@@ -6,7 +6,7 @@ import {ChatScreen} from './src/screens/ChatScreen';
 import {Chat, User, ChatMessage, MediaImageItem, VoiceNoteItem} from './src/types';
 import {demoChats, demoUsers} from './src/state/demoData';
 import {clearDemoSession, clearLiveSession, readDemoSession, readLiveSession, saveDemoSession, saveLiveSession} from './src/services/session';
-import {APP_CONFIG, isLiveConfigReady} from './src/config';
+import {APP_CONFIG, isLiveConfigReady, refreshTurnCredentials} from './src/config';
 import {TlsSignalingClient} from './src/services/signaling';
 import {ServerDataChannel, RtcStatus} from './src/services/rtc';
 import {e2eeService, RemotePreKeyBundle} from './src/services/e2ee';
@@ -498,6 +498,7 @@ export default function App() {
 
     const boot = async () => {
       try {
+        void refreshTurnCredentials();
         const saved = await readLiveSession();
         if (!saved || cancelled) {
           setIsInitializing(false);

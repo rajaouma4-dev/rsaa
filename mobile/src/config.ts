@@ -13,22 +13,26 @@ export const APP_CONFIG = {
     '5cb40b8a7ce95411ba3700c900abb8fe95cfa1bce124230c45371110f6605eb7',
   ],
   MAX_SIGNAL_FRAME_BYTES: 65_536,
-  // Google Global STUN pool + OpenRelay TURN for full NAT & firewall penetration
+  // Google Global STUN pool (Primary - zero bandwidth cost & ultra-low latency)
+  // + Metered Dedicated Authenticated TURN pool (Secondary fallback for strict symmetric CGNAT)
   ICE_SERVERS: [
     {
       urls: [
         'stun:stun.l.google.com:19302',
         'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun3.l.google.com:19302',
       ],
     },
     {
       urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turn:global.relay.metered.ca:80',
+        'turn:global.relay.metered.ca:80?transport=tcp',
+        'turn:global.relay.metered.ca:443',
+        'turns:global.relay.metered.ca:443?transport=tcp',
       ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
+      username: '6b4f1ed4dfec6aa058c544b1',
+      credential: '02Mhum2YDd/IcEhx',
     },
   ],
   ICE_TRANSPORT_POLICY: 'all' as const,
@@ -36,6 +40,33 @@ export const APP_CONFIG = {
   // WebSocket signaling URL for Render / Cloud (e.g. wss://your-service.onrender.com)
   SIGNALING_URL: 'wss://rsaa.onrender.com',
 };
+
+export async function refreshTurnCredentials(): Promise<void> {
+  try {
+    const res = await fetch('https://rsaa.metered.live/api/v1/turn/credentials?apiKey=3db65ca898a902693c4bacecd8dc40041fc1', {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        // ALWAYS keep Google STUN at top priority for 0-cost direct connectivity
+        APP_CONFIG.ICE_SERVERS = [
+          {
+            urls: [
+              'stun:stun.l.google.com:19302',
+              'stun:stun1.l.google.com:19302',
+              'stun:stun2.l.google.com:19302',
+              'stun:stun3.l.google.com:19302',
+            ],
+          },
+          ...data,
+        ];
+      }
+    }
+  } catch {
+    // Keep solid default static Metered credentials
+  }
+}
 
 export function updateSignalingHost(host: string) {
   const trimmed = host.trim();

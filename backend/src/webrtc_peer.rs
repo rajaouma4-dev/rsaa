@@ -630,7 +630,18 @@ pub async fn build_answerer(
             urls: vec![
                 "stun:stun.l.google.com:19302".to_string(),
                 "stun:stun1.l.google.com:19302".to_string(),
+                "stun:stun2.l.google.com:19302".to_string(),
+                "stun:stun3.l.google.com:19302".to_string(),
             ],
+            ..Default::default()
+        },
+        RTCIceServer {
+            urls: vec![
+                "turn:global.relay.metered.ca:80".to_string(),
+                "turn:global.relay.metered.ca:443".to_string(),
+            ],
+            username: "6b4f1ed4dfec6aa058c544b1".to_string(),
+            credential: "02Mhum2YDd/IcEhx".to_string(),
             ..Default::default()
         },
     ];
