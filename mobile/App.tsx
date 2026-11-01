@@ -443,9 +443,14 @@ export default function App() {
   const createRealtime = useCallback((signal: TlsSignalingClient) => {
     const rtc = new ServerDataChannel(signal);
     rtc.onConnectionStatus(status => {
-      setRtcStatus(status);
       if (status === 'connected') {
+        setRtcStatus('connected');
         void flushOutbox();
+      } else if (signalRef.current?.connected) {
+        setRtcStatus('connected');
+        void flushOutbox();
+      } else {
+        setRtcStatus(status);
       }
     });
     rtc.onMessage(packet => {

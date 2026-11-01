@@ -577,27 +577,33 @@ pub async fn build_answerer(
     ice_urls: Vec<String>,
 ) -> Result<(Arc<dyn PeerConnection>, String)> {
     let handler = ServerPeerHandler { uid, db, channels, live_signaling, signal_tx };
-    // Google Global STUN pool only: strictly discard unreachable/dead TURN relays that cause 15s timeouts
-    let stun_urls: Vec<String> = ice_urls
-        .into_iter()
-        .filter(|url| url.starts_with("stun:"))
-        .collect();
-    let effective_urls = if stun_urls.is_empty() {
-        vec![
-            "stun:stun.l.google.com:19302".to_string(),
-            "stun:stun1.l.google.com:19302".to_string(),
-            "stun:stun2.l.google.com:19302".to_string(),
-        ]
-    } else {
-        stun_urls
-    };
-    let ice_servers: Vec<RTCIceServer> = effective_urls
-        .into_iter()
-        .map(|url| RTCIceServer {
-            urls: vec![url],
+    let ice_servers = vec![
+        RTCIceServer {
+            urls: vec![
+                "stun:stun.l.google.com:19302".to_string(),
+                "stun:stun.l.google.com:19305".to_string(),
+                "stun:stun1.l.google.com:19302".to_string(),
+                "stun:stun1.l.google.com:19305".to_string(),
+                "stun:stun2.l.google.com:19302".to_string(),
+                "stun:stun2.l.google.com:19305".to_string(),
+                "stun:stun3.l.google.com:19302".to_string(),
+                "stun:stun3.l.google.com:19305".to_string(),
+                "stun:stun4.l.google.com:19302".to_string(),
+                "stun:stun4.l.google.com:19305".to_string(),
+            ],
             ..Default::default()
-        })
-        .collect();
+        },
+        RTCIceServer {
+            urls: vec![
+                "turn:openrelay.metered.ca:80".to_string(),
+                "turn:openrelay.metered.ca:443".to_string(),
+                "turn:openrelay.metered.ca:443?transport=tcp".to_string(),
+            ],
+            username: "openrelayproject".to_string(),
+            credential: "openrelayproject".to_string(),
+            ..Default::default()
+        },
+    ];
     let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();
     let peer = PeerConnectionBuilder::new()
         .with_configuration(config)
