@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  nexa-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "7443:7443"
+    environment:
+      - RUST_LOG=info
+      - SIGNALING_HOST=0.0.0.0
+      - SIGNALING_PORT=7443
+      - TURSO_DATABASE_URL=${TURSO_DATABASE_URL}
+      - TURSO_AUTH_TOKEN=${TURSO_AUTH_TOKEN}
+      - TLS_CERT_PATH=/etc/ssl/certs/signaling.crt
+      - TLS_KEY_PATH=/etc/ssl/private/signaling.key
+      - TURN_URL=${TURN_URL:-turn:turn.example.com:3478}
+      - TURN_USERNAME=${TURN_USERNAME:-nexa}
+      - TURN_PASSWORD=${TURN_PASSWORD:-change_me}
+    volumes:
+      - ./certs:/etc/ssl:ro
+    depends_on:
+      - coturn
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: "host"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./certs:/etc/ssl:ro

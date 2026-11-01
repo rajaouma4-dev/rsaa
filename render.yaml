@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: nexa-messenger-server
+    runtime: docker
+    dockerfilePath: backend/Dockerfile
+    dockerContext: backend
+    plan: free
+    region: oregon
+    envVars:
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: ICE_URLS
+        value: stun:stun.l.google.com:19302,turn:openrelay.metered.ca:80,turn:openrelay.metered.ca:443
+      - key: RUST_LOG
+        value: nexa_messenger_server=info,webrtc=warn

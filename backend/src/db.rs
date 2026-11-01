@@ -1,0 +1,670 @@
+use anyhow::{anyhow, Context, Result};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use libsql::{Builder, Database};
+use password_hash::SaltString;
+use rand_core::OsRng;
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::protocol::{ConversationSummary, MessageEnvelope, UserSummary};
+
+#[derive(Clone)]
+pub struct Store { db: Arc<Database> }
+
+#[derive(Debug, Clone)]
+pub struct PendingDelivery {
+    pub message: MessageEnvelope,
+    pub recipient_uid: String,
+}
+
+impl Store {
+    pub async fn connect(url: &str, token: &str) -> Result<Self> {
+        anyhow::ensure!(url.starts_with("libsql://") || url.starts_with("https://"), "TURSO_DATABASE_URL must be the database connection URL, not app.turso.tech");
+        anyhow::ensure!(!token.trim().is_empty() && !token.starts_with("PASTE_"), "Set TURSO_AUTH_TOKEN in backend/.env");
+        let db = Builder::new_remote(url.to_owned(), token.to_owned())
+            .build().await.context("connect to Turso/libSQL remote database")?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    async fn connection(&self) -> Result<libsql::Connection> {
+        let conn = self.db.connect()?;
+        let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
+        let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
+        Ok(conn)
+    }
+
+    pub async fn migrate(&self) -> Result<()> {
+        let conn = self.connection().await?;
+        let statements = [
+            "CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL COLLATE NOCASE UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS user_profiles (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, display_name TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', avatar_url TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY NOT NULL, uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, device_name TEXT NOT NULL DEFAULT 'Android Client', push_token TEXT, registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE INDEX IF NOT EXISTS idx_devices_uid ON devices(uid)",
+            "CREATE TABLE IF NOT EXISTS device_identity_keys (device_id TEXT PRIMARY KEY NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE, uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, identity_key TEXT NOT NULL, signed_prekey TEXT NOT NULL, signed_prekey_signature TEXT NOT NULL, registration_id INTEGER NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE INDEX IF NOT EXISTS idx_device_identity_keys_uid ON device_identity_keys(uid)",
+            "CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY NOT NULL, uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, device_id TEXT REFERENCES devices(device_id) ON DELETE CASCADE, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE INDEX IF NOT EXISTS idx_auth_sessions_uid ON auth_sessions(uid)",
+            "CREATE TABLE IF NOT EXISTS device_sessions (token_hash TEXT PRIMARY KEY NOT NULL, uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE INDEX IF NOT EXISTS idx_device_sessions_uid ON device_sessions(uid)",
+            "CREATE TABLE IF NOT EXISTS conversations (conversation_id TEXT PRIMARY KEY NOT NULL, pair_key TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL REFERENCES users(uid), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS conversation_members (conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE, uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (conversation_id, uid))",
+            "CREATE INDEX IF NOT EXISTS idx_conversation_members_uid ON conversation_members(uid)",
+            "CREATE TABLE IF NOT EXISTS messages (message_id TEXT PRIMARY KEY NOT NULL, conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id), sender_uid TEXT NOT NULL REFERENCES users(uid), recipient_uid TEXT NOT NULL REFERENCES users(uid), ciphertext BLOB NOT NULL, created_at TEXT NOT NULL, saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, status TEXT NOT NULL DEFAULT 'SAVED' CHECK(status IN ('SAVED','DELIVERED','SEEN')))",
+            "CREATE INDEX IF NOT EXISTS idx_messages_recipient_created ON messages(recipient_uid, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages(conversation_id, created_at)",
+            "CREATE TABLE IF NOT EXISTS message_delivery_status (message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE, recipient_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'SAVED' CHECK(status IN ('SAVED','DELIVERED','SEEN')), updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (message_id, recipient_uid))",
+            "CREATE INDEX IF NOT EXISTS idx_delivery_status_recipient ON message_delivery_status(recipient_uid, status)",
+            "CREATE TABLE IF NOT EXISTS user_presence (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, is_online INTEGER NOT NULL DEFAULT 0, last_active_at INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS user_contacts (uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, contact_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, is_blocked INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (uid, contact_uid))",
+            "CREATE INDEX IF NOT EXISTS idx_user_contacts_contact ON user_contacts(contact_uid)",
+            "CREATE TABLE IF NOT EXISTS user_settings (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, theme TEXT NOT NULL DEFAULT 'dark', notifications_enabled INTEGER NOT NULL DEFAULT 1, read_receipts_enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS sdui_configs (config_id TEXT PRIMARY KEY NOT NULL, version INTEGER NOT NULL, schema_json TEXT NOT NULL, signature TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS ui_configs (config_id TEXT PRIMARY KEY NOT NULL, version INTEGER NOT NULL, schema_json TEXT NOT NULL, signature TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS outbox (event_id TEXT PRIMARY KEY NOT NULL, message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE, recipient_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, delivered_at TEXT)",
+            "CREATE TABLE IF NOT EXISTS message_outbox (event_id TEXT PRIMARY KEY NOT NULL, message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE, recipient_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, delivered_at TEXT)",
+            "CREATE INDEX IF NOT EXISTS idx_message_outbox_pending ON message_outbox(recipient_uid, delivered_at, next_attempt_at)",
+            "CREATE TABLE IF NOT EXISTS prekey_bundles (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, bundle_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS database_schema_version (version INTEGER PRIMARY KEY NOT NULL, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, description TEXT NOT NULL)",
+            "INSERT OR IGNORE INTO database_schema_version (version, description) VALUES (1, 'Initial complete Nexa Chat schema')",
+        ];
+        for sql in statements { conn.execute(sql, ()).await?; }
+
+        // Upgrade databases created by the first starter ZIP without dropping user data.
+        let mut columns = conn.query("PRAGMA table_info(outbox)", ()).await?;
+        let mut has_attempts = false;
+        let mut has_next_attempt_at = false;
+        while let Some(row) = columns.next().await? {
+            let name: String = row.get(1)?;
+            has_attempts |= name == "attempts";
+            has_next_attempt_at |= name == "next_attempt_at";
+        }
+        if !has_attempts {
+            conn.execute("ALTER TABLE outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0", ()).await?;
+        }
+        if !has_next_attempt_at {
+            conn.execute("ALTER TABLE outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0", ()).await?;
+        }
+        // Create this index only after upgrading older outbox tables.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(recipient_uid, delivered_at, next_attempt_at)", ()).await?;
+        Ok(())
+    }
+
+    pub async fn register(&self, username: &str, display_name: &str, password: &str) -> Result<(UserSummary, String)> {
+        let username = normalize_username(username)?;
+        let display_name = display_name.trim();
+        anyhow::ensure!(display_name.chars().count() >= 2 && display_name.chars().count() <= 60, "display name must be 2-60 characters");
+        validate_password(password)?;
+        let salt = SaltString::generate(&mut OsRng);
+        let password_hash = Argon2::default().hash_password(password.as_bytes(), &salt)?.to_string();
+        let uid = format!("nx_{}", Uuid::new_v4().simple());
+        let conn = self.connection().await?;
+        conn.execute(
+            "INSERT INTO users (uid, username, display_name, password_hash) VALUES (?1, ?2, ?3, ?4)",
+            libsql::params![uid.clone(), username.clone(), display_name.to_owned(), password_hash],
+        ).await.context("create account; username may already be taken")?;
+        let token = self.issue_session(&uid).await?;
+        Ok((UserSummary { uid, username, display_name: display_name.to_owned(), about: String::new(), online: true }, token))
+    }
+
+    pub async fn login(&self, username: &str, password: &str) -> Result<(UserSummary, String)> {
+        let username = normalize_username(username)?;
+        let (uid, stored_username, display_name, about, stored_hash): (String, String, String, String, String) = {
+            let conn = self.connection().await?;
+            let mut rows = conn.query(
+                "SELECT uid, username, display_name, about, password_hash FROM users WHERE username = ?1 COLLATE NOCASE",
+                libsql::params![username],
+            ).await?;
+            let row = rows.next().await?.ok_or_else(|| anyhow!("invalid username or password"))?;
+            (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)
+        };
+
+        let parsed = PasswordHash::new(&stored_hash)
+            .map_err(|_| anyhow!("invalid username or password"))?;
+        Argon2::default().verify_password(password.as_bytes(), &parsed)
+            .map_err(|_| anyhow!("invalid username or password"))?;
+        let token = self.issue_session(&uid).await?;
+        Ok((UserSummary { uid, username: stored_username, display_name, about, online: true }, token))
+    }
+
+    pub async fn authenticate(&self, token: &str) -> Result<UserSummary> {
+        anyhow::ensure!(token.len() >= 32 && token.len() <= 256, "invalid session token");
+        let token_hash = hex_digest(token.as_bytes());
+        let conn = self.connection().await?;
+        let mut rows = conn.query(
+            "SELECT u.uid, u.username, u.display_name, u.about FROM device_sessions s JOIN users u ON u.uid = s.uid WHERE s.token_hash = ?1 AND s.expires_at > ?2",
+            libsql::params![token_hash, now_seconds()],
+        ).await?;
+        let row = rows.next().await?.ok_or_else(|| anyhow!("invalid or expired session"))?;
+        Ok(UserSummary {
+            uid: row.get(0)?, username: row.get(1)?, display_name: row.get(2)?, about: row.get(3)?, online: true,
+        })
+    }
+
+    pub async fn revoke_session(&self, token: &str) -> Result<()> {
+        anyhow::ensure!(token.len() >= 32 && token.len() <= 256, "invalid session token");
+        let conn = self.connection().await?;
+        conn.execute("DELETE FROM device_sessions WHERE token_hash = ?1", libsql::params![hex_digest(token.as_bytes())]).await?;
+        Ok(())
+    }
+
+    async fn issue_session(&self, uid: &str) -> Result<String> {
+        let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_hash = hex_digest(token.as_bytes());
+        let expires_at = now_seconds() + 60 * 60 * 24 * 30;
+        let conn = self.connection().await?;
+        conn.execute(
+            "INSERT INTO device_sessions (token_hash, uid, expires_at) VALUES (?1, ?2, ?3)",
+            libsql::params![token_hash, uid.to_owned(), expires_at],
+        ).await?;
+        Ok(token)
+    }
+
+    pub async fn search_users(&self, current_uid: &str, query: &str) -> Result<Vec<UserSummary>> {
+        let raw_query = query.trim();
+        let q = raw_query.strip_prefix('@').unwrap_or(raw_query);
+        anyhow::ensure!(q.chars().count() >= 2 && q.chars().count() <= 40, "search query must be 2-40 characters");
+        let pattern = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
+        let conn = self.connection().await?;
+        let mut rows = conn.query(
+            "SELECT uid, username, display_name, about FROM users WHERE uid <> ?1 AND (username LIKE ?2 ESCAPE '\\' COLLATE NOCASE OR display_name LIKE ?2 ESCAPE '\\' COLLATE NOCASE) ORDER BY username LIMIT 30",
+            libsql::params![current_uid.to_owned(), pattern],
+        ).await?;
+        let mut users = Vec::new();
+        while let Some(row) = rows.next().await? {
+            users.push(UserSummary {
+                uid: row.get(0)?, username: row.get(1)?, display_name: row.get(2)?, about: row.get(3)?, online: false,
+            });
+        }
+        Ok(users)
+    }
+
+    pub async fn update_profile(&self, uid: &str, display_name: &str, about: &str) -> Result<UserSummary> {
+        let display_name = display_name.trim();
+        let about = about.trim();
+        anyhow::ensure!((2..=60).contains(&display_name.chars().count()), "display name must be 2-60 characters");
+        anyhow::ensure!(about.chars().count() <= 160, "about text must be at most 160 characters");
+        let conn = self.connection().await?;
+        let changed = conn.execute(
+            "UPDATE users SET display_name = ?1, about = ?2 WHERE uid = ?3",
+            libsql::params![display_name.to_owned(), about.to_owned(), uid.to_owned()],
+        ).await?;
+        anyhow::ensure!(changed == 1, "user not found");
+        self.get_user(uid).await
+    }
+
+    pub async fn get_user(&self, uid: &str) -> Result<UserSummary> {
+        let conn = self.connection().await?;
+        let mut rows = conn.query("SELECT uid, username, display_name, about FROM users WHERE uid = ?1", libsql::params![uid.to_owned()]).await?;
+        let row = rows.next().await?.ok_or_else(|| anyhow!("user not found"))?;
+        Ok(UserSummary { uid: row.get(0)?, username: row.get(1)?, display_name: row.get(2)?, about: row.get(3)?, online: false })
+    }
+
+    pub async fn create_or_get_conversation(&self, current_uid: &str, other_uid: &str) -> Result<()> {
+        anyhow::ensure!(current_uid != other_uid, "cannot create a conversation with yourself");
+        let (left, right) = if current_uid < other_uid { (current_uid, other_uid) } else { (other_uid, current_uid) };
+        let pair_key = format!("{left}:{right}");
+        let conn = self.connection().await?;
+        let tx = conn.transaction().await?;
+        let mut user_rows = tx.query("SELECT COUNT(*) FROM users WHERE uid IN (?1, ?2)", libsql::params![current_uid.to_owned(), other_uid.to_owned()]).await?;
+        let user_count: i64 = user_rows.next().await?.ok_or_else(|| anyhow!("user lookup failed"))?.get(0)?;
+        anyhow::ensure!(user_count == 2, "user not found");
+        let proposed_id = format!("cv_{}", Uuid::new_v4().simple());
+        tx.execute(
+            "INSERT OR IGNORE INTO conversations (conversation_id, pair_key, created_by, created_at) VALUES (?1, ?2, ?3, ?4)",
+            libsql::params![proposed_id, pair_key.clone(), current_uid.to_owned(), now_epoch_string()],
+        ).await?;
+        let mut rows = tx.query("SELECT conversation_id FROM conversations WHERE pair_key = ?1", libsql::params![pair_key]).await?;
+        let conversation_id: String = rows.next().await?.ok_or_else(|| anyhow!("could not create conversation"))?.get(0)?;
+        tx.execute("INSERT OR IGNORE INTO conversation_members (conversation_id, uid) VALUES (?1, ?2), (?1, ?3)",
+            libsql::params![conversation_id, current_uid.to_owned(), other_uid.to_owned()]).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_conversations(&self, uid: &str, limit: i64) -> Result<Vec<ConversationSummary>> {
+        let conn = self.connection().await?;
+        let mut rows = conn.query(
+            "SELECT c.conversation_id, u.uid, u.username, u.display_name, u.about, COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.conversation_id), c.created_at) AS updated_at, (SELECT COUNT(*) FROM messages unread WHERE unread.conversation_id = c.conversation_id AND unread.recipient_uid = ?1 AND unread.status <> 'SEEN') AS unread_count, EXISTS(SELECT 1 FROM messages any_message WHERE any_message.conversation_id = c.conversation_id) AS has_messages FROM conversations c JOIN conversation_members mine ON mine.conversation_id = c.conversation_id AND mine.uid = ?1 JOIN conversation_members other ON other.conversation_id = c.conversation_id AND other.uid <> ?1 JOIN users u ON u.uid = other.uid ORDER BY updated_at DESC LIMIT ?2",
+            libsql::params![uid.to_owned(), limit.clamp(1, 100)],
+        ).await?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(ConversationSummary {
+                conversation_id: row.get(0)?,
+                user: UserSummary {
+                    uid: row.get(1)?, username: row.get(2)?, display_name: row.get(3)?, about: row.get(4)?, online: false,
+                },
+                updated_at: row.get(5)?,
+                unread_count: row.get(6)?,
+                has_messages: row.get::<i64>(7)? != 0,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Return only users who share at least one conversation with this account.
+    /// Presence is not broadcast globally; a user's online state is visible only to contacts.
+    pub async fn conversation_contacts(&self, uid: &str) -> Result<Vec<String>> {
+        let conn = self.connection().await?;
+        let mut rows = conn.query(
+            "SELECT DISTINCT other.uid FROM conversation_members mine JOIN conversation_members other ON other.conversation_id = mine.conversation_id AND other.uid <> mine.uid WHERE mine.uid = ?1 ORDER BY other.uid",
+            libsql::params![uid.to_owned()],
+        ).await?;
+        let mut contacts = Vec::new();
+        while let Some(row) = rows.next().await? { contacts.push(row.get(0)?); }
+        Ok(contacts)
+    }
+
+    pub async fn get_conversation_id(&self, current_uid: &str, other_uid: &str) -> Result<String> {
+        let (left, right) = if current_uid < other_uid { (current_uid, other_uid) } else { (other_uid, current_uid) };
+        let pair_key = format!("{left}:{right}");
+        let conn = self.connection().await?;
+        let mut rows = conn.query("SELECT c.conversation_id FROM conversations c JOIN conversation_members m ON m.conversation_id = c.conversation_id WHERE c.pair_key = ?1 AND m.uid = ?2", libsql::params![pair_key, current_uid.to_owned()]).await?;
+        let row = rows.next().await?.ok_or_else(|| anyhow!("conversation not found"))?;
+        Ok(row.get(0)?)
+    }
+
+    pub async fn history(&self, uid: &str, conversation_id: &str, before: Option<&str>, limit: i64) -> Result<Vec<MessageEnvelope>> {
+        let conn = self.connection().await?;
+        let mut member = conn.query("SELECT 1 FROM conversation_members WHERE conversation_id = ?1 AND uid = ?2", libsql::params![conversation_id.to_owned(), uid.to_owned()]).await?;
+        anyhow::ensure!(member.next().await?.is_some(), "not a conversation member");
+        let cursor = before.unwrap_or("");
+        if !cursor.is_empty() { validate_message_id(cursor)?; }
+        let mut rows = conn.query(
+            "SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status FROM messages WHERE conversation_id = ?1 AND (?3 = '' OR EXISTS (SELECT 1 FROM messages cursor WHERE cursor.message_id = ?3 AND cursor.conversation_id = messages.conversation_id AND (CAST(messages.created_at AS INTEGER) < CAST(cursor.created_at AS INTEGER) OR (CAST(messages.created_at AS INTEGER) = CAST(cursor.created_at AS INTEGER) AND messages.message_id < cursor.message_id)))) ORDER BY CAST(created_at AS INTEGER) DESC, message_id DESC LIMIT ?2",
+            libsql::params![conversation_id.to_owned(), limit.clamp(1, 100), cursor.to_owned()],
+        ).await?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let bytes: Vec<u8> = row.get(3)?;
+            messages.push(MessageEnvelope {
+                message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
+                ciphertext_b64: STANDARD.encode(bytes), created_at: row.get(4)?, status: row.get(5)?,
+            });
+        }
+        messages.reverse();
+        Ok(messages)
+    }
+
+    /// Saves only opaque ciphertext, verifies membership, and atomically adds an outbox row.
+    pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8]) -> Result<(String, bool)> {
+        validate_message_id(message_id)?;
+        anyhow::ensure!(!ciphertext.is_empty() && ciphertext.len() <= 10 * 1024 * 1024, "invalid ciphertext size");
+        let conn = self.connection().await?;
+        
+        let recipient_uid = {
+            let mut members = conn.query(
+                "SELECT uid FROM conversation_members WHERE conversation_id = ?1 AND uid <> ?2 LIMIT 2",
+                libsql::params![conversation_id.to_owned(), sender_uid.to_owned()],
+            ).await?;
+            let r: String = members.next().await?.ok_or_else(|| anyhow!("conversation not found or sender is not a member"))?.get(0)?;
+            anyhow::ensure!(members.next().await?.is_none(), "group conversations are not enabled in this version");
+            r
+        };
+
+        {
+            let mut sender_member = conn.query("SELECT 1 FROM conversation_members WHERE conversation_id = ?1 AND uid = ?2", libsql::params![conversation_id.to_owned(), sender_uid.to_owned()]).await?;
+            anyhow::ensure!(sender_member.next().await?.is_some(), "sender is not a conversation member");
+        }
+
+        let already_exists = {
+            let mut existing = conn.query("SELECT sender_uid, conversation_id, ciphertext FROM messages WHERE message_id = ?1", libsql::params![message_id.to_owned()]).await?;
+            if let Some(row) = existing.next().await? {
+                let old_sender: String = row.get(0)?;
+                let old_conversation: String = row.get(1)?;
+                let old_ciphertext: Vec<u8> = row.get(2)?;
+                anyhow::ensure!(old_sender == sender_uid && old_conversation == conversation_id && old_ciphertext == ciphertext,
+                    "message_id was already used with different content");
+                true
+            } else { false }
+        };
+
+        let mut is_new = false;
+        if !already_exists {
+            let recent_count: i64 = {
+                let mut recent = conn.query(
+                    "SELECT COUNT(*) FROM messages WHERE sender_uid = ?1 AND saved_at >= datetime('now', '-1 minute')",
+                    libsql::params![sender_uid.to_owned()],
+                ).await?;
+                recent.next().await?.ok_or_else(|| anyhow!("message quota check failed"))?.get(0)?
+            };
+            anyhow::ensure!(recent_count < 60, "message rate limit exceeded; try again shortly");
+            let created_at = if let Some(ts_str) = message_id.strip_prefix("m_").and_then(|rest| rest.split('_').next()) {
+                if let Ok(ts_ms) = ts_str.parse::<u64>() {
+                    if ts_ms > 100_000_000_000 {
+                        format!("{}", ts_ms / 1000)
+                    } else {
+                        now_epoch_string()
+                    }
+                } else {
+                    now_epoch_string()
+                }
+            } else {
+                now_epoch_string()
+            };
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'SAVED')",
+                libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), recipient_uid.clone(), ciphertext.to_vec(), created_at],
+            ).await?;
+            if inserted == 1 {
+                let event_id = format!("deliver:{message_id}");
+                // Next attempt is immediately eligible (now_seconds()) so delivery to newly connected
+                // recipients is instant via OnOpen flush or background worker.
+                let next_attempt = now_seconds();
+                let _ = conn.execute("INSERT OR IGNORE INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES (?1, ?2, ?3, ?4)",
+                    libsql::params![event_id, message_id.to_owned(), recipient_uid.clone(), next_attempt]).await;
+                is_new = true;
+            }
+        }
+        Ok((recipient_uid, is_new))
+    }
+
+    pub async fn pending_deliveries(&self, recipient_uid: &str, limit: i64) -> Result<Vec<PendingDelivery>> {
+        let conn = self.connection().await?;
+        let mut rows = conn.query(
+            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.created_at LIMIT ?3",
+            libsql::params![recipient_uid.to_owned(), now_seconds(), limit.clamp(1, 100)],
+        ).await?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let bytes: Vec<u8> = row.get(3)?;
+            items.push(PendingDelivery {
+                message: MessageEnvelope {
+                    message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
+                    ciphertext_b64: STANDARD.encode(bytes), created_at: row.get(4)?, status: row.get(5)?,
+                },
+                recipient_uid: recipient_uid.to_owned(),
+            });
+        }
+        Ok(items)
+    }
+
+    /// Atomically claims a due outbox event before network send, preventing two workers
+    /// from sending the same retry simultaneously. A failed send is retried after backoff.
+    pub async fn claim_delivery_attempt(&self, message_id: &str, recipient_uid: &str) -> Result<bool> {
+        let conn = self.connection().await?;
+        let changed = conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ?3 + CASE WHEN attempts = 0 THEN 2 WHEN attempts = 1 THEN 5 WHEN attempts = 2 THEN 12 WHEN attempts = 3 THEN 30 ELSE 60 END WHERE message_id = ?1 AND recipient_uid = ?2 AND delivered_at IS NULL AND next_attempt_at <= ?3",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned(), now_seconds()],
+        ).await?;
+        Ok(changed == 1)
+    }
+
+    pub async fn mark_delivered(&self, message_id: &str, recipient_uid: &str) -> Result<Option<String>> {
+        let conn = self.connection().await?;
+        let sender_uid = {
+            let mut rows = conn.query("SELECT sender_uid FROM messages WHERE message_id = ?1 AND recipient_uid = ?2", libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await?;
+            match rows.next().await? { Some(row) => row.get::<String>(0)?, None => return Ok(None) }
+        };
+        let _ = conn.execute("UPDATE outbox SET delivered_at = CURRENT_TIMESTAMP WHERE message_id = ?1 AND recipient_uid = ?2 AND delivered_at IS NULL",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
+        let _ = conn.execute("UPDATE messages SET status = 'DELIVERED' WHERE message_id = ?1 AND recipient_uid = ?2 AND status = 'SAVED'",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
+        Ok(Some(sender_uid))
+    }
+
+    pub async fn mark_seen(&self, message_id: &str, recipient_uid: &str) -> Result<Option<String>> {
+        let conn = self.connection().await?;
+        let sender_uid = {
+            let mut rows = conn.query("SELECT sender_uid FROM messages WHERE message_id = ?1 AND recipient_uid = ?2", libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await?;
+            match rows.next().await? { Some(row) => row.get::<String>(0)?, None => return Ok(None) }
+        };
+        let _ = conn.execute("UPDATE outbox SET delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE message_id = ?1 AND recipient_uid = ?2",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
+        let _ = conn.execute("UPDATE messages SET status = 'SEEN' WHERE message_id = ?1 AND recipient_uid = ?2",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
+        Ok(Some(sender_uid))
+    }
+
+    pub async fn save_prekey_bundle(&self, uid: &str, bundle_json: &str) -> Result<()> {
+        let conn = self.connection().await?;
+        conn.execute(
+            "INSERT INTO prekey_bundles (uid, bundle_json, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(uid) DO UPDATE SET bundle_json = excluded.bundle_json, updated_at = CURRENT_TIMESTAMP",
+            libsql::params![uid.to_owned(), bundle_json.to_owned()],
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn get_prekey_bundle(&self, uid: &str) -> Result<Option<String>> {
+        let conn = self.connection().await?;
+        let mut rows = conn.query("SELECT bundle_json FROM prekey_bundles WHERE uid = ?1", libsql::params![uid.to_owned()]).await?;
+        if let Some(row) = rows.next().await? {
+            let bundle: String = row.get(0)?;
+            Ok(Some(bundle))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn normalize_username(value: &str) -> Result<String> {
+    let raw = value.trim();
+    let raw = raw.strip_prefix('@').unwrap_or(raw);
+    let username = raw.to_ascii_lowercase();
+    anyhow::ensure!((3..=24).contains(&username.len()), "username must be 3-24 characters");
+    anyhow::ensure!(username.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.'), "username may only contain letters, digits, _ and .");
+    Ok(username)
+}
+
+fn validate_password(password: &str) -> Result<()> {
+    anyhow::ensure!(password.len() >= 10 && password.len() <= 128, "password must be 10-128 bytes");
+    Ok(())
+}
+
+fn validate_message_id(id: &str) -> Result<()> {
+    anyhow::ensure!((8..=80).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'), "invalid message ID");
+    Ok(())
+}
+
+fn hex_digest(input: &[u8]) -> String {
+    Sha256::digest(input).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn now_seconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
+/// Store a sortable Unix-seconds value as text for cross-device message cursors.
+pub fn now_epoch_string() -> String { format!("{}", now_seconds()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_turso_connection_test() {
+        dotenvy::dotenv().ok();
+        if let (Ok(url), Ok(token)) = (std::env::var("TURSO_DATABASE_URL"), std::env::var("TURSO_AUTH_TOKEN")) {
+            if !url.is_empty() && !token.is_empty() && !token.starts_with("PASTE_") {
+                let store = Store::connect(&url, &token).await.expect("Failed to connect to Turso");
+                store.migrate().await.expect("Failed to run Turso migrations");
+
+                // Test duplicate message prevention directly on live Turso
+                let test_suffix = Uuid::new_v4().simple().to_string();
+                let u1_name = format!("turso_dup_a_{}", &test_suffix[..8]);
+                let u2_name = format!("turso_dup_b_{}", &test_suffix[..8]);
+                let (u1, _) = store.register(&u1_name, "TursoA", "tursoPass123!").await.expect("Register u1");
+                let (u2, _) = store.register(&u2_name, "TursoB", "tursoPass123!").await.expect("Register u2");
+                store.create_or_get_conversation(&u1.uid, &u2.uid).await.expect("Create conversation");
+                let conv_id = store.get_conversation_id(&u1.uid, &u2.uid).await.expect("Get conv_id");
+
+                let test_msg_id = format!("turso_msg_{}", test_suffix);
+                let ciphertext = vec![0x33, 0x11, 0x22, 0x33];
+
+                // First delivery attempt
+                let (rec1, is_new1) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext).await.expect("Save 1");
+                assert_eq!(rec1, u2.uid);
+                assert!(is_new1, "Live Turso: First delivery attempt must be marked as new");
+
+                // Duplicate delivery attempt with identical payload
+                let (rec2, is_new2) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext).await.expect("Save 2");
+                assert_eq!(rec2, u2.uid);
+                assert!(!is_new2, "Live Turso: Duplicate delivery attempt must NOT be marked as new");
+
+                // Outbox check: exactly one outbox event created
+                let pending = store.pending_deliveries(&u2.uid, 10).await.expect("Pending");
+                let matches: Vec<_> = pending.into_iter().filter(|p| p.message.message_id == test_msg_id).collect();
+                assert_eq!(matches.len(), 1, "Live Turso: Exactly one outbox delivery event must exist");
+
+                // Live Turso: Test login with correct password
+                let login_ok = store.login(&u1_name, "tursoPass123!").await;
+                assert!(login_ok.is_ok(), "Live Turso: Correct password must log in");
+
+                // Live Turso: Test login with INCORRECT password
+                let login_bad = store.login(&u1_name, "wrongPassword999!").await;
+                assert!(login_bad.is_err(), "Live Turso: Incorrect password MUST BE REJECTED");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_password_verification_and_login_security() {
+        let temp_db_path = format!("target/test_auth_{}.db", Uuid::new_v4().simple());
+        let db = Builder::new_local(&temp_db_path).build().await.unwrap();
+        let store = Store { db: Arc::new(db) };
+        store.migrate().await.unwrap();
+
+        let username = "secure_alice";
+        let valid_password = "superSecurePassword123!";
+        let (u, token) = store.register(username, "Alice", valid_password).await.unwrap();
+        assert!(!token.is_empty());
+        assert_eq!(u.username, username);
+
+        // Test A: Correct password -> Login SUCCESS
+        let res_a = store.login(username, valid_password).await;
+        assert!(res_a.is_ok(), "Test A failed: Correct password must succeed: {:?}", res_a.err());
+        let (user_a, token_a) = res_a.unwrap();
+        assert_eq!(user_a.uid, u.uid);
+        assert!(!token_a.is_empty());
+
+        // Test H: Login failure -> No new session created
+        let count_sessions = || async {
+            let conn = store.connection().await.unwrap();
+            let mut rows = conn.query("SELECT COUNT(*) FROM device_sessions", ()).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            row.get::<i64>(0).unwrap()
+        };
+        let sessions_before = count_sessions().await;
+
+        // Test B: Incorrect password -> Login REJECTED
+        let res_b = store.login(username, "totallyWrongPassword123!").await;
+        assert!(res_b.is_err(), "Test B failed: Incorrect password MUST be rejected");
+        assert_eq!(res_b.unwrap_err().to_string(), "invalid username or password");
+
+        let sessions_after = count_sessions().await;
+        assert_eq!(sessions_before, sessions_after, "Test H failed: Failed login must not create any session");
+
+        // Test C: Random password -> Login REJECTED
+        let res_c = store.login(username, "RandomPassword!@#$%^&*()").await;
+        assert!(res_c.is_err(), "Test C failed: Random password MUST be rejected");
+
+        // Test D: Unknown username -> Login REJECTED
+        let res_d = store.login("non_existent_user_999", valid_password).await;
+        assert!(res_d.is_err(), "Test D failed: Unknown username MUST be rejected");
+
+        // Test E: Empty or short password -> Login REJECTED
+        let res_e = store.login(username, "").await;
+        assert!(res_e.is_err(), "Test E failed: Empty password MUST be rejected");
+
+        // Test F: Modified database password hash -> Login REJECTED
+        {
+            let conn = store.connection().await.unwrap();
+            conn.execute("UPDATE users SET password_hash = 'corrupted_hash' WHERE username = ?1", libsql::params![username]).await.unwrap();
+        }
+        let res_f = store.login(username, valid_password).await;
+        assert!(res_f.is_err(), "Test F failed: Corrupted hash MUST be rejected");
+
+        // Test J: Invalid or expired session -> Access denied
+        let res_j = store.authenticate("random_forged_session_token_32_bytes_long").await;
+        assert!(res_j.is_err(), "Test J failed: Forged session must be rejected");
+
+        // Test K: Logout -> Previous session can no longer authenticate
+        let (_u2, token_k) = store.register("bob_logout", "Bob", "bobPassword123!").await.unwrap();
+        assert!(store.authenticate(&token_k).await.is_ok());
+        store.revoke_session(&token_k).await.unwrap();
+        assert!(store.authenticate(&token_k).await.is_err(), "Test K failed: Revoked session must not authenticate");
+
+        // Test L: Password storage format verification -> Argon2id only, never plaintext
+        {
+            let conn = store.connection().await.unwrap();
+            let mut rows = conn.query("SELECT password_hash FROM users WHERE username = 'bob_logout'", ()).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let stored_hash: String = row.get(0).unwrap();
+            assert!(stored_hash.starts_with("$argon2id$"), "Test L failed: Stored password must be Argon2id hash");
+            assert!(!stored_hash.contains("bobPassword123!"), "Test L failed: Plaintext password must never appear in database");
+        }
+
+        // Test G: Database connection failure -> Login REJECTED
+        {
+            let dead_db = Builder::new_local("target/non_existent_dir_12345/unreachable.db").build().await;
+            if let Ok(db) = dead_db {
+                let dead_store = Store { db: Arc::new(db) };
+                let res_g = dead_store.login("alice", "anyPassword123!").await;
+                assert!(res_g.is_err(), "Test G failed: Database failure must reject login");
+            }
+        }
+
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[tokio::test]
+    async fn duplicate_message_prevention_test() {
+        let temp_db_path = format!("target/test_dup_{}.db", Uuid::new_v4().simple());
+        let db = Builder::new_local(&temp_db_path).build().await.unwrap();
+        let store = Store { db: Arc::new(db) };
+        store.migrate().await.unwrap();
+
+        let (u1, _) = store.register("alice_dup", "Alice", "password123").await.unwrap();
+        let (u2, _) = store.register("bob_dup", "Bob", "password123").await.unwrap();
+        store.create_or_get_conversation(&u1.uid, &u2.uid).await.unwrap();
+        let conv_id = store.get_conversation_id(&u1.uid, &u2.uid).await.unwrap();
+
+        let msg_id = "msg_test_dup_001";
+        let ciphertext = vec![0x33, 0x01, 0x02, 0x03];
+
+        let (recipient, is_new1) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext).await.unwrap();
+        assert_eq!(recipient, u2.uid);
+        assert!(is_new1, "First delivery attempt must be marked as new");
+
+        let (recipient2, is_new2) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext).await.unwrap();
+        assert_eq!(recipient2, u2.uid);
+        assert!(!is_new2, "Duplicate delivery attempt must NOT be marked as new");
+
+        let conflict_bytes = vec![0x33, 0x99, 0x88];
+        let conflict_res = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &conflict_bytes).await;
+        assert!(conflict_res.is_err(), "Conflicting message payload with same ID must be rejected");
+
+        let pending = store.pending_deliveries(&u2.uid, 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "There must be exactly one pending delivery in outbox");
+        assert_eq!(pending[0].message.message_id, msg_id);
+
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn username_is_normalized_and_restricted() {
+        assert_eq!(normalize_username("  @Alice_01 ").unwrap(), "alice_01");
+        assert!(normalize_username("ab").is_err());
+        assert!(normalize_username("alice name").is_err());
+        assert!(normalize_username("alice/../bob").is_err());
+        assert!(normalize_username("@@alice").is_err());
+    }
+
+    #[test]
+    fn passwords_have_reasonable_bounds() {
+        assert!(validate_password("correct horse battery").is_ok());
+        assert!(validate_password("short").is_err());
+        assert!(validate_password(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn message_ids_are_ascii_and_bounded() {
+        assert!(validate_message_id("msg_123456").is_ok());
+        assert!(validate_message_id("bad id 123").is_err());
+        assert!(validate_message_id("短いmessage").is_err());
+    }
+}

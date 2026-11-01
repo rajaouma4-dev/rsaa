@@ -1,0 +1,62 @@
+name: Validate and build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: nexa-build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend -> target
+      - name: Compile and test Rust backend
+        working-directory: backend
+        run: |
+          cargo generate-lockfile
+          cargo check --locked
+          cargo test --locked
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.13' 
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-37" "build-tools;37.0.0"
+      - name: Generate native Android shell
+        run: bash scripts/bootstrap-native.sh
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: npm install --no-audit --no-fund
+      - name: Validate project SQL and TypeScript syntax
+        run: |
+          node scripts/validate-typescript.cjs
+          python3 scripts/test-db-schema.py
+      - name: TypeScript semantic check
+        working-directory: mobile
+        run: npm run typecheck
+      - name: Build release APK
+        working-directory: mobile/android
+        run: ./gradlew --no-daemon clean assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexa-chat-release-apk
+          path: mobile/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*.local
+*.log
+backend/target/
+backend/certs/*.key
+backend/certs/*.crt
+*.apk
+deliverables/*.apk
+mobile/node_modules/
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/app/.cxx/
+mobile/ios/Pods/
