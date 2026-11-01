@@ -441,9 +441,9 @@ where
                 let mut sent = false;
                 // 1. Try sending via TCP signaling socket
                 {
-                    let sig_guard = live_signaling.lock().await;
-                    if let Some(target_tx) = sig_guard.get(&to_uid) {
-                        let _ = target_tx.send(ServerFrame::CallSignal {
+                    let target_tx = { live_signaling.lock().await.get(&to_uid).cloned() };
+                    if let Some(tx) = target_tx {
+                        let _ = tx.send(ServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
                             payload: payload.clone(),
                         }).await;
@@ -452,14 +452,14 @@ where
                 }
                 // 2. If not sent via TCP, try sending via DataChannel
                 if !sent {
-                    let dc_guard = channels.lock().await;
-                    if let Some(dc) = dc_guard.get(&to_uid) {
+                    let target_dc = { channels.lock().await.get(&to_uid).cloned() };
+                    if let Some(dc) = target_dc {
                         let frame = DataChannelServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
                             payload: payload.clone(),
                         };
                         if let Ok(json_str) = serde_json::to_string(&frame) {
-                            crate::webrtc_peer::send_safe_text(dc, &json_str).await;
+                            crate::webrtc_peer::send_safe_text(&dc, &json_str).await;
                             sent = true;
                         }
                     }
@@ -885,9 +885,9 @@ async fn handle_ws_client(
                 let from_uid = user.uid.clone();
                 let mut sent = false;
                 {
-                    let sig_guard = live_signaling.lock().await;
-                    if let Some(target_tx) = sig_guard.get(&to_uid) {
-                        let _ = target_tx.send(ServerFrame::CallSignal {
+                    let target_tx = { live_signaling.lock().await.get(&to_uid).cloned() };
+                    if let Some(tx) = target_tx {
+                        let _ = tx.send(ServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
                             payload: payload.clone(),
                         }).await;
@@ -895,14 +895,14 @@ async fn handle_ws_client(
                     }
                 }
                 if !sent {
-                    let dc_guard = channels.lock().await;
-                    if let Some(dc) = dc_guard.get(&to_uid) {
+                    let target_dc = { channels.lock().await.get(&to_uid).cloned() };
+                    if let Some(dc) = target_dc {
                         let frame = DataChannelServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
                             payload: payload.clone(),
                         };
                         if let Ok(json_str) = serde_json::to_string(&frame) {
-                            crate::webrtc_peer::send_safe_text(dc, &json_str).await;
+                            crate::webrtc_peer::send_safe_text(&dc, &json_str).await;
                             sent = true;
                         }
                     }

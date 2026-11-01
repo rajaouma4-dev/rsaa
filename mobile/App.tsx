@@ -1,5 +1,5 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {StatusBar, View, Alert, Text, ActivityIndicator, AppState, AppStateStatus} from 'react-native';
+import {StatusBar, View, Alert, Text, ActivityIndicator, AppState, AppStateStatus, Platform} from 'react-native';
 import {AuthScreen} from './src/screens/AuthScreen';
 import {HomeScreen, formatSnippet} from './src/screens/HomeScreen';
 import {ChatScreen} from './src/screens/ChatScreen';
@@ -67,6 +67,13 @@ export default function App() {
   const [callState, setCallState] = useState<CallState>(callService.getState());
   const signalRef = useRef<TlsSignalingClient | null>(null);
   const rtcRef = useRef<ServerDataChannel | null>(null);
+
+  useEffect(() => {
+    if (Platform.OS === 'android') {
+      (StatusBar as any).setBackgroundColor?.('#242526');
+      (StatusBar as any).setTranslucent?.(false);
+    }
+  }, []);
 
   const attachSignalHandlers = useCallback((client: TlsSignalingClient) => {
     client.onFrame(frame => {
@@ -1120,7 +1127,7 @@ export default function App() {
   };
 
   return <View style={{flex: 1, backgroundColor: C.bg}}>
-    <StatusBar barStyle="light-content"/>
+    <StatusBar barStyle="light-content" />
     {isInitializing ? (
       <View style={[S.screen, {justifyContent: 'center', alignItems: 'center'}]}>
         <ActivityIndicator size="large" color={C.green}/>

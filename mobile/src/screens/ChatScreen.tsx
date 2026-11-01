@@ -10,6 +10,7 @@ import {
   StyleSheet,
   ToastAndroid,
   ActivityIndicator,
+  StatusBar,
 } from 'react-native';
 import {Avatar} from '../components/Avatar';
 import {Chat, User, ChatMessage, MediaImageItem, VoiceNoteItem} from '../types';
@@ -202,6 +203,23 @@ export function ChatScreen({
     }
   };
 
+  const handleCancelActiveRecord = async () => {
+    setIsRecordingAudio(false);
+    await cancelRecordingVoice();
+  };
+
+  const handleInstantSendVoice = async () => {
+    setIsRecordingAudio(false);
+    const voiceItem = await stopRecordingVoice();
+    if (voiceItem) {
+      onSend({
+        mediaType: 'voice',
+        voice: voiceItem,
+      });
+      scrollToBottom();
+    }
+  };
+
   const handleCancelVoiceReview = async () => {
     await cancelRecordingVoice();
     setRecordedVoice(null);
@@ -384,8 +402,8 @@ export function ChatScreen({
   return (
     <KeyboardAvoidingView
       style={styles.screen}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      keyboardVerticalOffset={4}>
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}>
       {/* Facebook Messenger Style Header */}
       <View style={styles.header}>
         <Pressable onPress={onBack} hitSlop={10} style={styles.backBtn}>
@@ -437,6 +455,8 @@ export function ChatScreen({
         ListFooterComponent={<View style={{height: 14}} />}
         onScroll={handleScroll}
         scrollEventThrottle={16}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
         renderItem={renderMessage}
         showsVerticalScrollIndicator={false}
         initialNumToRender={14}
@@ -477,15 +497,22 @@ export function ChatScreen({
       ) : isRecordingAudio ? (
         /* When actively recording audio, show recording bar INSTEAD of composer */
         <View style={styles.recordingBar}>
+          <Pressable onPress={handleCancelActiveRecord} hitSlop={10} style={styles.cancelRecordBtn}>
+            <Text style={styles.cancelRecordIcon}>🗑️</Text>
+          </Pressable>
           <View style={styles.recordingPulse}>
             <View style={styles.recordingDot} />
             <Text style={styles.recordingTimer}>{formatSec(recordingSeconds)}</Text>
           </View>
-          <Text style={styles.recordingTip}>Recording voice note...</Text>
-          <Pressable onPress={handleStopVoiceRecord} style={styles.stopRecordBtn}>
-            <Text style={styles.stopRecordIcon}>⏹</Text>
-            <Text style={styles.stopRecordText}>Done</Text>
-          </Pressable>
+          <Text style={styles.recordingTip}>Recording voice...</Text>
+          <View style={styles.recordingActions}>
+            <Pressable onPress={handleStopVoiceRecord} style={styles.previewRecordBtn} hitSlop={8}>
+              <Text style={styles.previewRecordIcon}>⏸</Text>
+            </Pressable>
+            <Pressable onPress={handleInstantSendVoice} style={styles.instantSendBtn} hitSlop={8}>
+              <Text style={styles.instantSendIcon}>➤</Text>
+            </Pressable>
+          </View>
         </View>
       ) : (
         /* Facebook Messenger Style Composer with Gallery & Voice icons */
@@ -554,7 +581,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#18191A',
   },
   header: {
-    height: 64,
+    paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 0) : 0,
+    minHeight: Platform.OS === 'android' ? 56 + (StatusBar.currentHeight || 0) : 56,
     paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
@@ -775,23 +803,44 @@ const styles = StyleSheet.create({
     color: '#8A8D91',
     fontSize: 12,
   },
-  stopRecordBtn: {
+  cancelRecordBtn: {
+    padding: 6,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 59, 48, 0.15)',
+  },
+  cancelRecordIcon: {
+    fontSize: 16,
+  },
+  recordingActions: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 10,
+  },
+  previewRecordBtn: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: '#3A3B3C',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  previewRecordIcon: {
+    color: '#E4E6EB',
+    fontSize: 14,
+  },
+  instantSendBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: '#0084FF',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 14,
-    gap: 4,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  stopRecordIcon: {
+  instantSendIcon: {
     color: '#FFFFFF',
-    fontSize: 12,
-  },
-  stopRecordText: {
-    color: '#FFFFFF',
-    fontSize: 12,
-    fontWeight: '700',
+    fontSize: 15,
+    fontWeight: '900',
+    marginLeft: 2,
   },
   composerContainer: {
     flexDirection: 'row',

@@ -227,8 +227,8 @@ class NexaMediaModule(private val reactContext: ReactApplicationContext) :
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                setAudioSamplingRate(44100)
-                setAudioEncodingBitRate(64000)
+                setAudioSamplingRate(24000)
+                setAudioEncodingBitRate(28000)
                 setOutputFile(voiceFile.absolutePath)
                 prepare()
                 start()
@@ -263,18 +263,25 @@ class NexaMediaModule(private val reactContext: ReactApplicationContext) :
             val elapsedMs = System.currentTimeMillis() - startTime
             val durationSec = max(1, (elapsedMs / 1000).toInt())
 
-            val fileInputStream = FileInputStream(file)
-            val bytes = fileInputStream.readBytes()
-            fileInputStream.close()
+            Thread {
+                try {
+                    val fileInputStream = FileInputStream(file)
+                    val bytes = fileInputStream.readBytes()
+                    fileInputStream.close()
 
-            val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                    val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
 
-            val result = Arguments.createMap().apply {
-                putString("audioUri", Uri.fromFile(file).toString())
-                putString("audioBase64", base64)
-                putInt("durationSec", durationSec)
-            }
-            promise.resolve(result)
+                    val result = Arguments.createMap().apply {
+                        putString("audioUri", Uri.fromFile(file).toString())
+                        putString("audioBase64", base64)
+                        putInt("durationSec", durationSec)
+                    }
+                    promise.resolve(result)
+                } catch (ioErr: Exception) {
+                    stopCurrentRecording()
+                    promise.reject("E_RECORD_STOP", ioErr.message, ioErr)
+                }
+            }.start()
         } catch (e: Exception) {
             stopCurrentRecording()
             promise.reject("E_RECORD_STOP", e.message, e)

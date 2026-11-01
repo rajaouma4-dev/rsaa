@@ -208,22 +208,22 @@ pub async fn handle_client_frame(
             let mut sent = false;
             // 1. Try sending via target's DataChannel
             {
-                let dc_guard = channels.lock().await;
-                if let Some(target_dc) = dc_guard.get(&to_uid) {
+                let target_dc = { channels.lock().await.get(&to_uid).cloned() };
+                if let Some(target_dc) = target_dc {
                     let s_frame = DataChannelServerFrame::CallSignal {
                         from_uid: from_uid.clone(),
                         payload: payload.clone(),
                     };
                     if let Ok(text) = serde_json::to_string(&s_frame) {
-                        send_safe_text(target_dc, &text).await;
+                        send_safe_text(&target_dc, &text).await;
                         sent = true;
                     }
                 }
             }
             // 2. If not sent via DataChannel, try sending via target's signaling socket
             if !sent {
-                let sig_guard = live_signaling.lock().await;
-                if let Some(target_tx) = sig_guard.get(&to_uid) {
+                let target_tx = { live_signaling.lock().await.get(&to_uid).cloned() };
+                if let Some(target_tx) = target_tx {
                     let _ = target_tx.send(ServerFrame::CallSignal {
                         from_uid: from_uid.clone(),
                         payload: payload.clone(),

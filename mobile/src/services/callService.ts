@@ -63,6 +63,36 @@ export function formatCallDuration(sec: number): string {
 
 export type CallSignalSender = (toUid: string, payload: any) => void;
 
+const AUDIO_CONSTRAINTS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  highpassFilter: true,
+};
+
+function optimizeSdp(sdp: string): string {
+  let optimized = sdp;
+  if (optimized.includes('opus/48000')) {
+    const match = optimized.match(/a=rtpmap:(\d+)\s+opus\/48000/i);
+    if (match) {
+      const pt = match[1];
+      const fmtpRegex = new RegExp(`a=fmtp:${pt}\\s+([^\r\n]+)`, 'i');
+      if (fmtpRegex.test(optimized)) {
+        optimized = optimized.replace(
+          fmtpRegex,
+          `a=fmtp:${pt} $1;minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
+        );
+      } else {
+        optimized = optimized.replace(
+          `a=rtpmap:${pt} opus/48000/2`,
+          `a=rtpmap:${pt} opus/48000/2\r\na=fmtp:${pt} minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
+        );
+      }
+    }
+  }
+  return optimized;
+}
+
 class CallService {
   private pc: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
@@ -211,28 +241,31 @@ class CallService {
       let stream: MediaStream;
       if (callType === 'video') {
         stream = (await mediaDevices.getUserMedia({
-          audio: true,
+          audio: AUDIO_CONSTRAINTS as any,
           video: {
             facingMode: 'user',
-            width: {ideal: 1280},
-            height: {ideal: 720},
-            frameRate: {ideal: 30},
+            width: {ideal: 640, max: 1280},
+            height: {ideal: 480, max: 720},
+            frameRate: {ideal: 30, max: 30},
           },
         })) as MediaStream;
         this.isCameraOff = false;
       } else {
         // Pure audio call: Camera hardware is NOT activated
         stream = (await mediaDevices.getUserMedia({
-          audio: true,
+          audio: AUDIO_CONSTRAINTS as any,
           video: false,
         })) as MediaStream;
         this.isCameraOff = true;
       }
       this.localStream = stream;
 
-      // 2. Create PeerConnection
+      // 2. Create PeerConnection with instant candidate pooling & max-bundle
       const pc = new RTCPeerConnection({
         iceServers: APP_CONFIG.ICE_SERVERS as any,
+        iceCandidatePoolSize: 2,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
       });
       this.pc = pc;
 
@@ -240,16 +273,6 @@ class CallService {
       stream.getTracks().forEach(track => {
         pc.addTrack(track, stream);
       });
-
-      // Pre-allocate video transceiver with sendrecv so screen sharing and camera can be toggled instantly
-      if (callType === 'audio') {
-        try {
-          (pc as any).addTransceiver?.('video', {
-            direction: 'sendrecv',
-            streams: [stream],
-          });
-        } catch {}
-      }
 
       // 4. Handle ICE candidates
       pc.addEventListener('icecandidate', (event: any) => {
@@ -302,12 +325,13 @@ class CallService {
         }
       });
 
-      // 7. Create Offer & setLocalDescription (always offer audio & video)
+      // 7. Create Offer & setLocalDescription with Opus low-latency optimization
       const offer = await pc.createOffer({
         offerToReceiveAudio: true,
-        offerToReceiveVideo: true,
+        offerToReceiveVideo: callType === 'video',
       });
-      await pc.setLocalDescription(offer);
+      const optimizedOfferSdp = optimizeSdp(offer.sdp || '');
+      await pc.setLocalDescription(new RTCSessionDescription({type: 'offer', sdp: optimizedOfferSdp}));
 
       // 8. Send call_invite with offer SDP to peer
       this.signalSender?.(remoteUser.uid, {
@@ -315,7 +339,7 @@ class CallService {
         callId,
         callType,
         callerName: myDisplayName,
-        sdp: offer.sdp,
+        sdp: optimizedOfferSdp,
       });
 
       // 9. 35s Ringing timeout
@@ -358,28 +382,31 @@ class CallService {
       let stream: MediaStream;
       if (this.callType === 'video') {
         stream = (await mediaDevices.getUserMedia({
-          audio: true,
+          audio: AUDIO_CONSTRAINTS as any,
           video: {
             facingMode: 'user',
-            width: {ideal: 1280},
-            height: {ideal: 720},
-            frameRate: {ideal: 30},
+            width: {ideal: 640, max: 1280},
+            height: {ideal: 480, max: 720},
+            frameRate: {ideal: 30, max: 30},
           },
         })) as MediaStream;
         this.isCameraOff = false;
       } else {
         // Pure audio call: Camera is NOT activated
         stream = (await mediaDevices.getUserMedia({
-          audio: true,
+          audio: AUDIO_CONSTRAINTS as any,
           video: false,
         })) as MediaStream;
         this.isCameraOff = true;
       }
       this.localStream = stream;
 
-      // 2. Create PeerConnection
+      // 2. Create PeerConnection with instant candidate pooling & max-bundle
       const pc = new RTCPeerConnection({
         iceServers: APP_CONFIG.ICE_SERVERS as any,
+        iceCandidatePoolSize: 2,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
       });
       this.pc = pc;
 
@@ -387,16 +414,6 @@ class CallService {
       stream.getTracks().forEach(track => {
         pc.addTrack(track, stream);
       });
-
-      // Pre-allocate video transceiver with sendrecv so screen sharing and camera can be toggled instantly
-      if (this.callType === 'audio') {
-        try {
-          (pc as any).addTransceiver?.('video', {
-            direction: 'sendrecv',
-            streams: [stream],
-          });
-        } catch {}
-      }
 
       // 4. Handle ICE candidates
       pc.addEventListener('icecandidate', (event: any) => {
@@ -464,15 +481,16 @@ class CallService {
       }
       this.pendingCandidates = [];
 
-      // 8. Create Answer & setLocalDescription
+      // 8. Create Answer & setLocalDescription with Opus low-latency optimization
       const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+      const optimizedAnswerSdp = optimizeSdp(answer.sdp || '');
+      await pc.setLocalDescription(new RTCSessionDescription({type: 'answer', sdp: optimizedAnswerSdp}));
 
       // 9. Send call_answer back to caller
       this.signalSender?.(this.remoteUser.uid, {
         type: 'call_answer',
         callId,
-        sdp: answer.sdp,
+        sdp: optimizedAnswerSdp,
       });
 
       this.status = 'connected';
