@@ -2,8 +2,9 @@ services:
   - type: web
     name: nexa-messenger-server
     runtime: docker
-    dockerfilePath: backend/Dockerfile
-    dockerContext: backend
+    rootDir: backend
+    dockerfilePath: Dockerfile
+    dockerContext: .
     plan: free
     region: oregon
     envVars:
