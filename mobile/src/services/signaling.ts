@@ -56,6 +56,7 @@ export class TlsSignalingClient {
               settled = true;
               clearTimeout(timer);
               this.isConnected = true;
+              this.startHeartbeat();
               resolve();
             }
           };
@@ -182,6 +183,7 @@ export class TlsSignalingClient {
 
             settled = true;
             this.isConnected = true;
+            this.startHeartbeat();
             clearTimeout(timeout);
             resolve();
           } catch (e) {
@@ -242,23 +244,24 @@ export class TlsSignalingClient {
     } else if (this.socket) {
       this.socket.write(line);
     }
-    // Keep the long-lived signaling session active so the server can periodically
-    // revalidate revoked/expired sessions even when the user is idle in the chat screen.
-    if (!this.heartbeatTimer) {
-      this.heartbeatTimer = setInterval(() => {
-        if (this.connected) {
-          try {
-            if (this.ws) {
-              this.ws.send('{"type":"ping"}\n');
-            } else if (this.socket) {
-              this.socket.write('{"type":"ping"}\n');
-            }
-          } catch {
-            this.close();
+    this.startHeartbeat();
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.connected) {
+        try {
+          if (this.ws) {
+            this.ws.send('{"type":"ping"}\n');
+          } else if (this.socket) {
+            this.socket.write('{"type":"ping"}\n');
           }
+        } catch {
+          this.close();
         }
-      }, 25_000);
-    }
+      }
+    }, 7000);
   }
 
   request<T extends Frame = Frame>(frame: Frame, expectedType: string, timeoutMs = 12000): Promise<T> {

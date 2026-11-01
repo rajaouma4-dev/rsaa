@@ -77,6 +77,8 @@ export default function App() {
     }
   }, []);
 
+  const ensureConnectedRef = useRef<() => Promise<boolean>>(() => Promise.resolve(false));
+
   const attachSignalHandlers = useCallback((client: TlsSignalingClient) => {
     client.onFrame(frame => {
       if (frame.type === 'call_signal' && frame.from_uid && frame.payload) {
@@ -84,6 +86,11 @@ export default function App() {
       } else if (frame.type === 'data_frame' && (frame as any).payload) {
         void processDataEnvelopeRef.current((frame as any).payload);
       }
+    });
+    client.onClose(() => {
+      setTimeout(() => {
+        void ensureConnectedRef.current();
+      }, 300);
     });
   }, []);
 
@@ -159,6 +166,9 @@ export default function App() {
       const existingChat = currentChats.find(c => c.user.id === remoteUid);
       const conversationId = existingChat?.id || `cv_${remoteUid}`;
 
+      // Mark remote peer as online since call just finished
+      onlineUsersRef.current.add(remoteUid);
+
       // Persist to local database (AsyncStorage via messageStore)
       void appendLocalMessage(conversationId, callMsg);
       void saveSentMessageText(msgId, title);
@@ -169,6 +179,11 @@ export default function App() {
         if (found) {
           const updatedChat = {
             ...found,
+            user: {
+              ...found.user,
+              online: true,
+              lastActive: undefined,
+            },
             preview: title,
             time: 'Now',
             timestamp: now,
@@ -183,6 +198,7 @@ export default function App() {
               username: event.remoteUser.name.toLowerCase().replace(/\s+/g, '_'),
               name: event.remoteUser.name,
               online: true,
+              lastActive: undefined,
             },
             preview: title,
             time: 'Now',
@@ -198,6 +214,11 @@ export default function App() {
         if (current && current.user.id === remoteUid) {
           const updatedChat = {
             ...current,
+            user: {
+              ...current.user,
+              online: true,
+              lastActive: undefined,
+            },
             preview: title,
             time: 'Now',
             timestamp: now,
@@ -208,6 +229,11 @@ export default function App() {
         }
         return current;
       });
+
+      // Instantly ensure signaling and connection are refreshed
+      setTimeout(() => {
+        void ensureConnectedRef.current();
+      }, 200);
     });
 
     return () => {
@@ -615,16 +641,23 @@ export default function App() {
     }
   }, [session, createRealtime, flushOutbox]);
 
-  // Auto-recovery watchdog: retries when disconnected or failed with 5s backoff
   useEffect(() => {
-    if (!session?.live || rtcStatus === 'connected' || rtcStatus === 'connecting') return;
-    const timer = setTimeout(() => {
+    ensureConnectedRef.current = ensureConnected;
+  }, [ensureConnected]);
+
+  // Proactive real-time health-check watchdog: keeps connection permanently online
+  useEffect(() => {
+    if (!session?.live) return;
+    const interval = setInterval(() => {
       if (AppState.currentState === 'active') {
-        void ensureConnected();
+        const sig = signalRef.current;
+        if (!sig || !sig.connected) {
+          void ensureConnected();
+        }
       }
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, [rtcStatus, session, ensureConnected]);
+    }, 3500);
+    return () => clearInterval(interval);
+  }, [session, ensureConnected]);
 
   // AppState listener for instant foreground reconnect
   useEffect(() => {
