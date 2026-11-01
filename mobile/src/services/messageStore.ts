@@ -100,17 +100,27 @@ export async function getConversationPreview(conversationId: string): Promise<st
   }
 }
 
+const sentTextMemory = new Map<string, string>();
+
 export async function saveSentMessageText(messageId: string, text: string): Promise<void> {
   try {
     if (!messageId || !text) return;
+    sentTextMemory.set(messageId, text);
     await AsyncStorage.setItem(SENT_TEXT_PREFIX + messageId, text);
   } catch {}
 }
 
 export async function getSentMessageText(messageId: string): Promise<string | null> {
+  if (sentTextMemory.has(messageId)) {
+    return sentTextMemory.get(messageId)!;
+  }
   try {
     if (!messageId) return null;
-    return await AsyncStorage.getItem(SENT_TEXT_PREFIX + messageId);
+    const text = await AsyncStorage.getItem(SENT_TEXT_PREFIX + messageId);
+    if (text) {
+      sentTextMemory.set(messageId, text);
+    }
+    return text;
   } catch {
     return null;
   }

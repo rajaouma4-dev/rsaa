@@ -59,12 +59,14 @@ pub struct ConversationSummary {
     pub has_messages: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEnvelope {
     pub message_id: String,
     pub conversation_id: String,
     pub sender_uid: String,
     pub ciphertext_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_type: Option<u8>,
     pub created_at: String,
     pub status: String,
 }
@@ -76,6 +78,8 @@ pub enum DataChannelClientFrame {
         message_id: String,
         conversation_id: String,
         ciphertext_b64: String,
+        #[serde(default)]
+        msg_type: Option<u8>,
         created_at: Option<String>,
     },
     Chunk {
@@ -86,6 +90,7 @@ pub enum DataChannelClientFrame {
     },
     DeliveredAck { message_id: String },
     SeenAck { message_id: String },
+    SessionRepair { peer_uid: String },
     CallSignal { to_uid: String, payload: serde_json::Value },
     Ping,
     PresenceOffline,
@@ -96,6 +101,7 @@ pub enum DataChannelClientFrame {
 pub enum DataChannelServerFrame {
     SavedAck { message_id: String },
     NewMessage { message: MessageEnvelope },
+    SessionRepair { from_uid: String },
     Chunk {
         transfer_id: String,
         index: usize,

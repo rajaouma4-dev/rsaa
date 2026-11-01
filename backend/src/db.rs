@@ -86,6 +86,16 @@ impl Store {
         if !has_next_attempt_at {
             conn.execute("ALTER TABLE outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0", ()).await?;
         }
+        // Upgrade messages table with msg_type column if missing
+        let mut msg_columns = conn.query("PRAGMA table_info(messages)", ()).await?;
+        let mut has_msg_type = false;
+        while let Some(row) = msg_columns.next().await? {
+            let name: String = row.get(1)?;
+            has_msg_type |= name == "msg_type";
+        }
+        if !has_msg_type {
+            let _ = conn.execute("ALTER TABLE messages ADD COLUMN msg_type INTEGER NOT NULL DEFAULT 0", ()).await;
+        }
         // Create this index only after upgrading older outbox tables.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(recipient_uid, delivered_at, next_attempt_at)", ()).await?;
         Ok(())
@@ -273,15 +283,16 @@ impl Store {
         let cursor = before.unwrap_or("");
         if !cursor.is_empty() { validate_message_id(cursor)?; }
         let mut rows = conn.query(
-            "SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status FROM messages WHERE conversation_id = ?1 AND (?3 = '' OR EXISTS (SELECT 1 FROM messages cursor WHERE cursor.message_id = ?3 AND cursor.conversation_id = messages.conversation_id AND (CAST(messages.created_at AS INTEGER) < CAST(cursor.created_at AS INTEGER) OR (CAST(messages.created_at AS INTEGER) = CAST(cursor.created_at AS INTEGER) AND messages.message_id < cursor.message_id)))) ORDER BY CAST(created_at AS INTEGER) DESC, message_id DESC LIMIT ?2",
+            "SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status, msg_type FROM messages WHERE conversation_id = ?1 AND (?3 = '' OR EXISTS (SELECT 1 FROM messages cursor WHERE cursor.message_id = ?3 AND cursor.conversation_id = messages.conversation_id AND (CAST(messages.created_at AS INTEGER) < CAST(cursor.created_at AS INTEGER) OR (CAST(messages.created_at AS INTEGER) = CAST(cursor.created_at AS INTEGER) AND messages.message_id < cursor.message_id)))) ORDER BY CAST(created_at AS INTEGER) DESC, message_id DESC LIMIT ?2",
             libsql::params![conversation_id.to_owned(), limit.clamp(1, 100), cursor.to_owned()],
         ).await?;
         let mut messages = Vec::new();
         while let Some(row) = rows.next().await? {
             let bytes: Vec<u8> = row.get(3)?;
+            let mt: i64 = row.get(6).unwrap_or(0);
             messages.push(MessageEnvelope {
                 message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
-                ciphertext_b64: STANDARD.encode(bytes), created_at: row.get(4)?, status: row.get(5)?,
+                ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None }, created_at: row.get(4)?, status: row.get(5)?,
             });
         }
         messages.reverse();
@@ -289,7 +300,7 @@ impl Store {
     }
 
     /// Saves only opaque ciphertext, verifies membership, and atomically adds an outbox row.
-    pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8]) -> Result<(String, bool)> {
+    pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8], msg_type: Option<u8>) -> Result<(String, bool)> {
         validate_message_id(message_id)?;
         anyhow::ensure!(!ciphertext.is_empty() && ciphertext.len() <= 10 * 1024 * 1024, "invalid ciphertext size");
         let conn = self.connection().await?;
@@ -345,8 +356,8 @@ impl Store {
                 now_epoch_string()
             };
             let inserted = conn.execute(
-                "INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'SAVED')",
-                libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), recipient_uid.clone(), ciphertext.to_vec(), created_at],
+                "INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status, msg_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'SAVED', ?7)",
+                libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), recipient_uid.clone(), ciphertext.to_vec(), created_at, msg_type.unwrap_or(0) as i64],
             ).await?;
             if inserted == 1 {
                 let event_id = format!("deliver:{message_id}");
@@ -364,16 +375,17 @@ impl Store {
     pub async fn pending_deliveries(&self, recipient_uid: &str, limit: i64) -> Result<Vec<PendingDelivery>> {
         let conn = self.connection().await?;
         let mut rows = conn.query(
-            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.rowid ASC LIMIT ?3",
+            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status, m.msg_type FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.rowid ASC LIMIT ?3",
             libsql::params![recipient_uid.to_owned(), now_seconds(), limit.clamp(1, 100)],
         ).await?;
         let mut items = Vec::new();
         while let Some(row) = rows.next().await? {
             let bytes: Vec<u8> = row.get(3)?;
+            let mt: i64 = row.get(6).unwrap_or(0);
             items.push(PendingDelivery {
                 message: MessageEnvelope {
                     message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
-                    ciphertext_b64: STANDARD.encode(bytes), created_at: row.get(4)?, status: row.get(5)?,
+                    ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None }, created_at: row.get(4)?, status: row.get(5)?,
                 },
                 recipient_uid: recipient_uid.to_owned(),
             });

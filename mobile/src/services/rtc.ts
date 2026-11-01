@@ -344,7 +344,7 @@ export class ServerDataChannel {
   }
 
   /** Only send an E2EE ciphertext envelope or control frame here. */
-  sendControlFrame(frame: {type: 'delivered_ack' | 'seen_ack' | 'ping' | 'presence_offline' | 'call_signal'; message_id?: string; to_uid?: string; payload?: any}): void {
+  sendControlFrame(frame: {type: 'delivered_ack' | 'seen_ack' | 'ping' | 'presence_offline' | 'call_signal' | 'session_repair'; message_id?: string; to_uid?: string; peer_uid?: string; payload?: any}): void {
     if (!this.channel || this.channel.readyState !== 'open') throw new Error('WebRTC DataChannel is not connected');
     if ((frame.type === 'delivered_ack' || frame.type === 'seen_ack') && !frame.message_id) {
       throw new Error('A message ID is required for a receipt');

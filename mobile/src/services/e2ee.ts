@@ -128,6 +128,9 @@ class SignalProtocolStore implements libsignal.StorageType {
       return this.inMemorySessions.get(encodedAddress);
     }
     const val = await AsyncStorage.getItem(STORAGE_PREFIX + 'session_' + encodedAddress);
+    if (val) {
+      this.inMemorySessions.set(encodedAddress, val);
+    }
     return val ?? undefined;
   }
 
@@ -145,7 +148,41 @@ class SignalProtocolStore implements libsignal.StorageType {
 export class SignalE2EEService {
   private store = new SignalProtocolStore();
   private initialized = false;
-  private decryptQueue: Promise<any> = Promise.resolve();
+  private peerLocks = new Map<string, Promise<any>>();
+
+  private async runForPeer<T>(remoteUid: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.peerLocks.get(remoteUid) || Promise.resolve();
+    let resolveCurrent!: (val: T) => void;
+    let rejectCurrent!: (err: any) => void;
+    const current = new Promise<T>((res, rej) => {
+      resolveCurrent = res;
+      rejectCurrent = rej;
+    });
+
+    this.peerLocks.set(
+      remoteUid,
+      prev.then(
+        async () => {
+          try {
+            const res = await fn();
+            resolveCurrent(res);
+          } catch (err) {
+            rejectCurrent(err);
+          }
+        },
+        async () => {
+          try {
+            const res = await fn();
+            resolveCurrent(res);
+          } catch (err) {
+            rejectCurrent(err);
+          }
+        }
+      )
+    );
+
+    return current;
+  }
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -199,73 +236,76 @@ export class SignalE2EEService {
   }
 
   async clearSessionWithPeer(remoteUid: string): Promise<void> {
-    const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
-    await this.store.clearSession(remoteAddress.toString());
+    return this.runForPeer(remoteUid, async () => {
+      const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
+      await this.store.clearSession(remoteAddress.toString());
+    });
   }
 
   async establishSessionWithPeer(remoteUid: string, bundle: RemotePreKeyBundle): Promise<void> {
-    await this.initialize();
-    const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
-    const builder = new libsignal.SessionBuilder(this.store, remoteAddress);
+    return this.runForPeer(remoteUid, async () => {
+      await this.initialize();
+      const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
+      const builder = new libsignal.SessionBuilder(this.store, remoteAddress);
 
-    await builder.processPreKey({
-      registrationId: bundle.registrationId,
-      identityKey: base64ToArrayBuffer(bundle.identityKey),
-      signedPreKey: {
-        keyId: bundle.signedPreKeyId,
-        publicKey: base64ToArrayBuffer(bundle.signedPreKeyPublic),
-        signature: base64ToArrayBuffer(bundle.signedPreKeySignature),
-      },
-      preKey: {
-        keyId: bundle.preKeyId,
-        publicKey: base64ToArrayBuffer(bundle.preKeyPublic),
-      },
+      await builder.processPreKey({
+        registrationId: bundle.registrationId,
+        identityKey: base64ToArrayBuffer(bundle.identityKey),
+        signedPreKey: {
+          keyId: bundle.signedPreKeyId,
+          publicKey: base64ToArrayBuffer(bundle.signedPreKeyPublic),
+          signature: base64ToArrayBuffer(bundle.signedPreKeySignature),
+        },
+        preKey: {
+          keyId: bundle.preKeyId,
+          publicKey: base64ToArrayBuffer(bundle.preKeyPublic),
+        },
+      });
     });
   }
 
   async encrypt(remoteUid: string, plaintext: string): Promise<EncryptedMessagePayload> {
-    await this.initialize();
-    const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
-    const cipher = new libsignal.SessionCipher(this.store, remoteAddress);
+    return this.runForPeer(remoteUid, async () => {
+      await this.initialize();
+      const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
+      const cipher = new libsignal.SessionCipher(this.store, remoteAddress);
 
-    const plaintextBytes = Buffer.from(plaintext, 'utf8');
-    const cleanArrayBuffer = plaintextBytes.buffer.slice(
-      plaintextBytes.byteOffset,
-      plaintextBytes.byteOffset + plaintextBytes.byteLength,
-    );
+      const plaintextBytes = Buffer.from(plaintext, 'utf8');
+      const cleanArrayBuffer = plaintextBytes.buffer.slice(
+        plaintextBytes.byteOffset,
+        plaintextBytes.byteOffset + plaintextBytes.byteLength,
+      );
 
-    const envelope = await cipher.encrypt(cleanArrayBuffer);
-    if (!envelope.body) throw new Error('Cipher failed to produce ciphertext');
-    const bodyBase64 = Buffer.from(envelope.body, 'binary').toString('base64');
+      const envelope = await cipher.encrypt(cleanArrayBuffer);
+      if (!envelope.body) throw new Error('Cipher failed to produce ciphertext');
+      const bodyBase64 = Buffer.from(envelope.body, 'binary').toString('base64');
 
-    return {
-      type: envelope.type,
-      body_b64: bodyBase64,
-    };
+      return {
+        type: envelope.type,
+        body_b64: bodyBase64,
+      };
+    });
   }
 
   async decrypt(remoteUid: string, type: number, bodyBase64: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      this.decryptQueue = this.decryptQueue.then(async () => {
-        try {
-          const result = await this.doDecrypt(remoteUid, type, bodyBase64);
-          resolve(result);
-        } catch (err) {
-          reject(err);
-        }
-      });
+    return this.runForPeer(remoteUid, async () => {
+      return this.doDecrypt(remoteUid, type, bodyBase64);
     });
   }
 
   private isPreKeyWhisperPayload(rawBytes: Buffer): boolean {
     try {
-      if (rawBytes.length < 2) return false;
+      if (rawBytes.length < 35) return false;
       const decoded = PreKeyWhisperMessage.decode(rawBytes.slice(1));
       return Boolean(
         decoded &&
         decoded.baseKey &&
         decoded.baseKey.length === 33 &&
-        decoded.signedPreKeyId !== undefined
+        decoded.identityKey &&
+        decoded.identityKey.length === 33 &&
+        decoded.message &&
+        decoded.message.length > 0 &&
+        typeof decoded.signedPreKeyId === 'number'
       );
     } catch {
       return false;
@@ -283,31 +323,31 @@ export class SignalE2EEService {
 
     // Detect exact Signal protocol wire type:
     // If explicitly provided (type === 3 or type === 1), honor it.
-    // Otherwise, inspect the protobuf envelope directly to avoid trial decryption corruption.
-    const isPreKey = type === 3 || (type === 0 && this.isPreKeyWhisperPayload(rawBuffer));
+    // Otherwise, inspect the protobuf envelope directly.
+    const isPreKey = type === 3 || (type !== 1 && this.isPreKeyWhisperPayload(rawBuffer));
 
-    if (isPreKey) {
-      try {
+    try {
+      if (isPreKey) {
         decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-      } catch (preErr) {
-        // Fallback: try WhisperMessage in case of false positive detection
-        try {
-          decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
-        } catch {
-          throw preErr;
-        }
-      }
-    } else {
-      try {
+      } else {
         decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
-      } catch (whisperErr) {
-        // Fallback: try PreKeyWhisperMessage
-        try {
-          decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-        } catch {
-          throw whisperErr;
-        }
       }
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      console.warn(`[E2EE] Decryption error with peer ${remoteUid} (isPreKey=${isPreKey}):`, errMsg);
+
+      // If session is broken / Bad MAC / desynced, automatically clear the broken local session
+      // so subsequent messages can re-establish cleanly rather than failing permanently
+      if (
+        errMsg.includes('Bad MAC') ||
+        errMsg.includes('No record for device') ||
+        errMsg.includes('No session found') ||
+        errMsg.includes('Message key not found')
+      ) {
+        const addr = new libsignal.SignalProtocolAddress(remoteUid, 1);
+        await this.store.clearSession(addr.toString());
+      }
+      throw err;
     }
 
     if (!decryptedBuffer) {

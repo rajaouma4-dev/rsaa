@@ -250,6 +250,7 @@ pub async fn handle_client_frame(
             message_id,
             conversation_id,
             ciphertext_b64,
+            msg_type,
             created_at: _,
         } => {
             if ciphertext_b64.is_empty() || ciphertext_b64.len() > 10 * 1024 * 1024 {
@@ -283,7 +284,7 @@ pub async fn handle_client_frame(
                 cache.insert(message_id.clone(), uid.to_string());
             }
 
-            match db.save_ciphertext(&message_id, &conversation_id, uid, &ciphertext).await {
+            match db.save_ciphertext(&message_id, &conversation_id, uid, &ciphertext, msg_type).await {
                 Ok((recipient_uid, is_new)) => {
                     let saved_ack = DataChannelServerFrame::SavedAck { message_id: message_id.clone() };
                     reply_to_sender(channel, signal_tx, &saved_ack).await;
@@ -294,6 +295,7 @@ pub async fn handle_client_frame(
                             conversation_id: conversation_id.clone(),
                             sender_uid: uid.to_string(),
                             ciphertext_b64: ciphertext_b64.clone(),
+                            msg_type,
                             created_at: crate::db::now_epoch_string(),
                             status: "SAVED".to_string(),
                         };
@@ -306,6 +308,10 @@ pub async fn handle_client_frame(
                     reply_error(channel, signal_tx, "SAVE_FAILED", &err.to_string()).await;
                 }
             }
+        }
+        DataChannelClientFrame::SessionRepair { peer_uid } => {
+            let frame = DataChannelServerFrame::SessionRepair { from_uid: uid.to_string() };
+            send_to_user(channels, live_signaling, &peer_uid, &frame).await;
         }
         DataChannelClientFrame::DeliveredAck { message_id } => {
             let cached_sender = {

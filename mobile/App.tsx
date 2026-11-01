@@ -247,6 +247,7 @@ export default function App() {
     conversationId: string;
     recipientUid: string;
     ciphertextB64: string;
+    msgType?: number;
   }[]>([]);
 
   const flushOutbox = useCallback(async () => {
@@ -264,6 +265,7 @@ export default function App() {
           message_id: item.messageId,
           conversation_id: item.conversationId,
           ciphertext_b64: item.ciphertextB64,
+          msg_type: item.msgType,
         };
         if (rtc && rtc.isOpen) {
           await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
@@ -332,6 +334,11 @@ export default function App() {
           selectedRef.current = updated;
           return updated;
         });
+      } else if (envelope.type === 'session_repair') {
+        const peerUid = envelope.from_uid || envelope.peer_uid;
+        if (peerUid) {
+          void e2eeService.clearSessionWithPeer(peerUid);
+        }
       } else if (envelope.type === 'new_conversation' && envelope.conversation_id && envelope.user) {
         const newChat: Chat = {
           id: envelope.conversation_id,
@@ -373,10 +380,19 @@ export default function App() {
 
           let decryptedText = 'Encrypted message';
           try {
-            decryptedText = await e2eeService.decrypt(incoming.sender_uid, 0, incoming.ciphertext_b64);
+            decryptedText = await e2eeService.decrypt(incoming.sender_uid, (incoming as any).msg_type || 0, incoming.ciphertext_b64);
           } catch (err) {
             console.warn('Decryption failed:', err);
             decryptedText = 'Decryption failed · Bad MAC or missing session';
+            // Request sender to re-key with a fresh session
+            try {
+              const repairPayload = {type: 'session_repair' as const, peer_uid: incoming.sender_uid};
+              if (rtcRef.current?.isOpen) {
+                rtcRef.current.sendControlFrame(repairPayload);
+              } else if (signalRef.current?.connected) {
+                signalRef.current.send({type: 'data_frame', payload: repairPayload});
+              }
+            } catch {}
           }
 
           let msgMediaType: 'text' | 'image' | 'voice' = 'text';
@@ -746,12 +762,24 @@ export default function App() {
       }, 'history');
 
       const serverMessages = response.messages || [];
-      const localMap = new Map<string, any>();
-      for (const m of initialMsgs) {
-        localMap.set(m.id, m);
-      }
 
-      const merged: any[] = [];
+      // 1. Gather all local candidate messages to ensure 0 messages are lost:
+      // - initialMsgs captured at openChat start
+      // - fresh messages written to storage while history was in flight
+      // - in-memory messages in selectedRef.current (optimistically sent or real-time incoming)
+      const freshLocalMsgs = await getLocalMessages(chat.id);
+      const inMemoryMsgs =
+        selectedRef.current &&
+        (selectedRef.current.id === chat.id || selectedRef.current.user.id === chat.user.id)
+          ? selectedRef.current.messages
+          : [];
+
+      const localMap = new Map<string, ChatMessage>();
+      for (const m of initialMsgs) localMap.set(m.id, m);
+      for (const m of freshLocalMsgs) localMap.set(m.id, m);
+      for (const m of inMemoryMsgs) localMap.set(m.id, m);
+
+      const merged: ChatMessage[] = [];
 
       for (const sm of serverMessages) {
         const existing = localMap.get(sm.message_id);
@@ -761,7 +789,13 @@ export default function App() {
 
         const smTimestamp = Number(sm.created_at) * 1000 || Date.now();
 
-        if (existing && existing.text && existing.text !== 'Sent message' && !existing.text.startsWith('Encrypted message') && !existing.text.startsWith('Decryption failed')) {
+        if (
+          existing &&
+          existing.text &&
+          existing.text !== 'Sent message' &&
+          !existing.text.startsWith('Encrypted message') &&
+          !existing.text.startsWith('Decryption failed')
+        ) {
           // Already decrypted and stored locally! Keep the plaintext!
           merged.push({
             ...existing,
@@ -772,7 +806,7 @@ export default function App() {
           // New message or message with placeholder text needing restoration
           let text = existing?.text && existing.text !== 'Sent message' ? existing.text : 'Encrypted message';
           if (sm.sender_uid === session?.uid) {
-            // Check persistent sent text cache first
+            // Check persistent and in-memory sent text cache first
             const cachedSent = await getSentMessageText(sm.message_id);
             if (cachedSent) {
               text = cachedSent;
@@ -780,23 +814,24 @@ export default function App() {
               text = existing.text;
             } else {
               // Match against optimistic local sent message by timestamp
-              const opt = initialMsgs.find(m =>
-                m.from === 'me' &&
-                m.text &&
-                m.text !== 'Sent message' &&
-                !m.text.startsWith('Encrypted message') &&
-                Math.abs(getMessageTimestamp(m) - smTimestamp) < 30000
+              const opt = Array.from(localMap.values()).find(
+                m =>
+                  m.from === 'me' &&
+                  m.text &&
+                  m.text !== 'Sent message' &&
+                  !m.text.startsWith('Encrypted message') &&
+                  Math.abs(getMessageTimestamp(m) - smTimestamp) < 30000
               );
               if (opt) {
                 text = opt.text;
-                await saveSentMessageText(sm.message_id, text);
+                void saveSentMessageText(sm.message_id, text);
               } else {
                 text = existing?.text && existing.text !== 'Sent message' ? existing.text : 'Encrypted message';
               }
             }
           } else {
             try {
-              text = await e2eeService.decrypt(sm.sender_uid, 0, sm.ciphertext_b64);
+              text = await e2eeService.decrypt(sm.sender_uid, (sm as any).msg_type || 0, sm.ciphertext_b64);
             } catch {
               text = existing?.text || 'Encrypted message';
             }
@@ -843,8 +878,8 @@ export default function App() {
         }
       }
 
-      // Preserve any optimistic messages not yet returned by server history
-      for (const m of initialMsgs) {
+      // Preserve ANY local messages not yet returned by server history (optimistic sends, real-time incoming)
+      for (const m of localMap.values()) {
         if (!merged.some(item => item.id === m.id)) {
           merged.push(m);
         }
@@ -872,9 +907,17 @@ export default function App() {
         timestamp: lastMerged?.timestamp || chat.timestamp,
         messages: merged,
       };
-      setSelected(current => current?.id === chat.id ? updated : current);
-      selectedRef.current = updated;
-      setChats(prev => prev.map(item => item.id === chat.id ? updated : item));
+      setSelected(current => {
+        if (!current) return current;
+        if (current.id === chat.id || current.user.id === chat.user.id) {
+          return updated;
+        }
+        return current;
+      });
+      if (selectedRef.current && (selectedRef.current.id === chat.id || selectedRef.current.user.id === chat.user.id)) {
+        selectedRef.current = updated;
+      }
+      setChats(prev => prev.map(item => (item.id === chat.id || item.user.id === chat.user.id) ? updated : item));
 
       // Acknowledge seen for any incoming messages in the merged history
       for (const m of merged) {
@@ -1028,13 +1071,14 @@ export default function App() {
         await e2eeService.establishSessionWithPeer(recipientUid, res.bundle);
       }
 
-      const {body_b64} = await e2eeService.encrypt(recipientUid, plaintextPayload);
+      const {type: msgType, body_b64} = await e2eeService.encrypt(recipientUid, plaintextPayload);
 
       const queueItem = {
         messageId: tempMsgId,
         conversationId,
         recipientUid,
         ciphertextB64: body_b64,
+        msgType,
       };
 
       const payloadObj = {
@@ -1042,6 +1086,7 @@ export default function App() {
         message_id: tempMsgId,
         conversation_id: conversationId,
         ciphertext_b64: body_b64,
+        msg_type: msgType,
       };
 
       if (rtc && rtc.isOpen) {
