@@ -253,7 +253,8 @@ export default function App() {
   const flushOutbox = useCallback(async () => {
     if (outboxRef.current.length === 0) return;
     const rtc = rtcRef.current;
-    if (!rtc || !rtc.isOpen) return;
+    const sig = signalRef.current;
+    if ((!rtc || !rtc.isOpen) && (!sig || !sig.connected)) return;
 
     const queue = [...outboxRef.current];
     outboxRef.current = [];
@@ -267,7 +268,13 @@ export default function App() {
           ciphertext_b64: item.ciphertextB64,
           msg_type: item.msgType,
         };
-        await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
+        if (rtc && rtc.isOpen) {
+          await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
+        } else if (sig && sig.connected) {
+          sig.send({type: 'data_frame', payload: payloadObj});
+        } else {
+          outboxRef.current.push(item);
+        }
       } catch {
         outboxRef.current.push(item);
       }
@@ -349,6 +356,8 @@ export default function App() {
           try {
             if (rtcRef.current?.isOpen) {
               rtcRef.current.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id});
+            } else if (signalRef.current?.connected) {
+              signalRef.current.send({type: 'data_frame', payload: {type: 'delivered_ack', message_id: incoming.message_id}});
             }
           } catch {}
 
@@ -357,6 +366,8 @@ export default function App() {
             try {
               if (rtcRef.current?.isOpen) {
                 rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: incoming.message_id});
+              } else if (signalRef.current?.connected) {
+                signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: incoming.message_id}});
               }
             } catch {}
           }
@@ -475,9 +486,11 @@ export default function App() {
   const createRealtime = useCallback((signal: TlsSignalingClient) => {
     const rtc = new ServerDataChannel(signal);
     rtc.onConnectionStatus(status => {
-      setRtcStatus(status);
-      if (status === 'connected') {
+      if (status === 'connected' || signalRef.current?.connected) {
+        setRtcStatus('connected');
         void flushOutbox();
+      } else {
+        setRtcStatus(status);
       }
     });
     rtc.onMessage(packet => {
@@ -560,19 +573,21 @@ export default function App() {
 
   const ensureConnected = useCallback(async (): Promise<boolean> => {
     if (!session?.live) return false;
-    if (rtcRef.current?.isOpen) {
+    if (signalRef.current?.connected) {
       setRtcStatus('connected');
+      void flushOutbox();
       return true;
     }
     if (reconnectingRef.current) {
       for (let i = 0; i < 25; i++) {
-        if (rtcRef.current?.isOpen) {
+        if (signalRef.current?.connected) {
           setRtcStatus('connected');
+          void flushOutbox();
           return true;
         }
         await new Promise<void>(r => setTimeout(r, 100));
       }
-      return rtcRef.current?.isOpen || false;
+      return signalRef.current?.connected || false;
     }
 
     reconnectingRef.current = true;
@@ -597,37 +612,19 @@ export default function App() {
         }
       }
 
-      // 2. Freshly connect WebRTC DataChannel (rebuild if signal was recreated or rtc is null)
+      setRtcStatus('connected');
+      void flushOutbox();
+
+      // 2. Connect WebRTC DataChannel (accelerated peer data channel)
       let rtc = rtcRef.current;
       if (!rtc || signalRecreated) {
         try { rtc?.close(); } catch {}
         rtc = createRealtime(signal);
         rtcRef.current = rtc;
-      }
-      try {
-        await rtc.connectAuthenticated();
-      } catch (rtcErr) {
-        console.warn('WebRTC DataChannel setup error:', rtcErr);
+        void rtc.connectAuthenticated().catch(() => {});
       }
 
-      // Strictly wait for WebRTC DataChannel to open
-      for (let i = 0; i < 25; i++) {
-        if (rtc.isOpen) {
-          setRtcStatus('connected');
-          void flushOutbox();
-          return true;
-        }
-        await new Promise<void>(r => setTimeout(r, 200));
-      }
-
-      if (rtc.isOpen) {
-        setRtcStatus('connected');
-        void flushOutbox();
-        return true;
-      } else {
-        setRtcStatus('connecting');
-        return false;
-      }
+      return true;
     } catch (err) {
       console.warn('Auto-reconnect error:', err);
       setRtcStatus('failed');
@@ -901,7 +898,11 @@ export default function App() {
       for (const m of merged) {
         if (m.from === 'them' && m.status !== 'seen') {
           try {
-            rtcRef.current?.sendControlFrame({type: 'seen_ack', message_id: m.id});
+            if (rtcRef.current?.isOpen) {
+              rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: m.id});
+            } else if (signalRef.current?.connected) {
+              signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: m.id}});
+            }
           } catch {}
         }
       }
@@ -1072,8 +1073,21 @@ export default function App() {
         try {
           await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
         } catch (sendErr) {
+          if (signal?.connected) {
+            try {
+              signal.send({type: 'data_frame', payload: payloadObj});
+            } catch {
+              outboxRef.current.push(queueItem);
+            }
+          } else {
+            outboxRef.current.push(queueItem);
+          }
+        }
+      } else if (signal && signal.connected) {
+        try {
+          signal.send({type: 'data_frame', payload: payloadObj});
+        } catch {
           outboxRef.current.push(queueItem);
-          throw sendErr;
         }
       } else {
         outboxRef.current.push(queueItem);

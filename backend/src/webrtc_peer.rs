@@ -212,7 +212,18 @@ pub async fn handle_client_frame(
         DataChannelClientFrame::CallSignal { to_uid, payload } => {
             let from_uid = uid.to_string();
             let mut sent = false;
-            // 1. Try sending via target's DataChannel
+            // 1. Send via target's live signaling socket (guaranteed delivery over TLS WebSocket/TCP)
+            {
+                let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
+                if let Some(target_tx) = target_tx {
+                    let _ = target_tx.send(ServerFrame::CallSignal {
+                        from_uid: from_uid.clone(),
+                        payload: payload.clone(),
+                    }).await;
+                    sent = true;
+                }
+            }
+            // 2. Also forward via DataChannel if target has an active DataChannel
             {
                 let target_dc = { channels.read().await.get(&to_uid).cloned() };
                 if let Some(target_dc) = target_dc {
@@ -226,17 +237,7 @@ pub async fn handle_client_frame(
                     }
                 }
             }
-            // 2. If not sent via DataChannel, try sending via target's signaling socket
-            if !sent {
-                let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
-                if let Some(target_tx) = target_tx {
-                    let _ = target_tx.send(ServerFrame::CallSignal {
-                        from_uid: from_uid.clone(),
-                        payload: payload.clone(),
-                    }).await;
-                    sent = true;
-                }
-            }
+            tracing::info!(from = %from_uid, to = %to_uid, signal_type = ?payload.get("type"), sent = %sent, "call_signal dispatched");
             if !sent && payload.get("type").and_then(|t| t.as_str()) == Some("call_invite") {
                 let s_frame = DataChannelServerFrame::CallSignal {
                     from_uid: to_uid.clone(),
