@@ -37,14 +37,17 @@ export const APP_CONFIG = {
   ICE_TRANSPORT_POLICY: 'all' as const,
   APP_NAME: 'Nexa Chat',
   // WebSocket signaling URL for Render / Cloud (e.g. wss://your-service.onrender.com)
-  SIGNALING_URL: '',
+  SIGNALING_URL: 'wss://rsaa.onrender.com',
 };
 
 export function updateSignalingHost(host: string) {
   const trimmed = host.trim();
-  if (trimmed.startsWith('ws://') || trimmed.startsWith('wss://')) {
-    APP_CONFIG.SIGNALING_URL = trimmed;
-    APP_CONFIG.SIGNALING_HOST = trimmed.replace(/^wss?:\/\//i, '').replace(/:\d+$/, '').replace(/\/.*$/, '');
+  if (trimmed.startsWith('ws://') || trimmed.startsWith('wss://') || trimmed.includes('onrender.com')) {
+    const url = trimmed.startsWith('ws')
+      ? trimmed
+      : `wss://${trimmed.replace(/^https?:\/\//i, '').replace(/\/$/, '')}`;
+    APP_CONFIG.SIGNALING_URL = url;
+    APP_CONFIG.SIGNALING_HOST = url.replace(/^wss?:\/\//i, '').replace(/:\d+$/, '').replace(/\/.*$/, '');
     return;
   }
   const cleaned = trimmed.replace(/^https?:\/\//i, '').replace(/:\d+$/, '');
