@@ -633,16 +633,6 @@ pub async fn build_answerer(
             ],
             ..Default::default()
         },
-        RTCIceServer {
-            urls: vec![
-                "turn:openrelay.metered.ca:80".to_string(),
-                "turn:openrelay.metered.ca:443".to_string(),
-                "turn:openrelay.metered.ca:443?transport=tcp".to_string(),
-            ],
-            username: "openrelayproject".to_string(),
-            credential: "openrelayproject".to_string(),
-            ..Default::default()
-        },
     ];
     let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();
     let peer = PeerConnectionBuilder::new()

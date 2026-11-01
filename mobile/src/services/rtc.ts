@@ -157,6 +157,13 @@ export class ServerDataChannel {
       this.keepaliveTimer = undefined;
       if (this.signal.connected) {
         this.onStatus?.('connected');
+        if (!this.isDestroyed) {
+          setTimeout(() => {
+            if (!this.isDestroyed && this.signal.connected && (!this.channel || this.channel.readyState !== 'open')) {
+              void this.connectAuthenticated().catch(() => {});
+            }
+          }, 1500);
+        }
       } else {
         this.onStatus?.('disconnected');
       }
@@ -175,12 +182,26 @@ export class ServerDataChannel {
       } else if (state === 'failed') {
         if (this.signal.connected) {
           this.onStatus?.('connected');
+          if (!this.isDestroyed) {
+            setTimeout(() => {
+              if (!this.isDestroyed && this.signal.connected && (!this.channel || this.channel.readyState !== 'open')) {
+                void this.connectAuthenticated().catch(() => {});
+              }
+            }, 1500);
+          }
         } else {
           this.onStatus?.('failed');
         }
       } else if (state === 'closed' || state === 'disconnected') {
         if (this.signal.connected) {
           this.onStatus?.('connected');
+          if (!this.isDestroyed && state === 'closed') {
+            setTimeout(() => {
+              if (!this.isDestroyed && this.signal.connected && (!this.channel || this.channel.readyState !== 'open')) {
+                void this.connectAuthenticated().catch(() => {});
+              }
+            }, 1500);
+          }
         } else {
           this.onStatus?.('disconnected');
         }
