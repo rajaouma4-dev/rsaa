@@ -7,9 +7,9 @@ use db::Store;
 use futures_util::{SinkExt, StreamExt};
 use protocol::{ClientFrame, DataChannelServerFrame, ServerFrame};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{collections::{HashMap, VecDeque}, env, fs::File, io::BufReader, net::IpAddr, sync::Arc};
+use std::{collections::{HashMap, VecDeque}, env, fs::File, io::BufReader, net::IpAddr, pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader as TokioBufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader as TokioBufReader, ReadBuf},
     net::TcpListener,
     sync::{mpsc, Mutex, Semaphore},
     time::{timeout, Duration, Instant},
@@ -542,6 +542,53 @@ where
     Ok(())
 }
 
+struct PrefixedStream<S> {
+    prefix: Vec<u8>,
+    pos: usize,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self { prefix, pos: 0, inner }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let available = &self.prefix[self.pos..];
+            let to_copy = std::cmp::min(available.len(), buf.remaining());
+            buf.put_slice(&available[..to_copy]);
+            self.pos += to_copy;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 async fn handle_ws_client(
     mut stream: tokio::net::TcpStream,
     store: Store,
@@ -551,18 +598,42 @@ async fn handle_ws_client(
     auth_limiter: AuthRateLimiter,
     client_ip: IpAddr,
 ) -> Result<()> {
-    // If Render port scanner or browser sends a plain HTTP GET request, respond with 200 OK immediately
-    let mut peek_buf = [0u8; 1024];
-    let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
-    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
-    if peek_str.starts_with("GET ") && !peek_str.to_lowercase().contains("upgrade: websocket") {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\nConnection: close\r\n\r\n{\"status\":\"ok\",\"service\":\"nexa-messenger-server\"}";
-        let _ = stream.write_all(response).await;
+    // Read initial data from stream (waiting up to 5 seconds for client probe or websocket headers)
+    let mut initial_buf = Vec::new();
+    let mut temp = [0u8; 1024];
+    loop {
+        let n = match timeout(Duration::from_secs(5), stream.read(&mut temp)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => break,
+        };
+        initial_buf.extend_from_slice(&temp[..n]);
+        if initial_buf.windows(4).any(|w| w == b"\r\n\r\n") || initial_buf.len() >= 4096 {
+            break;
+        }
+    }
+
+    if initial_buf.is_empty() {
+        return Ok(());
+    }
+
+    let req_str = String::from_utf8_lossy(&initial_buf);
+    let is_ws_upgrade = req_str.to_lowercase().contains("upgrade: websocket");
+
+    // If Render port scanner, health check probe, or web browser sends a plain HTTP request
+    if !is_ws_upgrade {
+        let body = b"{\"status\":\"ok\",\"service\":\"nexa-messenger-server\"}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(body).await;
         let _ = stream.flush().await;
         return Ok(());
     }
 
-    let ws_stream = tokio_tungstenite::accept_async(stream).await
+    let prefixed = PrefixedStream::new(initial_buf, stream);
+    let ws_stream = tokio_tungstenite::accept_async(prefixed).await
         .context("WebSocket handshake failed")?;
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
 

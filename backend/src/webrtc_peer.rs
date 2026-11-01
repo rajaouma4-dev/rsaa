@@ -548,28 +548,25 @@ pub async fn build_answerer(
     ice_urls: Vec<String>,
 ) -> Result<(Arc<dyn PeerConnection>, String)> {
     let handler = ServerPeerHandler { uid, db, channels, live_signaling, signal_tx };
-    // Google STUN only: filter out any non-STUN or TURN URLs.
+    // Google Global STUN pool only: strictly discard unreachable/dead TURN relays that cause 15s timeouts
     let stun_urls: Vec<String> = ice_urls
         .into_iter()
-        .filter(|url| url.starts_with("stun:") || url.starts_with("turn:") || url.starts_with("turns:"))
+        .filter(|url| url.starts_with("stun:"))
         .collect();
     let effective_urls = if stun_urls.is_empty() {
-        vec!["stun:stun.l.google.com:19302".to_string()]
+        vec![
+            "stun:stun.l.google.com:19302".to_string(),
+            "stun:stun1.l.google.com:19302".to_string(),
+            "stun:stun2.l.google.com:19302".to_string(),
+        ]
     } else {
         stun_urls
     };
-    let turn_user = std::env::var("TURN_USERNAME").unwrap_or_else(|_| "openrelayproject".into());
-    let turn_pass = std::env::var("TURN_CREDENTIAL").unwrap_or_else(|_| "openrelayproject".into());
     let ice_servers: Vec<RTCIceServer> = effective_urls
         .into_iter()
-        .map(|url| {
-            let is_turn = url.starts_with("turn:") || url.starts_with("turns:");
-            RTCIceServer {
-                urls: vec![url],
-                username: if is_turn { turn_user.clone() } else { String::new() },
-                credential: if is_turn { turn_pass.clone() } else { String::new() },
-                ..Default::default()
-            }
+        .map(|url| RTCIceServer {
+            urls: vec![url],
+            ..Default::default()
         })
         .collect();
     let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();

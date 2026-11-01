@@ -45,7 +45,7 @@ export class TlsSignalingClient {
             this.isConnected = false;
             reject(new Error(`WebSocket signaling connection to ${wsUrl} timed out`));
           }
-        }, 8000);
+        }, 25000);
 
         try {
           const ws = new WebSocket(wsUrl);

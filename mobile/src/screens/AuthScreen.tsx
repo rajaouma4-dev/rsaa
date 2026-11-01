@@ -46,15 +46,15 @@ export function AuthScreen({
         msg.toLowerCase().includes('user not found') ||
         msg.toLowerCase().includes('invalid username')
       ) {
-        setError('Invalid username or password.');
+        setError(isRegister ? 'Username may already be taken or invalid.' : 'Invalid username or password. If new, tap "Create account" below.');
       } else if (
         msg.toLowerCase().includes('connect') ||
         msg.toLowerCase().includes('econnrefused') ||
         msg.toLowerCase().includes('timed out')
       ) {
-        setError(`Could not connect to ${serverHost}. Tap 'SERVER' to change.`);
+        setError(`Could not connect to ${serverHost}. Please wait 5s and try again.`);
       } else {
-        setError(msg || 'Invalid username or password.');
+        setError(msg || (isRegister ? 'Registration failed.' : 'Invalid username or password.'));
       }
     } finally {
       setLocalBusy(false);
