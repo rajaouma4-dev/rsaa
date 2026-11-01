@@ -13,6 +13,6 @@ services:
       - key: TURSO_AUTH_TOKEN
         sync: false
       - key: ICE_URLS
-        value: stun:stun.l.google.com:19302,turn:openrelay.metered.ca:80,turn:openrelay.metered.ca:443
+        value: stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302,stun:stun3.l.google.com:19302,stun:stun4.l.google.com:19302
       - key: RUST_LOG
         value: nexa_messenger_server=info,webrtc=warn

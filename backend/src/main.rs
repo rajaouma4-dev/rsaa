@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     let connection_slots = Arc::new(Semaphore::new(max_connections));
     tokio::spawn(run_delivery_worker(store.clone(), channels.clone()));
     let ice_urls: Vec<String> = env::var("ICE_URLS")
-        .unwrap_or_else(|_| "stun:stun.l.google.com:19302,turn:openrelay.metered.ca:80,turn:openrelay.metered.ca:443".into())
+        .unwrap_or_else(|_| "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302,stun:stun3.l.google.com:19302,stun:stun4.l.google.com:19302".into())
         .split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
 
     // 1. WebSocket listener (Port 80/443 on Render via $PORT, or 7444 for local dev)
@@ -466,8 +466,14 @@ where
             }
             ClientFrame::IceCandidate { candidate } => {
                 if let Some(peer) = current_peer.as_ref() {
-                    if let Ok(cand_init) = serde_json::from_value::<webrtc::peer_connection::RTCIceCandidateInit>(candidate) {
-                        let _ = peer.add_ice_candidate(cand_init).await;
+                    match serde_json::from_value::<webrtc::peer_connection::RTCIceCandidateInit>(candidate) {
+                        Ok(cand_init) => {
+                            tracing::info!(candidate = %cand_init.candidate, "server accepted client ICE candidate");
+                            let _ = peer.add_ice_candidate(cand_init).await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "could not parse client ICE candidate");
+                        }
                     }
                 }
             }
@@ -514,7 +520,7 @@ where
 }
 
 async fn handle_ws_client(
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     store: Store,
     channels: LiveChannels,
     live_signaling: LiveSignaling,
@@ -522,6 +528,17 @@ async fn handle_ws_client(
     auth_limiter: AuthRateLimiter,
     client_ip: IpAddr,
 ) -> Result<()> {
+    // If Render port scanner or browser sends a plain HTTP GET request, respond with 200 OK immediately
+    let mut peek_buf = [0u8; 1024];
+    let n = stream.peek(&mut peek_buf).await.unwrap_or(0);
+    let peek_str = String::from_utf8_lossy(&peek_buf[..n]);
+    if peek_str.starts_with("GET ") && !peek_str.to_lowercase().contains("upgrade: websocket") {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 48\r\nConnection: close\r\n\r\n{\"status\":\"ok\",\"service\":\"nexa-messenger-server\"}";
+        let _ = stream.write_all(response).await;
+        let _ = stream.flush().await;
+        return Ok(());
+    }
+
     let ws_stream = tokio_tungstenite::accept_async(stream).await
         .context("WebSocket handshake failed")?;
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
@@ -796,8 +813,14 @@ async fn handle_ws_client(
             }
             ClientFrame::IceCandidate { candidate } => {
                 if let Some(peer) = current_peer.as_ref() {
-                    if let Ok(cand_init) = serde_json::from_value::<webrtc::peer_connection::RTCIceCandidateInit>(candidate) {
-                        let _ = peer.add_ice_candidate(cand_init).await;
+                    match serde_json::from_value::<webrtc::peer_connection::RTCIceCandidateInit>(candidate) {
+                        Ok(cand_init) => {
+                            tracing::info!(candidate = %cand_init.candidate, "server accepted client ICE candidate");
+                            let _ = peer.add_ice_candidate(cand_init).await;
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "could not parse client ICE candidate");
+                        }
                     }
                 }
             }
@@ -904,5 +927,16 @@ mod tests {
         let input = b"12345\n";
         let mut reader = BufReader::new(&input[..]);
         assert!(read_bounded_line(&mut reader, 4).await.is_err());
+    }
+
+    #[test]
+    fn test_candidate_deserialization() {
+        let json_val = serde_json::json!({
+            "candidate": "candidate:1 1 UDP 2013266431 192.168.1.1 50000 typ host",
+            "sdpMid": "0",
+            "sdpMLineIndex": 0
+        });
+        let res = serde_json::from_value::<webrtc::peer_connection::RTCIceCandidateInit>(json_val);
+        assert!(res.is_ok(), "Failed to deserialize camelCase candidate: {:?}", res.err());
     }
 }

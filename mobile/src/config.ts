@@ -13,7 +13,7 @@ export const APP_CONFIG = {
     '5cb40b8a7ce95411ba3700c900abb8fe95cfa1bce124230c45371110f6605eb7',
   ],
   MAX_SIGNAL_FRAME_BYTES: 65_536,
-  // Google Global STUN pool + Global TURN Relay for 100% worldwide connectivity across all mobile carriers
+  // Google Global STUN pool for instant NAT hole punching across mobile carriers
   ICE_SERVERS: [
     {
       urls: [
@@ -23,15 +23,6 @@ export const APP_CONFIG = {
         'stun:stun3.l.google.com:19302',
         'stun:stun4.l.google.com:19302',
       ],
-    },
-    {
-      urls: [
-        'turn:openrelay.metered.ca:80',
-        'turn:openrelay.metered.ca:443',
-        'turns:openrelay.metered.ca:443?transport=tcp',
-      ],
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
     },
   ],
   ICE_TRANSPORT_POLICY: 'all' as const,
