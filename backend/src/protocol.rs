@@ -17,6 +17,7 @@ pub enum ClientFrame {
     PublishPrekeys { bundle: serde_json::Value },
     GetPrekeyBundle { uid: String },
     CallSignal { to_uid: String, payload: serde_json::Value },
+    DataFrame { payload: serde_json::Value },
     Ping,
 }
 
@@ -37,6 +38,7 @@ pub enum ServerFrame {
     Answer { sdp: String },
     IceCandidate { candidate: serde_json::Value },
     CallSignal { from_uid: String, payload: serde_json::Value },
+    DataFrame { payload: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Serialize)]

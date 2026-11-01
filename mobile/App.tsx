@@ -72,6 +72,8 @@ export default function App() {
     client.onFrame(frame => {
       if (frame.type === 'call_signal' && frame.from_uid && frame.payload) {
         void callService.handleSignal(String(frame.from_uid), frame.payload);
+      } else if (frame.type === 'data_frame' && (frame as any).payload) {
+        void processDataEnvelopeRef.current((frame as any).payload);
       }
     });
   }, []);
@@ -204,6 +206,7 @@ export default function App() {
       unsubCallEnd();
     };
   }, []);
+
   const outboxRef = useRef<{
     messageId: string;
     conversationId: string;
@@ -212,19 +215,26 @@ export default function App() {
   }[]>([]);
 
   const flushOutbox = useCallback(async () => {
+    if (outboxRef.current.length === 0) return;
     const rtc = rtcRef.current;
-    if (!rtc || !rtc.isOpen || outboxRef.current.length === 0) return;
+    const sig = signalRef.current;
+    if ((!rtc || !rtc.isOpen) && (!sig || !sig.connected)) return;
+
     const queue = [...outboxRef.current];
     outboxRef.current = [];
     for (const item of queue) {
       try {
-        const payload = JSON.stringify({
+        const payloadObj = {
           type: 'send_message',
           message_id: item.messageId,
           conversation_id: item.conversationId,
           ciphertext_b64: item.ciphertextB64,
-        });
-        await rtc.sendEncryptedEnvelope(payload);
+        };
+        if (rtc && rtc.isOpen) {
+          await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
+        } else if (sig && sig.connected) {
+          sig.send({ type: 'data_frame', payload: payloadObj });
+        }
       } catch {
         outboxRef.current.push(item);
       }
@@ -234,6 +244,187 @@ export default function App() {
   useEffect(() => {
     selectedRef.current = selected;
   }, [selected]);
+
+  const processDataEnvelope = useCallback(async (envelope: any) => {
+    try {
+      if (!envelope || typeof envelope !== 'object') return;
+      if (envelope.type === 'error') {
+        console.warn('Transport notification:', envelope);
+      } else if (envelope.type === 'call_signal' && envelope.from_uid && envelope.payload) {
+        void callService.handleSignal(String(envelope.from_uid), envelope.payload);
+      } else if (['saved_ack', 'delivered_ack', 'seen_ack'].includes(envelope.type || '') && envelope.message_id) {
+        const nextStatus = envelope.type === 'saved_ack' ? 'saved' : envelope.type === 'delivered_ack' ? 'delivered' : 'seen';
+        const msgId = envelope.message_id;
+        const convId = envelope.conversation_id || selectedRef.current?.id;
+        if (convId) {
+          void updateLocalMessageStatus(convId, msgId, nextStatus as any);
+        }
+        setChats(current => current.map(item => ({
+          ...item,
+          messages: item.messages.map(message => message.id === msgId ? {...message, status: nextStatus as 'saved' | 'delivered' | 'seen'} : message),
+        })));
+        setSelected(current => current ? ({
+          ...current,
+          messages: current.messages.map(message => message.id === msgId ? {...message, status: nextStatus as 'saved' | 'delivered' | 'seen'} : message),
+        }) : current);
+      } else if (envelope.type === 'presence_update' && envelope.uid && typeof envelope.online === 'boolean') {
+        const targetUid = envelope.uid;
+        const isOnline = envelope.online!;
+        const now = Date.now();
+        setChats(current => current.map(item => item.user.id === targetUid ? {
+          ...item,
+          user: {
+            ...item.user,
+            online: isOnline,
+            lastActive: isOnline ? undefined : (item.user.lastActive || now),
+          },
+        } : item));
+        setSelected(current => {
+          if (!current || current.user.id !== targetUid) return current;
+          const updated = {
+            ...current,
+            user: {
+              ...current.user,
+              online: isOnline,
+              lastActive: isOnline ? undefined : (current.user.lastActive || now),
+            },
+          };
+          selectedRef.current = updated;
+          return updated;
+        });
+      } else if (envelope.type === 'new_conversation' && envelope.conversation_id && envelope.user) {
+        const newChat: Chat = {
+          id: envelope.conversation_id,
+          user: {id: envelope.user.uid, username: envelope.user.username, name: envelope.user.display_name, about: envelope.user.about, online: envelope.user.online},
+          preview: 'Start a conversation', time: 'Now', timestamp: Date.now(), unread: 0, messages: [],
+        };
+        setChats(current => current.some(item => item.id === newChat.id) ? current : [newChat, ...current]);
+      } else if (envelope.type === 'new_message' && envelope.message) {
+        const incoming = envelope.message;
+        const handleIncoming = async () => {
+          // Acknowledge delivered receipt immediately
+          try {
+            if (rtcRef.current?.isOpen) {
+              rtcRef.current.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id});
+            } else if (signalRef.current?.connected) {
+              signalRef.current.send({type: 'data_frame', payload: {type: 'delivered_ack', message_id: incoming.message_id}});
+            }
+          } catch {}
+
+          const isCurrentChat = selectedRef.current?.id === incoming.conversation_id;
+          if (isCurrentChat) {
+            try {
+              if (rtcRef.current?.isOpen) {
+                rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: incoming.message_id});
+              } else if (signalRef.current?.connected) {
+                signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: incoming.message_id}});
+              }
+            } catch {}
+          }
+
+          // Check in-memory first to avoid slow disk read on duplicates
+          const currentSelected = selectedRef.current;
+          if (currentSelected && currentSelected.id === incoming.conversation_id) {
+            const alreadyInMemory = currentSelected.messages.find(m => m.id === incoming.message_id);
+            if (alreadyInMemory && !alreadyInMemory.text.startsWith('Encrypted message') && !alreadyInMemory.text.startsWith('Decryption failed')) {
+              return;
+            }
+          }
+
+          let decryptedText = 'Encrypted message';
+          try {
+            decryptedText = await e2eeService.decrypt(incoming.sender_uid, 0, incoming.ciphertext_b64);
+          } catch (err) {
+            console.warn('Decryption failed:', err);
+            decryptedText = 'Decryption failed · Bad MAC or missing session';
+          }
+
+          let msgMediaType: 'text' | 'image' | 'voice' = 'text';
+          let msgImages: MediaImageItem[] | undefined = undefined;
+          let msgIsHd: boolean | undefined = undefined;
+          let msgVoice: VoiceNoteItem | undefined = undefined;
+          let displayText = decryptedText;
+
+          try {
+            if (decryptedText.startsWith('{') && decryptedText.endsWith('}')) {
+              const parsed = JSON.parse(decryptedText);
+              if (parsed.type === 'image_batch' && Array.isArray(parsed.images)) {
+                msgMediaType = 'image';
+                msgImages = parsed.images;
+                msgIsHd = !!parsed.isHd;
+                displayText = parsed.caption || (parsed.images.length > 1 ? `📷 ${parsed.images.length} Photos` : '📷 Photo');
+              } else if (parsed.type === 'voice_note' && parsed.audioBase64) {
+                msgMediaType = 'voice';
+                msgVoice = {
+                  audioBase64: parsed.audioBase64,
+                  durationSec: parsed.durationSec || 1,
+                };
+                displayText = `🎤 Voice message (${parsed.durationSec || 1}s)`;
+              } else if (parsed.type === 'text' && typeof parsed.text === 'string') {
+                displayText = parsed.text;
+              }
+            }
+          } catch {}
+
+          const incomingEpoch = Number(incoming.created_at) * 1000 || Date.now();
+          const incomingMsg: ChatMessage = {
+            id: incoming.message_id,
+            from: 'them',
+            text: displayText,
+            time: new Date(incomingEpoch).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}),
+            timestamp: incomingEpoch,
+            status: isCurrentChat ? ('seen' as const) : ('delivered' as const),
+            mediaType: msgMediaType,
+            images: msgImages,
+            isHd: msgIsHd,
+            voice: msgVoice,
+          };
+
+          // 1. Instantly update UI (0ms delay) so incoming message appears in real time
+          setChats(current => current.map(item => {
+            if (item.id !== incoming.conversation_id) return item;
+            const exists = item.messages.some(m => m.id === incoming.message_id);
+            const msgs = exists ? item.messages.map(m => m.id === incoming.message_id ? incomingMsg : m) : [...item.messages, incomingMsg];
+            return {
+              ...item,
+              preview: displayText,
+              time: 'Now',
+              timestamp: incomingEpoch,
+              unread: isCurrentChat ? 0 : item.unread + 1,
+              messages: msgs,
+            };
+          }));
+
+          setSelected(current => {
+            if (!current || current.id !== incoming.conversation_id) return current;
+            const exists = current.messages.some(m => m.id === incoming.message_id);
+            const msgs = exists ? current.messages.map(m => m.id === incoming.message_id ? incomingMsg : m) : [...current.messages, incomingMsg];
+            const updatedChat = {
+              ...current,
+              preview: displayText,
+              time: 'Now',
+              timestamp: incomingEpoch,
+              unread: 0,
+              messages: msgs,
+            };
+            selectedRef.current = updatedChat;
+            return updatedChat;
+          });
+
+          // 2. Persist to storage in background without blocking realtime flow
+          void appendLocalMessage(incoming.conversation_id, incomingMsg);
+        };
+        void handleIncoming();
+      }
+    } catch (err) {
+      console.warn('Error processing data envelope:', err);
+    }
+  }, []);
+
+  const processDataEnvelopeRef = useRef(processDataEnvelope);
+  useEffect(() => {
+    processDataEnvelopeRef.current = processDataEnvelope;
+  }, [processDataEnvelope]);
 
   const createRealtime = useCallback((signal: TlsSignalingClient) => {
     const rtc = new ServerDataChannel(signal);
@@ -245,180 +436,14 @@ export default function App() {
     });
     rtc.onMessage(packet => {
       try {
-        const envelope = JSON.parse(packet) as {
-          type?: string;
-          uid?: string;
-          online?: boolean;
-          message_id?: string;
-          conversation_id?: string;
-          user?: InboxUser;
-          message?: {message_id: string; conversation_id: string; sender_uid: string; ciphertext_b64: string; created_at: string; status: string};
-        };
-        if (envelope.type === 'error') {
-          console.warn('Transport notification:', packet);
-        } else if (envelope.type === 'call_signal' && (envelope as any).from_uid && (envelope as any).payload) {
-          void callService.handleSignal(String((envelope as any).from_uid), (envelope as any).payload);
-        } else if (['saved_ack', 'delivered_ack', 'seen_ack'].includes(envelope.type || '') && envelope.message_id) {
-          const nextStatus = envelope.type === 'saved_ack' ? 'saved' : envelope.type === 'delivered_ack' ? 'delivered' : 'seen';
-          const msgId = envelope.message_id;
-          const convId = envelope.conversation_id || selectedRef.current?.id;
-          if (convId) {
-            void updateLocalMessageStatus(convId, msgId, nextStatus as any);
-          }
-          setChats(current => current.map(item => ({
-            ...item,
-            messages: item.messages.map(message => message.id === msgId ? {...message, status: nextStatus as 'saved' | 'delivered' | 'seen'} : message),
-          })));
-          setSelected(current => current ? ({
-            ...current,
-            messages: current.messages.map(message => message.id === msgId ? {...message, status: nextStatus as 'saved' | 'delivered' | 'seen'} : message),
-          }) : current);
-        } else if (envelope.type === 'presence_update' && envelope.uid && typeof envelope.online === 'boolean') {
-          const targetUid = envelope.uid;
-          const isOnline = envelope.online!;
-          const now = Date.now();
-          setChats(current => current.map(item => item.user.id === targetUid ? {
-            ...item,
-            user: {
-              ...item.user,
-              online: isOnline,
-              lastActive: isOnline ? undefined : (item.user.lastActive || now),
-            },
-          } : item));
-          setSelected(current => {
-            if (!current || current.user.id !== targetUid) return current;
-            const updated = {
-              ...current,
-              user: {
-                ...current.user,
-                online: isOnline,
-                lastActive: isOnline ? undefined : (current.user.lastActive || now),
-              },
-            };
-            selectedRef.current = updated;
-            return updated;
-          });
-        } else if (envelope.type === 'new_conversation' && envelope.conversation_id && envelope.user) {
-          const newChat: Chat = {
-            id: envelope.conversation_id,
-            user: {id: envelope.user.uid, username: envelope.user.username, name: envelope.user.display_name, about: envelope.user.about, online: envelope.user.online},
-            preview: 'Start a conversation', time: 'Now', timestamp: Date.now(), unread: 0, messages: [],
-          };
-          setChats(current => current.some(item => item.id === newChat.id) ? current : [newChat, ...current]);
-        } else if (envelope.type === 'new_message' && envelope.message) {
-          const incoming = envelope.message;
-          const handleIncoming = async () => {
-            // Acknowledge delivered receipt immediately
-            try {
-              rtc.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id});
-            } catch {}
-
-            const isCurrentChat = selectedRef.current?.id === incoming.conversation_id;
-            if (isCurrentChat) {
-              try {
-                rtc.sendControlFrame({type: 'seen_ack', message_id: incoming.message_id});
-              } catch {}
-            }
-
-            // Check in-memory first to avoid slow disk read on duplicates
-            if (selectedRef.current?.id === incoming.conversation_id) {
-              const alreadyInMemory = selectedRef.current.messages.find(m => m.id === incoming.message_id);
-              if (alreadyInMemory && !alreadyInMemory.text.startsWith('Encrypted message') && !alreadyInMemory.text.startsWith('Decryption failed')) {
-                return;
-              }
-            }
-
-            let decryptedText = 'Encrypted message';
-            try {
-              decryptedText = await e2eeService.decrypt(incoming.sender_uid, 0, incoming.ciphertext_b64);
-            } catch (err) {
-              console.warn('Decryption failed:', err);
-              decryptedText = 'Decryption failed · Bad MAC or missing session';
-            }
-
-            let msgMediaType: 'text' | 'image' | 'voice' = 'text';
-            let msgImages: MediaImageItem[] | undefined = undefined;
-            let msgIsHd: boolean | undefined = undefined;
-            let msgVoice: VoiceNoteItem | undefined = undefined;
-            let displayText = decryptedText;
-
-            try {
-              if (decryptedText.startsWith('{') && decryptedText.endsWith('}')) {
-                const parsed = JSON.parse(decryptedText);
-                if (parsed.type === 'image_batch' && Array.isArray(parsed.images)) {
-                  msgMediaType = 'image';
-                  msgImages = parsed.images;
-                  msgIsHd = !!parsed.isHd;
-                  displayText = parsed.caption || (parsed.images.length > 1 ? `📷 ${parsed.images.length} Photos` : '📷 Photo');
-                } else if (parsed.type === 'voice_note' && parsed.audioBase64) {
-                  msgMediaType = 'voice';
-                  msgVoice = {
-                    audioBase64: parsed.audioBase64,
-                    durationSec: parsed.durationSec || 1,
-                  };
-                  displayText = `🎤 Voice message (${parsed.durationSec || 1}s)`;
-                } else if (parsed.type === 'text' && typeof parsed.text === 'string') {
-                  displayText = parsed.text;
-                }
-              }
-            } catch {}
-
-            const incomingEpoch = Number(incoming.created_at) * 1000 || Date.now();
-            const incomingMsg: ChatMessage = {
-              id: incoming.message_id,
-              from: 'them',
-              text: displayText,
-              time: new Date(incomingEpoch).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}),
-              timestamp: incomingEpoch,
-              status: isCurrentChat ? ('seen' as const) : ('delivered' as const),
-              mediaType: msgMediaType,
-              images: msgImages,
-              isHd: msgIsHd,
-              voice: msgVoice,
-            };
-
-            // 1. Instantly update UI (0ms delay) so incoming message appears in real time
-            setChats(current => current.map(item => {
-              if (item.id !== incoming.conversation_id) return item;
-              const exists = item.messages.some(m => m.id === incoming.message_id);
-              const msgs = exists ? item.messages.map(m => m.id === incoming.message_id ? incomingMsg : m) : [...item.messages, incomingMsg];
-              return {
-                ...item,
-                preview: displayText,
-                time: 'Now',
-                timestamp: incomingEpoch,
-                unread: isCurrentChat ? 0 : item.unread + 1,
-                messages: msgs,
-              };
-            }));
-
-            setSelected(current => {
-              if (!current || current.id !== incoming.conversation_id) return current;
-              const exists = current.messages.some(m => m.id === incoming.message_id);
-              const msgs = exists ? current.messages.map(m => m.id === incoming.message_id ? incomingMsg : m) : [...current.messages, incomingMsg];
-              const updatedChat = {
-                ...current,
-                preview: displayText,
-                time: 'Now',
-                timestamp: incomingEpoch,
-                unread: 0,
-                messages: msgs,
-              };
-              selectedRef.current = updatedChat;
-              return updatedChat;
-            });
-
-            // 2. Persist to storage in background without blocking realtime flow
-            void appendLocalMessage(incoming.conversation_id, incomingMsg);
-          };
-          void handleIncoming();
-        }
-      } catch {
-        // Ignore malformed DataChannel payloads; never acknowledge an unverified message.
+        const envelope = JSON.parse(packet);
+        void processDataEnvelope(envelope);
+      } catch (e) {
+        console.warn('Malformed DataChannel packet:', e);
       }
     });
     return rtc;
-  }, []);
+  }, [flushOutbox, processDataEnvelope]);
 
   useEffect(() => {
     let cancelled = false;
@@ -551,7 +576,9 @@ export default function App() {
         return true;
       }
       if (signalRef.current?.connected) {
-        setRtcStatus('connecting');
+        setRtcStatus('connected');
+        void flushOutbox();
+        return true;
       } else {
         setRtcStatus('disconnected');
       }
@@ -638,7 +665,11 @@ export default function App() {
     for (const m of initialMsgs) {
       if (m.from === 'them' && m.status !== 'seen') {
         try {
-          rtcRef.current?.sendControlFrame({type: 'seen_ack', message_id: m.id});
+          if (rtcRef.current?.isOpen) {
+            rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: m.id});
+          } else if (signalRef.current?.connected) {
+            signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: m.id}});
+          }
         } catch {}
       }
     }
@@ -941,26 +972,32 @@ export default function App() {
         ciphertextB64: body_b64,
       };
 
-      // Verify or reconnect WebRTC if channel is not open
-      if (!rtc || !rtc.isOpen) {
+      const payloadObj = {
+        type: 'send_message',
+        message_id: tempMsgId,
+        conversation_id: conversationId,
+        ciphertext_b64: body_b64,
+      };
+
+      if (rtc && rtc.isOpen) {
+        try {
+          await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
+        } catch (sendErr) {
+          outboxRef.current.push(queueItem);
+          throw sendErr;
+        }
+      } else if (signal && signal.connected) {
+        try {
+          signal.send({ type: 'data_frame', payload: payloadObj });
+        } catch (sendErr) {
+          outboxRef.current.push(queueItem);
+          throw sendErr;
+        }
+      } else {
         outboxRef.current.push(queueItem);
         void ensureConnected().then(connected => {
           if (connected) void flushOutbox();
         });
-        return;
-      }
-
-      try {
-        const payload = JSON.stringify({
-          type: 'send_message',
-          message_id: tempMsgId,
-          conversation_id: conversationId,
-          ciphertext_b64: body_b64,
-        });
-        await rtc.sendEncryptedEnvelope(payload);
-      } catch (sendErr) {
-        outboxRef.current.push(queueItem);
-        throw sendErr;
       }
     } catch (err) {
       console.warn('Send issue:', err);

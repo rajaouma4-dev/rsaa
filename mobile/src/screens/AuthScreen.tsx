@@ -21,7 +21,7 @@ export function AuthScreen({
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [serverHost, setServerHost] = useState(
-    APP_CONFIG.SIGNALING_HOST.includes('YOUR_DOMAIN') ? '10.109.201.244' : APP_CONFIG.SIGNALING_HOST
+    APP_CONFIG.SIGNALING_URL || 'wss://rsaa.onrender.com'
   );
   const [showServerInput, setShowServerInput] = useState(false);
   const [localBusy, setLocalBusy] = useState(false);
@@ -52,7 +52,7 @@ export function AuthScreen({
         msg.toLowerCase().includes('econnrefused') ||
         msg.toLowerCase().includes('timed out')
       ) {
-        setError(`Could not connect to server at ${serverHost}:7443. Tap 'SERVER' to change host IP.`);
+        setError(`Could not connect to ${serverHost}. Tap 'SERVER' to change.`);
       } else {
         setError(msg || 'Invalid username or password.');
       }

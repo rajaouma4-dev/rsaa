@@ -77,7 +77,7 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
                             let _ = previous.close().await;
                         }
                         tracing::info!(user_id = %uid, "client DataChannel opened");
-                        broadcast_presence(&db, &channels, &uid, true).await;
+                        broadcast_presence(&db, &channels, &live_signaling, &uid, true).await;
 
                         // Immediately deliver all queued offline messages to this recipient
                         deliver_all_pending(&db, &channel, &uid).await;
@@ -130,12 +130,12 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
                                 };
                                 if let Some(full_str) = assembled {
                                     if let Ok(inner_frame) = serde_json::from_str::<DataChannelClientFrame>(&full_str) {
-                                        handle_client_frame(inner_frame, &channel, &db, &channels, &live_signaling, &uid).await;
+                                        handle_client_frame(inner_frame, Some(&channel), None, &db, &channels, &live_signaling, &uid).await;
                                     }
                                 }
                             }
                             other => {
-                                handle_client_frame(other, &channel, &db, &channels, &live_signaling, &uid).await;
+                                handle_client_frame(other, Some(&channel), None, &db, &channels, &live_signaling, &uid).await;
                             }
                         }
                     }
@@ -152,7 +152,7 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
             };
             drop(guard);
             if removed {
-                broadcast_presence(&db, &channels, &uid, false).await;
+                broadcast_presence(&db, &channels, &live_signaling, &uid, false).await;
             }
             tracing::info!(user_id = %uid, "client DataChannel closed");
         });
@@ -162,9 +162,41 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
 static INCOMING_CHUNKS: LazyLock<tokio::sync::Mutex<HashMap<String, (usize, HashMap<usize, String>)>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
-async fn handle_client_frame(
+async fn reply_to_sender(
+    channel: Option<&Arc<dyn DataChannel>>,
+    signal_tx: Option<&mpsc::Sender<ServerFrame>>,
+    frame: &DataChannelServerFrame,
+) {
+    if let Some(ch) = channel {
+        if let Ok(text) = serde_json::to_string(frame) {
+            send_safe_text(ch, &text).await;
+            return;
+        }
+    }
+    if let Some(tx) = signal_tx {
+        if let Ok(payload) = serde_json::to_value(frame) {
+            let _ = tx.send(ServerFrame::DataFrame { payload }).await;
+        }
+    }
+}
+
+async fn reply_error(
+    channel: Option<&Arc<dyn DataChannel>>,
+    signal_tx: Option<&mpsc::Sender<ServerFrame>>,
+    code: &str,
+    message: &str,
+) {
+    let frame = DataChannelServerFrame::Error {
+        code: code.to_owned(),
+        message: message.chars().take(240).collect(),
+    };
+    reply_to_sender(channel, signal_tx, &frame).await;
+}
+
+pub async fn handle_client_frame(
     frame: DataChannelClientFrame,
-    channel: &Arc<dyn DataChannel>,
+    channel: Option<&Arc<dyn DataChannel>>,
+    signal_tx: Option<&mpsc::Sender<ServerFrame>>,
     db: &Store,
     channels: &LiveChannels,
     live_signaling: &LiveSignaling,
@@ -188,7 +220,7 @@ async fn handle_client_frame(
                     }
                 }
             }
-            // 2. If not sent via DataChannel, try sending via target's TCP signaling socket
+            // 2. If not sent via DataChannel, try sending via target's signaling socket
             if !sent {
                 let sig_guard = live_signaling.lock().await;
                 if let Some(target_tx) = sig_guard.get(&to_uid) {
@@ -208,9 +240,7 @@ async fn handle_client_frame(
                         "reason": "offline"
                     }),
                 };
-                if let Ok(text) = serde_json::to_string(&s_frame) {
-                    send_safe_text(channel, &text).await;
-                }
+                reply_to_sender(channel, signal_tx, &s_frame).await;
             }
         }
         DataChannelClientFrame::SendMessage {
@@ -220,13 +250,13 @@ async fn handle_client_frame(
             created_at: _,
         } => {
             if ciphertext_b64.is_empty() || ciphertext_b64.len() > 10 * 1024 * 1024 {
-                send_dc_error(channel, "INVALID_CIPHERTEXT", "ciphertext envelope is empty or too large").await;
+                reply_error(channel, signal_tx, "INVALID_CIPHERTEXT", "ciphertext envelope is empty or too large").await;
                 return;
             }
             let ciphertext = match STANDARD.decode(&ciphertext_b64) {
                 Ok(b) if !b.is_empty() => b,
                 _ => {
-                    send_dc_error(channel, "BAD_CIPHERTEXT", "ciphertext is not valid base64").await;
+                    reply_error(channel, signal_tx, "BAD_CIPHERTEXT", "ciphertext is not valid base64").await;
                     return;
                 }
             };
@@ -235,8 +265,9 @@ async fn handle_client_frame(
             let min_version = version_byte & 0x0f;
             let max_version = version_byte >> 4;
             if min_version > 3 || max_version < 3 {
-                send_dc_error(
+                reply_error(
                     channel,
+                    signal_tx,
                     "E2EE_NOT_CONFIGURED",
                     "message relay requires a valid Signal Protocol V3 ciphertext envelope",
                 ).await;
@@ -252,9 +283,7 @@ async fn handle_client_frame(
             match db.save_ciphertext(&message_id, &conversation_id, uid, &ciphertext).await {
                 Ok((recipient_uid, is_new)) => {
                     let saved_ack = DataChannelServerFrame::SavedAck { message_id: message_id.clone() };
-                    if let Ok(text) = serde_json::to_string(&saved_ack) {
-                        send_safe_text(channel, &text).await;
-                    }
+                    reply_to_sender(channel, signal_tx, &saved_ack).await;
 
                     if is_new {
                         let msg = crate::protocol::MessageEnvelope {
@@ -266,12 +295,12 @@ async fn handle_client_frame(
                             status: "SAVED".to_string(),
                         };
                         let frame = DataChannelServerFrame::NewMessage { message: msg };
-                        send_to_user(channels, &recipient_uid, &frame).await;
+                        send_to_user(channels, live_signaling, &recipient_uid, &frame).await;
                     }
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "save_ciphertext failed");
-                    send_dc_error(channel, "SAVE_FAILED", &err.to_string()).await;
+                    reply_error(channel, signal_tx, "SAVE_FAILED", &err.to_string()).await;
                 }
             }
         }
@@ -282,7 +311,7 @@ async fn handle_client_frame(
             };
             if let Some(sender_uid) = cached_sender {
                 let ack = DataChannelServerFrame::DeliveredAck { message_id: message_id.clone() };
-                send_to_user(channels, &sender_uid, &ack).await;
+                send_to_user(channels, live_signaling, &sender_uid, &ack).await;
                 let db_clone = db.clone();
                 let r_uid = uid.to_string();
                 let m_id = message_id.clone();
@@ -293,7 +322,7 @@ async fn handle_client_frame(
                 match db.mark_delivered(&message_id, uid).await {
                     Ok(Some(sender_uid)) => {
                         let ack = DataChannelServerFrame::DeliveredAck { message_id };
-                        send_to_user(channels, &sender_uid, &ack).await;
+                        send_to_user(channels, live_signaling, &sender_uid, &ack).await;
                     }
                     Ok(None) => {}
                     Err(err) => tracing::warn!(error = %err, "failed to record delivered receipt"),
@@ -307,7 +336,7 @@ async fn handle_client_frame(
             };
             if let Some(sender_uid) = cached_sender {
                 let ack = DataChannelServerFrame::SeenAck { message_id: message_id.clone() };
-                send_to_user(channels, &sender_uid, &ack).await;
+                send_to_user(channels, live_signaling, &sender_uid, &ack).await;
                 let db_clone = db.clone();
                 let r_uid = uid.to_string();
                 let m_id = message_id.clone();
@@ -318,7 +347,7 @@ async fn handle_client_frame(
                 match db.mark_seen(&message_id, uid).await {
                     Ok(Some(sender_uid)) => {
                         let ack = DataChannelServerFrame::SeenAck { message_id };
-                        send_to_user(channels, &sender_uid, &ack).await;
+                        send_to_user(channels, live_signaling, &sender_uid, &ack).await;
                     }
                     Ok(None) => {}
                     Err(err) => tracing::warn!(error = %err, "failed to record seen receipt"),
@@ -326,9 +355,7 @@ async fn handle_client_frame(
             }
         }
         DataChannelClientFrame::Ping => {
-            if let Ok(text) = serde_json::to_string(&DataChannelServerFrame::Pong) {
-                let _ = channel.send_text(&text).await;
-            }
+            reply_to_sender(channel, signal_tx, &DataChannelServerFrame::Pong).await;
         }
         DataChannelClientFrame::PresenceOffline => {
             tracing::info!(user_id = %uid, "client explicitly reported offline");
@@ -401,14 +428,37 @@ async fn deliver_one(db: &Store, channels: &LiveChannels, recipient_uid: &str, m
     }
 }
 
-/// Polls only currently connected recipients. The database outbox remains the source of truth;
-/// a missed ACK causes capped exponential-backoff retries after the channel reconnects.
-pub async fn run_delivery_worker(db: Store, channels: LiveChannels) {
+pub async fn deliver_all_pending_via_signal(db: &Store, signal_tx: &mpsc::Sender<ServerFrame>, uid: &str) {
+    let pending = match db.pending_deliveries(uid, 100).await {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(user_id = %uid, error = %err, "could not query pending deliveries on signal connect");
+            return;
+        }
+    };
+    for item in pending {
+        let claimed = match db.claim_delivery_attempt(&item.message.message_id, uid).await {
+            Ok(value) => value,
+            Err(_) => false,
+        };
+        if !claimed { continue; }
+        let frame = DataChannelServerFrame::NewMessage { message: item.message.clone() };
+        if let Ok(payload) = serde_json::to_value(&frame) {
+            let _ = signal_tx.send(ServerFrame::DataFrame { payload }).await;
+        }
+    }
+}
+
+pub async fn run_delivery_worker(db: Store, channels: LiveChannels, live_signaling: LiveSignaling) {
     loop {
-        let recipients: Vec<String> = channels.lock().await.keys().cloned().collect();
+        let mut recipients: std::collections::HashSet<String> = {
+            channels.lock().await.keys().cloned().collect()
+        };
+        {
+            let sig = live_signaling.lock().await;
+            recipients.extend(sig.keys().cloned());
+        }
         for uid in recipients {
-            let channel = channels.lock().await.get(&uid).cloned();
-            let Some(channel) = channel else { continue; };
             let pending = match db.pending_deliveries(&uid, 100).await {
                 Ok(items) => items,
                 Err(err) => {
@@ -423,35 +473,63 @@ pub async fn run_delivery_worker(db: Store, channels: LiveChannels) {
                 };
                 if !claimed { continue; }
                 let frame = DataChannelServerFrame::NewMessage { message: item.message.clone() };
-                let Ok(text) = serde_json::to_string(&frame) else { continue; };
-                send_safe_text(&channel, &text).await;
+                send_to_user(&channels, &live_signaling, &uid, &frame).await;
             }
         }
         sleep(Duration::from_secs(1)).await;
     }
 }
 
-pub async fn broadcast_presence(_db: &Store, channels: &LiveChannels, changed_uid: &str, online: bool) {
+pub async fn broadcast_presence(_db: &Store, channels: &LiveChannels, live_signaling: &LiveSignaling, changed_uid: &str, online: bool) {
     let frame = DataChannelServerFrame::PresenceUpdate {
         uid: changed_uid.to_owned(),
         online,
     };
     let Ok(text) = serde_json::to_string(&frame) else { return; };
-    let recipients: Vec<Arc<dyn DataChannel>> = {
+    let Ok(payload) = serde_json::to_value(&frame) else { return; };
+
+    // 1. Send to WebRTC DataChannel peers
+    let dc_recipients: Vec<Arc<dyn DataChannel>> = {
         let connected = channels.lock().await;
         connected.iter().filter(|(uid, _)| *uid != changed_uid).map(|(_, channel)| Arc::clone(channel)).collect()
     };
-    for channel in recipients {
+    for channel in dc_recipients {
         if let Err(err) = channel.send_text(&text).await {
-            tracing::debug!(error = %err, "presence update could not be sent");
+            tracing::debug!(error = %err, "presence update could not be sent to DataChannel");
         }
+    }
+
+    // 2. Send to WebSocket signaling peers
+    let sig_recipients: Vec<mpsc::Sender<ServerFrame>> = {
+        let sig = live_signaling.lock().await;
+        sig.iter().filter(|(uid, _)| *uid != changed_uid).map(|(_, tx)| tx.clone()).collect()
+    };
+    for tx in sig_recipients {
+        let _ = tx.send(ServerFrame::DataFrame { payload: payload.clone() }).await;
     }
 }
 
-pub async fn send_to_user(channels: &LiveChannels, uid: &str, frame: &DataChannelServerFrame) {
-    let Some(channel) = channels.lock().await.get(uid).cloned() else { return; };
-    if let Ok(text) = serde_json::to_string(frame) {
-        send_safe_text(&channel, &text).await;
+pub async fn send_to_user(
+    channels: &LiveChannels,
+    live_signaling: &LiveSignaling,
+    uid: &str,
+    frame: &DataChannelServerFrame,
+) {
+    // 1. Prefer active WebRTC DataChannel
+    let dc = { channels.lock().await.get(uid).cloned() };
+    if let Some(channel) = dc {
+        if let Ok(text) = serde_json::to_string(frame) {
+            send_safe_text(&channel, &text).await;
+            return;
+        }
+    }
+
+    // 2. Fall back to active WebSocket signaling connection
+    let sig = { live_signaling.lock().await.get(uid).cloned() };
+    if let Some(tx) = sig {
+        if let Ok(payload) = serde_json::to_value(frame) {
+            let _ = tx.send(ServerFrame::DataFrame { payload }).await;
+        }
     }
 }
 

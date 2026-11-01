@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     let auth_limiter = AuthRateLimiter::default();
     let max_connections = env::var("MAX_SIGNAL_CONNECTIONS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(500).clamp(10, 10_000);
     let connection_slots = Arc::new(Semaphore::new(max_connections));
-    tokio::spawn(run_delivery_worker(store.clone(), channels.clone()));
+    tokio::spawn(run_delivery_worker(store.clone(), channels.clone(), live_signaling.clone()));
     let ice_urls: Vec<String> = env::var("ICE_URLS")
         .unwrap_or_else(|_| "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302,stun:stun3.l.google.com:19302,stun:stun4.l.google.com:19302".into())
         .split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
@@ -264,7 +264,9 @@ where
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
                         live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
-                        send_auth_ok(&signal_tx, user, token).await?;
+                        send_auth_ok(&signal_tx, user.clone(), token).await?;
+                        crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                     }
                     Err(err) => send_error(&signal_tx, "REGISTER_FAILED", &safe_error(&err)).await?,
                 }
@@ -284,7 +286,9 @@ where
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
                         live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
-                        send_auth_ok(&signal_tx, user, token).await?;
+                        send_auth_ok(&signal_tx, user.clone(), token).await?;
+                        crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                     }
                     Err(err) => send_error(&signal_tx, "LOGIN_FAILED", &safe_error(&err)).await?,
                 }
@@ -300,7 +304,9 @@ where
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
                         live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
-                        send_auth_ok(&signal_tx, user, token).await?;
+                        send_auth_ok(&signal_tx, user.clone(), token).await?;
+                        crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                     }
                     Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
                 }
@@ -385,8 +391,8 @@ where
                                     conversation_id: conversation_id.clone(),
                                     user: user.clone(),
                                 };
-                                send_to_user(&channels, &other_uid, &notification).await;
-                                crate::webrtc_peer::broadcast_presence(&store, &channels, &user.uid, true).await;
+                                send_to_user(&channels, &live_signaling, &other_uid, &notification).await;
+                                crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                                 signal_tx.send(ServerFrame::Conversation { conversation_id, user: other }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                             }
                             Err(err) => send_error(&signal_tx, "CONVERSATION_FAILED", &safe_error(&err)).await?,
@@ -504,6 +510,23 @@ where
                     Err(err) => send_error(&signal_tx, "PREKEY_FETCH_FAILED", &safe_error(&err)).await?,
                 }
             }
+            ClientFrame::DataFrame { payload } => {
+                let Some(user) = current_user.as_ref() else {
+                    send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?;
+                    continue;
+                };
+                if let Ok(dc_frame) = serde_json::from_value::<protocol::DataChannelClientFrame>(payload) {
+                    crate::webrtc_peer::handle_client_frame(
+                        dc_frame,
+                        None,
+                        Some(&signal_tx),
+                        &store,
+                        &channels,
+                        &live_signaling,
+                        &user.uid,
+                    ).await;
+                }
+            }
             ClientFrame::Ping => {
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
             }
@@ -514,7 +537,7 @@ where
     if let Some(user) = current_user {
         live_signaling.lock().await.remove(&user.uid);
         channels.lock().await.remove(&user.uid);
-        crate::webrtc_peer::broadcast_presence(&store, &channels, &user.uid, false).await;
+        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
     }
     Ok(())
 }
@@ -615,7 +638,9 @@ async fn handle_ws_client(
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
                         live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
-                        send_auth_ok(&signal_tx, user, token).await?;
+                        send_auth_ok(&signal_tx, user.clone(), token).await?;
+                        crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                     }
                     Err(err) => send_error(&signal_tx, "REGISTER_FAILED", &safe_error(&err)).await?,
                 }
@@ -635,7 +660,9 @@ async fn handle_ws_client(
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
                         live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
-                        send_auth_ok(&signal_tx, user, token).await?;
+                        send_auth_ok(&signal_tx, user.clone(), token).await?;
+                        crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                     }
                     Err(err) => send_error(&signal_tx, "LOGIN_FAILED", &safe_error(&err)).await?,
                 }
@@ -651,7 +678,9 @@ async fn handle_ws_client(
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
                         live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
-                        send_auth_ok(&signal_tx, user, token).await?;
+                        send_auth_ok(&signal_tx, user.clone(), token).await?;
+                        crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                     }
                     Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
                 }
@@ -734,8 +763,8 @@ async fn handle_ws_client(
                                     conversation_id: conversation_id.clone(),
                                     user: user.clone(),
                                 };
-                                send_to_user(&channels, &other_uid, &notification).await;
-                                crate::webrtc_peer::broadcast_presence(&store, &channels, &user.uid, true).await;
+                                send_to_user(&channels, &live_signaling, &other_uid, &notification).await;
+                                crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                                 signal_tx.send(ServerFrame::Conversation { conversation_id, user: other }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                             }
                             Err(err) => send_error(&signal_tx, "CONVERSATION_FAILED", &safe_error(&err)).await?,
@@ -847,6 +876,23 @@ async fn handle_ws_client(
                     Err(err) => send_error(&signal_tx, "PREKEY_FETCH_FAILED", &safe_error(&err)).await?,
                 }
             }
+            ClientFrame::DataFrame { payload } => {
+                let Some(user) = current_user.as_ref() else {
+                    send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?;
+                    continue;
+                };
+                if let Ok(dc_frame) = serde_json::from_value::<protocol::DataChannelClientFrame>(payload) {
+                    crate::webrtc_peer::handle_client_frame(
+                        dc_frame,
+                        None,
+                        Some(&signal_tx),
+                        &store,
+                        &channels,
+                        &live_signaling,
+                        &user.uid,
+                    ).await;
+                }
+            }
             ClientFrame::Ping => {
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
             }
@@ -857,7 +903,7 @@ async fn handle_ws_client(
     if let Some(user) = current_user {
         live_signaling.lock().await.remove(&user.uid);
         channels.lock().await.remove(&user.uid);
-        crate::webrtc_peer::broadcast_presence(&store, &channels, &user.uid, false).await;
+        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
     }
     Ok(())
 }

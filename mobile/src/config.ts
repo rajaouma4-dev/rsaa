@@ -2,10 +2,10 @@ export const APP_CONFIG = {
   // Live mode is strictly enforced and fail-closed. Unauthenticated demo bypass is disabled.
   DEMO_MODE: false,
   // Production signaling host: public domain only, no hardcoded localhost or private LAN IP.
-  SIGNALING_HOST: '10.109.201.13',
+  SIGNALING_HOST: 'rsaa.onrender.com',
   // Candidate hosts for fallback during local development/testing
-  CANDIDATE_HOSTS: ['10.109.201.13', '10.109.201.244', '10.0.2.2', 'chat.YOUR_DOMAIN.com'],
-  SIGNALING_PORT: 7443,
+  CANDIDATE_HOSTS: ['rsaa.onrender.com', '10.0.2.2', '10.109.201.13'],
+  SIGNALING_PORT: 443,
   // Pin the SHA-256 fingerprint of the leaf TLS certificate. Add backup pins before rotation.
   TLS_CERT_SHA256_PINS: [
     '044db75f48cf4514638bdf7da3cc1162fbed36017b99c7a848f69de479000cc5',
