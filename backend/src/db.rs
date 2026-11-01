@@ -450,7 +450,7 @@ fn normalize_username(value: &str) -> Result<String> {
 }
 
 fn validate_password(password: &str) -> Result<()> {
-    anyhow::ensure!(password.len() >= 10 && password.len() <= 128, "password must be 10-128 bytes");
+    anyhow::ensure!(password.len() >= 6 && password.len() <= 128, "password must be 6-128 bytes");
     Ok(())
 }
 

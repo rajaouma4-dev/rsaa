@@ -152,7 +152,10 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
             };
             drop(guard);
             if removed {
-                broadcast_presence(&db, &channels, &live_signaling, &uid, false).await;
+                let still_online = live_signaling.lock().await.contains_key(&uid);
+                if !still_online {
+                    broadcast_presence(&db, &channels, &live_signaling, &uid, false).await;
+                }
             }
             tracing::info!(user_id = %uid, "client DataChannel closed");
         });

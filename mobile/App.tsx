@@ -38,14 +38,15 @@ type InboxUser = {uid: string; username: string; display_name: string; about: st
 type InboxConversation = {conversation_id: string; user: InboxUser; unread_count: number; has_messages: boolean; updated_at: string};
 type AuthResponse = {uid: string; username: string; display_name: string; about: string; token: string};
 
-async function mapInbox(conversations: InboxConversation[]): Promise<Chat[]> {
+async function mapInbox(conversations: InboxConversation[], onlineUsers?: Set<string>): Promise<Chat[]> {
   return Promise.all(conversations.map(async item => {
     const localMsgs = await getLocalMessages(item.conversation_id);
     const lastMsg = localMsgs.length > 0 ? localMsgs[localMsgs.length - 1] : null;
     const itemTimestamp = lastMsg?.timestamp || (Number(item.updated_at) ? Number(item.updated_at) * 1000 : Date.now());
+    const isOnline = (onlineUsers && onlineUsers.has(item.user.uid)) || item.user.online;
     return {
       id: item.conversation_id,
-      user: {id: item.user.uid, username: item.user.username, name: item.user.display_name, about: item.user.about, online: item.user.online},
+      user: {id: item.user.uid, username: item.user.username, name: item.user.display_name, about: item.user.about, online: isOnline},
       preview: lastMsg ? formatSnippet(lastMsg.text) : item.has_messages ? 'Encrypted message' : 'Start a conversation',
       time: lastMsg ? lastMsg.time : 'Recent',
       timestamp: itemTimestamp,
@@ -62,6 +63,7 @@ export default function App() {
   const [chats, setChats] = useState<Chat[]>([]);
   const [selected, setSelected] = useState<Chat | null>(null);
   const selectedRef = useRef<Chat | null>(null);
+  const onlineUsersRef = useRef<Set<string>>(new Set<string>());
   const [authBusy, setAuthBusy] = useState(false);
   const [rtcStatus, setRtcStatus] = useState<RtcStatus>('disconnected');
   const [callState, setCallState] = useState<CallState>(callService.getState());
@@ -277,6 +279,11 @@ export default function App() {
       } else if (envelope.type === 'presence_update' && envelope.uid && typeof envelope.online === 'boolean') {
         const targetUid = envelope.uid;
         const isOnline = envelope.online!;
+        if (isOnline) {
+          onlineUsersRef.current.add(targetUid);
+        } else {
+          onlineUsersRef.current.delete(targetUid);
+        }
         const now = Date.now();
         setChats(current => current.map(item => item.user.id === targetUid ? {
           ...item,
@@ -484,7 +491,7 @@ export default function App() {
         bootRtc = createRealtime(bootSignal);
         rtcRef.current = bootRtc;
         setSession({uid: result.uid, username: result.username, displayName: result.display_name, about: result.about, token: result.token, live: true});
-        setChats(await mapInbox(inbox.conversations || []));
+        setChats(await mapInbox(inbox.conversations || [], onlineUsersRef.current));
         try {
           await bootRtc.connectAuthenticated();
         } catch {
@@ -614,15 +621,10 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [rtcStatus, session, ensureConnected]);
 
-  // AppState listener for instant foreground reconnect and presence reporting
+  // AppState listener for instant foreground reconnect
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState: AppStateStatus) => {
-      if (nextState === 'background') {
-        // Proactively report offline to contacts when going to background, keep channel alive
-        try {
-          rtcRef.current?.sendControlFrame({type: 'presence_offline'});
-        } catch {}
-      } else if (nextState === 'active') {
+      if (nextState === 'active') {
         if (session?.live) {
           void ensureConnected();
         }
@@ -642,7 +644,11 @@ export default function App() {
     const response = await signal.request<{users?: Array<{uid: string; username: string; display_name: string; about: string; online: boolean}>}>(
       {type: 'search_users', query}, 'users');
     return (response.users || []).map(user => ({
-      id: user.uid, username: user.username, name: user.display_name, about: user.about, online: user.online,
+      id: user.uid,
+      username: user.username,
+      name: user.display_name,
+      about: user.about,
+      online: onlineUsersRef.current.has(user.uid) || user.online,
     }));
   }, []);
 
@@ -661,8 +667,13 @@ export default function App() {
       (a, b) => getMessageTimestamp(a) - getMessageTimestamp(b)
     );
     const lastM = initialMsgs.length > 0 ? initialMsgs[initialMsgs.length - 1] : null;
+    const isUserOnline = (chat.user?.id ? onlineUsersRef.current.has(chat.user.id) : false) || chat.user.online;
     const initialChat = {
       ...chat,
+      user: {
+        ...chat.user,
+        online: isUserOnline,
+      },
       unread: 0,
       preview: lastM ? formatSnippet(lastM.text) : chat.preview,
       timestamp: lastM?.timestamp || chat.timestamp || Date.now(),
@@ -670,7 +681,7 @@ export default function App() {
     };
     setSelected(initialChat);
     selectedRef.current = initialChat;
-    setChats(prev => prev.map(item => item.id === chat.id ? {...item, unread: 0} : item));
+    setChats(prev => prev.map(item => item.id === chat.id ? {...item, unread: 0, user: {...item.user, online: isUserOnline}} : item));
 
     // Send seen_ack for unread messages from peer
     for (const m of initialMsgs) {
@@ -811,8 +822,13 @@ export default function App() {
 
       await saveLocalMessages(chat.id, merged);
       const lastMerged = merged.length > 0 ? merged[merged.length - 1] : null;
+      const isCurrentOnline = (chat.user?.id ? onlineUsersRef.current.has(chat.user.id) : false) || chat.user.online;
       const updated = {
         ...chat,
+        user: {
+          ...chat.user,
+          online: isCurrentOnline,
+        },
         unread: 0,
         preview: lastMerged ? formatSnippet(lastMerged.text) : chat.preview,
         timestamp: lastMerged?.timestamp || chat.timestamp,
@@ -1066,7 +1082,7 @@ export default function App() {
         token: result.token,
         live: true,
       });
-      setChats(await mapInbox(inbox.conversations || []));
+      setChats(await mapInbox(inbox.conversations || [], onlineUsersRef.current));
 
       try {
         await rtc.connectAuthenticated();

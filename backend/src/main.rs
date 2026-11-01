@@ -542,7 +542,10 @@ where
     if let Some(user) = current_user {
         live_signaling.lock().await.remove(&user.uid);
         channels.lock().await.remove(&user.uid);
-        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
+        let still_online = is_user_online(&channels, &live_signaling, &user.uid).await;
+        if !still_online {
+            crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
+        }
     }
     Ok(())
 }
@@ -717,6 +720,7 @@ async fn handle_ws_client(
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "REGISTER_FAILED", &safe_error(&err)).await?,
                 }
@@ -981,7 +985,10 @@ async fn handle_ws_client(
     if let Some(user) = current_user {
         live_signaling.lock().await.remove(&user.uid);
         channels.lock().await.remove(&user.uid);
-        crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
+        let still_online = is_user_online(&channels, &live_signaling, &user.uid).await;
+        if !still_online {
+            crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
+        }
     }
     Ok(())
 }

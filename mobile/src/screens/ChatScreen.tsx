@@ -575,14 +575,17 @@ export function ChatScreen({
   );
 }
 
+const TOP_INSET = Platform.OS === 'android' ? Math.max(StatusBar.currentHeight || 0, 36) : 20;
+const BOTTOM_INSET = Platform.OS === 'android' ? 16 : 10;
+
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
     backgroundColor: '#18191A',
   },
   header: {
-    paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 0) : 0,
-    minHeight: Platform.OS === 'android' ? 56 + (StatusBar.currentHeight || 0) : 56,
+    paddingTop: TOP_INSET,
+    minHeight: 56 + TOP_INSET,
     paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
@@ -780,7 +783,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#242526',
     borderTopWidth: 1,
     borderTopColor: '#333333',
-    paddingVertical: 10,
+    paddingTop: 10,
+    paddingBottom: 10 + BOTTOM_INSET,
     paddingHorizontal: 16,
   },
   recordingPulse: {
@@ -846,7 +850,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-end',
     paddingHorizontal: 8,
-    paddingVertical: 8,
+    paddingTop: 8,
+    paddingBottom: 8 + BOTTOM_INSET,
     backgroundColor: '#242526',
     borderTopWidth: 1,
     borderTopColor: '#393A3B',

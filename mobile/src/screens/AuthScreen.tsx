@@ -1,8 +1,11 @@
 import React, {useState} from 'react';
-import {View, Text, TextInput, Pressable, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, ActivityIndicator} from 'react-native';
+import {View, Text, TextInput, Pressable, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, ActivityIndicator, StatusBar} from 'react-native';
 import {Brand} from '../components/Brand';
 import {C, S} from '../theme';
 import {APP_CONFIG, updateSignalingHost} from '../config';
+
+const TOP_INSET = Platform.OS === 'android' ? Math.max(StatusBar.currentHeight || 0, 36) + 16 : 52;
+const BOTTOM_INSET = Platform.OS === 'android' ? 20 : 12;
 
 export function AuthScreen({
   mode,
@@ -20,6 +23,7 @@ export function AuthScreen({
   const [name, setName] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [serverHost, setServerHost] = useState(
     APP_CONFIG.SIGNALING_URL || 'wss://rsaa.onrender.com'
   );
@@ -27,7 +31,7 @@ export function AuthScreen({
   const [localBusy, setLocalBusy] = useState(false);
   const [error, setError] = useState('');
   const isRegister = mode === 'register';
-  const ready = username.trim().length >= 3 && password.length >= 10 && (!isRegister || name.trim().length >= 2);
+  const ready = username.trim().length >= 3 && password.length >= 6 && (!isRegister || name.trim().length >= 2);
   const submitting = busy || localBusy;
 
   const submit = async () => {
@@ -105,7 +109,27 @@ export function AuthScreen({
         <Text style={styles.cardTitle}>{isRegister ? 'Create account' : 'Welcome back'}</Text>
         {isRegister ? <TextInput value={name} onChangeText={setName} placeholder="Your name" placeholderTextColor={C.muted} style={S.input} autoCapitalize="words" maxLength={60} editable={!submitting}/> : null}
         <TextInput value={username} onChangeText={value => {setUsername(value); setError('');}} placeholder="Username" placeholderTextColor={C.muted} style={S.input} autoCapitalize="none" autoCorrect={false} maxLength={24} editable={!submitting}/>
-        <TextInput value={password} onChangeText={value => {setPassword(value); setError('');}} placeholder="Password (10+ characters)" placeholderTextColor={C.muted} style={S.input} secureTextEntry maxLength={128} editable={!submitting}/>
+        
+        <View style={styles.passwordContainer}>
+          <TextInput
+            value={password}
+            onChangeText={value => {setPassword(value); setError('');}}
+            placeholder="Password (min 6 characters)"
+            placeholderTextColor={C.muted}
+            style={[S.input, styles.passwordInput]}
+            secureTextEntry={!showPassword}
+            maxLength={128}
+            editable={!submitting}
+          />
+          <Pressable onPress={() => setShowPassword(p => !p)} style={styles.eyeBtn}>
+            <Text style={styles.eyeIcon}>{showPassword ? '🙈' : '👁️'}</Text>
+          </Pressable>
+        </View>
+
+        {password.length > 0 && password.length < 6 ? (
+          <Text style={styles.hint}>Password must be at least 6 characters ({password.length}/6)</Text>
+        ) : null}
+
         {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
         <Pressable disabled={!ready || submitting} onPress={() => { void submit(); }} style={[S.primaryButton, (!ready || submitting) && {opacity: 0.45}]}>
           {submitting ? <ActivityIndicator color="#06251C"/> : <Text style={S.primaryText}>{isRegister ? 'Create account' : 'Sign in'}  →</Text>}
@@ -121,7 +145,7 @@ export function AuthScreen({
 }
 
 const styles = StyleSheet.create({
-  wrap: {flexGrow: 1, padding: 24, paddingTop: 52, justifyContent: 'space-between'},
+  wrap: {flexGrow: 1, padding: 24, paddingTop: TOP_INSET, paddingBottom: BOTTOM_INSET, justifyContent: 'space-between'},
   top: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'},
   pill: {flexDirection: 'row', alignItems: 'center', gap: 7, borderWidth: 1, borderColor: C.line, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 20},
   pulse: {width: 6, height: 6, borderRadius: 6, backgroundColor: C.green},
@@ -129,16 +153,21 @@ const styles = StyleSheet.create({
   serverBox: {marginTop: 14, padding: 12, backgroundColor: C.panel, borderColor: C.line, borderWidth: 1, borderRadius: 14, gap: 6},
   serverLabel: {color: C.muted, fontSize: 11, fontWeight: '600'},
   serverInput: {height: 42, fontSize: 13},
-  hero: {marginTop: 36, marginBottom: 24},
-  eyebrow: {color: C.green, letterSpacing: 2, fontSize: 10, fontWeight: '800', marginBottom: 13},
-  title: {color: C.text, fontSize: 39, lineHeight: 44, fontWeight: '900', letterSpacing: -1.4},
-  sub: {color: C.muted, fontSize: 14, marginTop: 14, lineHeight: 21, maxWidth: 270},
+  hero: {marginTop: 28, marginBottom: 20},
+  eyebrow: {color: C.green, letterSpacing: 2, fontSize: 10, fontWeight: '800', marginBottom: 11},
+  title: {color: C.text, fontSize: 36, lineHeight: 40, fontWeight: '900', letterSpacing: -1.2},
+  sub: {color: C.muted, fontSize: 13, marginTop: 12, lineHeight: 19, maxWidth: 270},
   card: {backgroundColor: C.panel, borderColor: C.line, borderWidth: 1, borderRadius: 24, padding: 20, gap: 13},
   cardTitle: {color: C.text, fontSize: 19, fontWeight: '800', marginBottom: 4},
+  passwordContainer: {position: 'relative', justifyContent: 'center'},
+  passwordInput: {paddingRight: 48},
+  eyeBtn: {position: 'absolute', right: 12, height: 40, width: 40, alignItems: 'center', justifyContent: 'center'},
+  eyeIcon: {fontSize: 18},
+  hint: {color: C.muted, fontSize: 11, marginTop: -6, marginLeft: 4},
   switchRow: {flexDirection: 'row', justifyContent: 'center', marginTop: 2},
   switchText: {color: C.muted, fontSize: 12},
   switchLink: {color: C.green, fontWeight: '800', fontSize: 12},
-  footer: {flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 24},
+  footer: {flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 20},
   lock: {color: C.green},
   footerText: {color: C.muted, fontSize: 10},
   error: {color: C.red, fontSize: 12, lineHeight: 18},
