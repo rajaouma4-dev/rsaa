@@ -16,6 +16,9 @@ export class TlsSignalingClient {
   private closeListeners = new Set<() => void>();
   private dataHandlerAttached = false;
   private isConnected = false;
+  private isAuth = false;
+  private awaitingPong = false;
+  private missedPongs = 0;
   private connectPromise?: Promise<void>;
   private requestTail: Promise<void> = Promise.resolve();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
@@ -66,6 +69,14 @@ export class TlsSignalingClient {
             if (!line) return;
             try {
               const frame = JSON.parse(line);
+              if (frame.type === 'pong') {
+                this.awaitingPong = false;
+                this.missedPongs = 0;
+              } else if (frame.type === 'auth_ok') {
+                this.isAuth = true;
+              } else if (frame.type === 'logged_out' || (frame.type === 'error' && frame.code === 'SESSION_EXPIRED')) {
+                this.isAuth = false;
+              }
               for (const listener of [...this.listeners]) {
                 try { listener(frame); } catch {}
               }
@@ -232,6 +243,8 @@ export class TlsSignalingClient {
   }
 
   get connected(): boolean { return this.isConnected && Boolean(this.socket || this.ws); }
+  get authenticated(): boolean { return this.isAuth && this.connected; }
+  setAuthenticated(val: boolean): void { this.isAuth = val; }
 
   send(frame: Frame): void {
     if (!this.connected) throw new Error('Signaling socket is not connected');
@@ -251,6 +264,15 @@ export class TlsSignalingClient {
     if (this.heartbeatTimer) return;
     this.heartbeatTimer = setInterval(() => {
       if (this.connected) {
+        if (this.awaitingPong) {
+          this.missedPongs++;
+          if (this.missedPongs >= 2) {
+            console.warn('Signaling heartbeat missed 2 pongs, socket is dead, closing');
+            this.close();
+            return;
+          }
+        }
+        this.awaitingPong = true;
         try {
           if (this.ws) {
             this.ws.send('{"type":"ping"}\n');
@@ -261,7 +283,7 @@ export class TlsSignalingClient {
           this.close();
         }
       }
-    }, 7000);
+    }, 3500);
   }
 
   request<T extends Frame = Frame>(frame: Frame, expectedType: string, timeoutMs = 12000): Promise<T> {
@@ -316,6 +338,14 @@ export class TlsSignalingClient {
     try {
       const frames = this.decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8'));
       for (const frame of frames) {
+        if (frame.type === 'pong') {
+          this.awaitingPong = false;
+          this.missedPongs = 0;
+        } else if (frame.type === 'auth_ok') {
+          this.isAuth = true;
+        } else if (frame.type === 'logged_out' || (frame.type === 'error' && frame.code === 'SESSION_EXPIRED')) {
+          this.isAuth = false;
+        }
         for (const listener of [...this.listeners]) {
           try { listener(frame); } catch { /* isolate listeners from the socket reader */ }
         }
@@ -345,6 +375,9 @@ export class TlsSignalingClient {
     this.ws = undefined;
     this.socket = undefined;
     this.isConnected = false;
+    this.isAuth = false;
+    this.awaitingPong = false;
+    this.missedPongs = 0;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = undefined;
     this.decoder.reset();

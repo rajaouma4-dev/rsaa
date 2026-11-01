@@ -326,14 +326,35 @@ export class SignalE2EEService {
     // Otherwise, inspect the protobuf envelope directly.
     const isPreKey = type === 3 || (type !== 1 && this.isPreKeyWhisperPayload(rawBuffer));
 
-    try {
-      if (isPreKey) {
+    let lastError: any = null;
+    if (isPreKey) {
+      try {
         decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-      } else {
-        decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
+      } catch (err) {
+        lastError = err;
+        try {
+          decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
+          lastError = null;
+        } catch (whisperErr) {
+          lastError = whisperErr;
+        }
       }
-    } catch (err: any) {
-      const errMsg = err?.message || String(err);
+    } else {
+      try {
+        decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
+      } catch (err) {
+        lastError = err;
+        try {
+          decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
+          lastError = null;
+        } catch (preKeyErr) {
+          lastError = preKeyErr;
+        }
+      }
+    }
+
+    if (!decryptedBuffer && lastError) {
+      const errMsg = lastError?.message || String(lastError);
       console.warn(`[E2EE] Decryption error with peer ${remoteUid} (isPreKey=${isPreKey}):`, errMsg);
 
       // If session is broken / Bad MAC / desynced, automatically clear the broken local session
@@ -347,7 +368,7 @@ export class SignalE2EEService {
         const addr = new libsignal.SignalProtocolAddress(remoteUid, 1);
         await this.store.clearSession(addr.toString());
       }
-      throw err;
+      throw lastError;
     }
 
     if (!decryptedBuffer) {

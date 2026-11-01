@@ -392,6 +392,8 @@ export default function App() {
               const repairPayload = {type: 'session_repair' as const, peer_uid: incoming.sender_uid};
               if (rtcRef.current?.isOpen) {
                 rtcRef.current.sendControlFrame(repairPayload);
+              } else if (signalRef.current?.connected) {
+                signalRef.current.send({type: 'data_frame', payload: repairPayload});
               }
             } catch {}
           }
@@ -486,7 +488,7 @@ export default function App() {
   const createRealtime = useCallback((signal: TlsSignalingClient) => {
     const rtc = new ServerDataChannel(signal);
     rtc.onConnectionStatus(status => {
-      if (status === 'connected' || signalRef.current?.connected) {
+      if (status === 'connected' || (signalRef.current?.connected && signalRef.current?.authenticated)) {
         setRtcStatus('connected');
         void flushOutbox();
       } else {
@@ -526,6 +528,7 @@ export default function App() {
         attachSignalHandlers(bootSignal);
         await bootSignal.connect();
         const result = await bootSignal.request<AuthResponse>({type: 'resume', token: saved.token}, 'auth_ok');
+        bootSignal.setAuthenticated(true);
         const inbox = await bootSignal.request<{conversations?: InboxConversation[]}>(
           {type: 'list_conversations'}, 'conversations');
         if (cancelled) { bootSignal.close(); return; }
@@ -573,28 +576,31 @@ export default function App() {
 
   const ensureConnected = useCallback(async (): Promise<boolean> => {
     if (!session?.live) return false;
-    if (signalRef.current?.connected) {
+    const currentSig = signalRef.current;
+    if (currentSig?.connected && currentSig?.authenticated) {
       setRtcStatus('connected');
       void flushOutbox();
       return true;
     }
     if (reconnectingRef.current) {
       for (let i = 0; i < 25; i++) {
-        if (signalRef.current?.connected) {
+        const s = signalRef.current;
+        if (s?.connected && s?.authenticated) {
           setRtcStatus('connected');
           void flushOutbox();
           return true;
         }
         await new Promise<void>(r => setTimeout(r, 100));
       }
-      return signalRef.current?.connected || false;
+      const s = signalRef.current;
+      return (s?.connected && s?.authenticated) || false;
     }
 
     reconnectingRef.current = true;
     try {
       setRtcStatus('connecting');
 
-      // 1. Ensure TLS signaling connection is alive
+      // 1. Ensure TLS signaling connection is alive and authenticated
       let signal = signalRef.current;
       let signalRecreated = false;
       if (!signal || !signal.connected) {
@@ -604,10 +610,13 @@ export default function App() {
         await signal.connect();
         signalRef.current = signal;
         signalRecreated = true;
+      }
 
+      if (!signal.authenticated) {
         const token = session.token || (await readLiveSession())?.token;
         if (token) {
-          await signal.request({type: 'resume', token}, 'auth_ok', 6000);
+          await signal.request({type: 'resume', token}, 'auth_ok', 7000);
+          signal.setAuthenticated(true);
           await publishPrekeys(signal);
         }
       }
@@ -627,7 +636,8 @@ export default function App() {
       return true;
     } catch (err) {
       console.warn('Auto-reconnect error:', err);
-      setRtcStatus('failed');
+      try { signalRef.current?.close(); } catch {}
+      setRtcStatus('connecting');
       return false;
     } finally {
       reconnectingRef.current = false;
@@ -638,17 +648,26 @@ export default function App() {
     ensureConnectedRef.current = ensureConnected;
   }, [ensureConnected]);
 
-  // Proactive real-time health-check watchdog: keeps connection permanently online
+  // Proactive real-time health-check watchdog: keeps connection permanently online and updates presence
   useEffect(() => {
     if (!session?.live) return;
     const interval = setInterval(() => {
       if (AppState.currentState === 'active') {
         const sig = signalRef.current;
-        if (!sig || !sig.connected) {
+        if (!sig || !sig.connected || !sig.authenticated) {
           void ensureConnected();
+        } else {
+          // Poll presence / conversation updates to keep online status live
+          sig.request<{conversations?: InboxConversation[]}>({type: 'list_conversations'}, 'conversations', 3000)
+            .then(async inbox => {
+              if (inbox?.conversations) {
+                setChats(await mapInbox(inbox.conversations, onlineUsersRef.current));
+              }
+            })
+            .catch(() => {});
         }
       }
-    }, 3500);
+    }, 4000);
     return () => clearInterval(interval);
   }, [session, ensureConnected]);
 
@@ -657,7 +676,10 @@ export default function App() {
     const sub = AppState.addEventListener('change', (nextState: AppStateStatus) => {
       if (nextState === 'active') {
         if (session?.live) {
-          void ensureConnected();
+          const sig = signalRef.current;
+          if (!sig || !sig.connected || !sig.authenticated) {
+            void ensureConnected();
+          }
         }
       }
     });
@@ -1050,7 +1072,21 @@ export default function App() {
         await e2eeService.establishSessionWithPeer(recipientUid, res.bundle);
       }
 
-      const {type: msgType, body_b64} = await e2eeService.encrypt(recipientUid, plaintextPayload);
+      let encryptedResult: {type: number; body_b64: string};
+      try {
+        encryptedResult = await e2eeService.encrypt(recipientUid, plaintextPayload);
+      } catch (encryptErr) {
+        console.warn('Initial encrypt failed, attempting session auto-repair:', encryptErr);
+        await e2eeService.clearSessionWithPeer(recipientUid);
+        const res = await signal?.request<{uid: string; bundle: RemotePreKeyBundle}>(
+          {type: 'get_prekey_bundle', uid: recipientUid},
+          'prekey_bundle'
+        );
+        if (!res?.bundle) throw encryptErr;
+        await e2eeService.establishSessionWithPeer(recipientUid, res.bundle);
+        encryptedResult = await e2eeService.encrypt(recipientUid, plaintextPayload);
+      }
+      const {type: msgType, body_b64} = encryptedResult;
 
       const queueItem = {
         messageId: tempMsgId,
@@ -1127,6 +1163,7 @@ export default function App() {
       if (!result?.token || !result?.uid) {
         throw new Error('Invalid username or password.');
       }
+      pendingSignal.setAuthenticated(true);
 
       const inbox = await pendingSignal.request<{conversations?: Array<{conversation_id: string; user: {uid: string; username: string; display_name: string; about: string; online: boolean}; unread_count: number; has_messages: boolean; updated_at: string}>}>(
         {type: 'list_conversations'}, 'conversations');
