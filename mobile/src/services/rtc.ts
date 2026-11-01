@@ -193,19 +193,16 @@ export class ServerDataChannel {
       }
     };
 
-    // Network switching support: when ICE connection transitions to disconnected (e.g. Wi-Fi -> 4G),
-    // wait briefly for ICE to heal or re-gather
+    // Network switching support: when ICE connection transitions to disconnected or failed on cloud UDP-blocked hosts,
+    // maintain active E2EE session smoothly over TLS signaling fallback without spamming server renegotiations
     this.pc.oniceconnectionstatechange = () => {
       const iceState = this.pc.iceConnectionState;
-      if (iceState === 'disconnected') {
+      if (iceState === 'disconnected' || iceState === 'failed') {
         if (this.signal.connected) {
           this.onStatus?.('connected');
         } else {
-          this.onStatus?.('disconnected');
+          this.onStatus?.(iceState === 'failed' ? 'failed' : 'disconnected');
         }
-      } else if (iceState === 'failed') {
-        // Safe ICE restart attempt before declaring final failure
-        void this.restartIce();
       }
     };
 

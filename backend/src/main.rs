@@ -194,6 +194,10 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+async fn is_user_online(channels: &LiveChannels, live_signaling: &LiveSignaling, uid: &str) -> bool {
+    channels.lock().await.contains_key(uid) || live_signaling.lock().await.contains_key(uid)
+}
+
 async fn handle_client<S>(stream: S, store: Store, channels: LiveChannels, live_signaling: LiveSignaling, ice_urls: Vec<String>, auth_limiter: AuthRateLimiter, client_ip: IpAddr) -> Result<()>
 where
     S: AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -267,6 +271,7 @@ where
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "REGISTER_FAILED", &safe_error(&err)).await?,
                 }
@@ -289,6 +294,7 @@ where
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "LOGIN_FAILED", &safe_error(&err)).await?,
                 }
@@ -307,6 +313,7 @@ where
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
                 }
@@ -334,11 +341,9 @@ where
                 };
                 match store.search_users(&user.uid, &query).await {
                     Ok(mut users) => {
-                        let connected = channels.lock().await;
                         for item in &mut users {
-                            item.online = connected.contains_key(&item.uid);
+                            item.online = is_user_online(&channels, &live_signaling, &item.uid).await;
                         }
-                        drop(connected);
                         signal_tx.send(ServerFrame::Users { users }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                     }
                     Err(err) => send_error(&signal_tx, "SEARCH_FAILED", &safe_error(&err)).await?,
@@ -351,9 +356,9 @@ where
                 };
                 match store.list_conversations(&user.uid, 100).await {
                     Ok(mut conversations) => {
-                        let connected = channels.lock().await;
-                        for item in &mut conversations { item.user.online = connected.contains_key(&item.user.uid); }
-                        drop(connected);
+                        for item in &mut conversations {
+                            item.user.online = is_user_online(&channels, &live_signaling, &item.user.uid).await;
+                        }
                         signal_tx.send(ServerFrame::Conversations { conversations }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                     }
                     Err(err) => send_error(&signal_tx, "CONVERSATIONS_FAILED", &safe_error(&err)).await?,
@@ -382,7 +387,7 @@ where
                         let result = async {
                             let conversation_id = store.get_conversation_id(&user.uid, &other_uid).await?;
                             let mut other = store.get_user(&other_uid).await?;
-                            other.online = channels.lock().await.contains_key(&other_uid);
+                            other.online = is_user_online(&channels, &live_signaling, &other_uid).await;
                             Ok::<_, anyhow::Error>((conversation_id, other))
                         }.await;
                         match result {
@@ -734,6 +739,7 @@ async fn handle_ws_client(
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "LOGIN_FAILED", &safe_error(&err)).await?,
                 }
@@ -752,6 +758,7 @@ async fn handle_ws_client(
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
                 }
@@ -779,9 +786,9 @@ async fn handle_ws_client(
                 };
                 match store.search_users(&user.uid, &query).await {
                     Ok(mut users) => {
-                        let connected = channels.lock().await;
-                        for item in &mut users { item.online = connected.contains_key(&item.uid); }
-                        drop(connected);
+                        for item in &mut users {
+                            item.online = is_user_online(&channels, &live_signaling, &item.uid).await;
+                        }
                         signal_tx.send(ServerFrame::Users { users }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                     }
                     Err(err) => send_error(&signal_tx, "SEARCH_FAILED", &safe_error(&err)).await?,
@@ -794,9 +801,9 @@ async fn handle_ws_client(
                 };
                 match store.list_conversations(&user.uid, 100).await {
                     Ok(mut conversations) => {
-                        let connected = channels.lock().await;
-                        for item in &mut conversations { item.user.online = connected.contains_key(&item.user.uid); }
-                        drop(connected);
+                        for item in &mut conversations {
+                            item.user.online = is_user_online(&channels, &live_signaling, &item.user.uid).await;
+                        }
                         signal_tx.send(ServerFrame::Conversations { conversations }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                     }
                     Err(err) => send_error(&signal_tx, "CONVERSATIONS_FAILED", &safe_error(&err)).await?,
@@ -825,7 +832,7 @@ async fn handle_ws_client(
                         let result = async {
                             let conversation_id = store.get_conversation_id(&user.uid, &other_uid).await?;
                             let mut other = store.get_user(&other_uid).await?;
-                            other.online = channels.lock().await.contains_key(&other_uid);
+                            other.online = is_user_online(&channels, &live_signaling, &other_uid).await;
                             Ok::<_, anyhow::Error>((conversation_id, other))
                         }.await;
                         match result {

@@ -509,6 +509,32 @@ pub async fn broadcast_presence(_db: &Store, channels: &LiveChannels, live_signa
     }
 }
 
+pub async fn send_initial_presence_via_signal(
+    channels: &LiveChannels,
+    live_signaling: &LiveSignaling,
+    signal_tx: &mpsc::Sender<ServerFrame>,
+    current_uid: &str,
+) {
+    let mut online_uids: std::collections::HashSet<String> = {
+        channels.lock().await.keys().cloned().collect()
+    };
+    {
+        let sig = live_signaling.lock().await;
+        online_uids.extend(sig.keys().cloned());
+    }
+    online_uids.remove(current_uid);
+
+    for other_uid in online_uids {
+        let frame = DataChannelServerFrame::PresenceUpdate {
+            uid: other_uid,
+            online: true,
+        };
+        if let Ok(payload) = serde_json::to_value(&frame) {
+            let _ = signal_tx.send(ServerFrame::DataFrame { payload }).await;
+        }
+    }
+}
+
 pub async fn send_to_user(
     channels: &LiveChannels,
     live_signaling: &LiveSignaling,
