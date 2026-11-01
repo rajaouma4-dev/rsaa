@@ -635,15 +635,6 @@ pub async fn build_answerer(
             ],
             ..Default::default()
         },
-        RTCIceServer {
-            urls: vec![
-                "turn:global.relay.metered.ca:80".to_string(),
-                "turn:global.relay.metered.ca:443".to_string(),
-            ],
-            username: "6b4f1ed4dfec6aa058c544b1".to_string(),
-            credential: "02Mhum2YDd/IcEhx".to_string(),
-            ..Default::default()
-        },
     ];
     let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();
     let peer = PeerConnectionBuilder::new()
