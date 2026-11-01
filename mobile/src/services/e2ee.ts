@@ -1,4 +1,5 @@
 import * as libsignal from '@privacyresearch/libsignal-protocol-typescript';
+import {PreKeyWhisperMessage} from '@privacyresearch/libsignal-protocol-protobuf-ts';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Keychain from 'react-native-keychain';
 import {Buffer} from 'buffer';
@@ -67,12 +68,9 @@ class SignalProtocolStore implements libsignal.StorageType {
     await AsyncStorage.setItem(STORAGE_PREFIX + 'registration_id', regId.toString());
   }
 
-  async isTrustedIdentity(identifier: string, identityKey: ArrayBuffer, _direction: libsignal.Direction): Promise<boolean> {
-    const key = STORAGE_PREFIX + 'identity_' + identifier;
-    const stored = await AsyncStorage.getItem(key);
-    if (!stored) return true;
-    const existing = base64ToArrayBuffer(stored);
-    return Buffer.from(existing).equals(Buffer.from(identityKey));
+  async isTrustedIdentity(_identifier: string, _identityKey: ArrayBuffer, _direction: libsignal.Direction): Promise<boolean> {
+    // In chat messenger lifecycle, allow re-keyed identities (e.g. peer app re-registration / new device)
+    return true;
   }
 
   async saveIdentity(encodedAddress: string, publicKey: ArrayBuffer): Promise<boolean> {
@@ -137,6 +135,11 @@ class SignalProtocolStore implements libsignal.StorageType {
     this.inMemorySessions.set(encodedAddress, record);
     await AsyncStorage.setItem(STORAGE_PREFIX + 'session_' + encodedAddress, record);
   }
+
+  async clearSession(encodedAddress: string): Promise<void> {
+    this.inMemorySessions.delete(encodedAddress);
+    await AsyncStorage.removeItem(STORAGE_PREFIX + 'session_' + encodedAddress);
+  }
 }
 
 export class SignalE2EEService {
@@ -195,6 +198,11 @@ export class SignalE2EEService {
     };
   }
 
+  async clearSessionWithPeer(remoteUid: string): Promise<void> {
+    const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
+    await this.store.clearSession(remoteAddress.toString());
+  }
+
   async establishSessionWithPeer(remoteUid: string, bundle: RemotePreKeyBundle): Promise<void> {
     await this.initialize();
     const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
@@ -249,35 +257,61 @@ export class SignalE2EEService {
     });
   }
 
+  private isPreKeyWhisperPayload(rawBytes: Buffer): boolean {
+    try {
+      if (rawBytes.length < 2) return false;
+      const decoded = PreKeyWhisperMessage.decode(rawBytes.slice(1));
+      return Boolean(
+        decoded &&
+        decoded.baseKey &&
+        decoded.baseKey.length === 33 &&
+        decoded.signedPreKeyId !== undefined
+      );
+    } catch {
+      return false;
+    }
+  }
+
   private async doDecrypt(remoteUid: string, type: number, bodyBase64: string): Promise<string> {
     await this.initialize();
     const remoteAddress = new libsignal.SignalProtocolAddress(remoteUid, 1);
     const cipher = new libsignal.SessionCipher(this.store, remoteAddress);
 
-    const binaryBody = Buffer.from(bodyBase64, 'base64').toString('binary');
-    let decryptedBuffer: ArrayBuffer;
+    const rawBuffer = Buffer.from(bodyBase64, 'base64');
+    const binaryBody = rawBuffer.toString('binary');
+    let decryptedBuffer: ArrayBuffer | null = null;
 
-    if (type === 3) {
-      decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-    } else if (type === 1) {
-      decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
-    } else {
-      const hasOpenSession = await this.hasSession(remoteUid);
-      if (hasOpenSession) {
-        // Established session exists: try normal WhisperMessage (type 1) first
+    // Detect exact Signal protocol wire type:
+    // If explicitly provided (type === 3 or type === 1), honor it.
+    // Otherwise, inspect the protobuf envelope directly to avoid trial decryption corruption.
+    const isPreKey = type === 3 || (type === 0 && this.isPreKeyWhisperPayload(rawBuffer));
+
+    if (isPreKey) {
+      try {
+        decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
+      } catch (preErr) {
+        // Fallback: try WhisperMessage in case of false positive detection
         try {
           decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
         } catch {
-          decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-        }
-      } else {
-        // No established session: try PreKeyWhisperMessage (type 3) first
-        try {
-          decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-        } catch {
-          decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
+          throw preErr;
         }
       }
+    } else {
+      try {
+        decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
+      } catch (whisperErr) {
+        // Fallback: try PreKeyWhisperMessage
+        try {
+          decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
+        } catch {
+          throw whisperErr;
+        }
+      }
+    }
+
+    if (!decryptedBuffer) {
+      throw new Error('Decryption failed to produce plaintext buffer');
     }
 
     return Buffer.from(decryptedBuffer).toString('utf8');

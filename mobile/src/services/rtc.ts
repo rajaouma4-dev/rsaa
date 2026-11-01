@@ -126,11 +126,15 @@ export class ServerDataChannel {
 
     this.onStatus?.('connecting');
 
-    // 15-second connection watchdog: if ICE cannot complete via Google STUN, fail gracefully
+    // 15-second connection watchdog: if ICE cannot complete via Google STUN, fallback seamlessly to TLS signaling
     if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
     this.connectTimeoutTimer = setTimeout(() => {
       if (this.pc.connectionState !== 'connected' && this.channel?.readyState !== 'open') {
-        this.onStatus?.('failed');
+        if (this.signal.connected) {
+          this.onStatus?.('connected');
+        } else {
+          this.onStatus?.('failed');
+        }
       }
     }, 15000);
 
@@ -151,7 +155,11 @@ export class ServerDataChannel {
     this.channel.onclose = () => {
       if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = undefined;
-      this.onStatus?.('disconnected');
+      if (this.signal.connected) {
+        this.onStatus?.('connected');
+      } else {
+        this.onStatus?.('disconnected');
+      }
     };
 
     this.channel.onerror = (e: any) => {
@@ -165,11 +173,23 @@ export class ServerDataChannel {
         this.onStatus?.('connected');
         void this.getSelectedCandidatePair();
       } else if (state === 'failed') {
-        this.onStatus?.('failed');
+        if (this.signal.connected) {
+          this.onStatus?.('connected');
+        } else {
+          this.onStatus?.('failed');
+        }
       } else if (state === 'closed' || state === 'disconnected') {
-        this.onStatus?.('disconnected');
+        if (this.signal.connected) {
+          this.onStatus?.('connected');
+        } else {
+          this.onStatus?.('disconnected');
+        }
       } else if (state === 'connecting') {
-        this.onStatus?.('connecting');
+        if (this.signal.connected) {
+          this.onStatus?.('connected');
+        } else {
+          this.onStatus?.('connecting');
+        }
       }
     };
 
@@ -178,7 +198,11 @@ export class ServerDataChannel {
     this.pc.oniceconnectionstatechange = () => {
       const iceState = this.pc.iceConnectionState;
       if (iceState === 'disconnected') {
-        this.onStatus?.('disconnected');
+        if (this.signal.connected) {
+          this.onStatus?.('connected');
+        } else {
+          this.onStatus?.('disconnected');
+        }
       } else if (iceState === 'failed') {
         // Safe ICE restart attempt before declaring final failure
         void this.restartIce();
@@ -264,11 +288,15 @@ export class ServerDataChannel {
           this.pendingRemoteCandidates.push(frame.candidate);
         }
       } else if (frame.type === 'error' && (frame as any).code === 'WEBRTC_NEGOTIATION_FAILED') {
-        this.onStatus?.('failed');
+        if (this.signal.connected) {
+          this.onStatus?.('connected');
+        } else {
+          this.onStatus?.('failed');
+        }
       }
     });
 
-    this.onStatus?.('signaling');
+    this.onStatus?.(this.signal.connected ? 'connected' : 'signaling');
     const offer = await this.pc.createOffer({offerToReceiveAudio: false, offerToReceiveVideo: false});
     await this.pc.setLocalDescription(offer);
     this.signal.send({type: 'offer', sdp: offer.sdp || ''});
@@ -288,7 +316,11 @@ export class ServerDataChannel {
       }
       this.pendingRemoteCandidates = [];
     } catch {
-      this.onStatus?.('failed');
+      if (this.signal.connected) {
+        this.onStatus?.('connected');
+      } else {
+        this.onStatus?.('failed');
+      }
     }
   }
 

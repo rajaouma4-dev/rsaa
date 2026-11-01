@@ -557,11 +557,15 @@ export default function App() {
         rtc = createRealtime(signal);
         rtcRef.current = rtc;
       }
-      await rtc.connectAuthenticated();
+      try {
+        await rtc.connectAuthenticated();
+      } catch (rtcErr) {
+        console.warn('WebRTC DataChannel setup error:', rtcErr);
+      }
 
-      // Poll up to 6 seconds for channel to open
-      for (let i = 0; i < 30; i++) {
-        if (rtc.isOpen) {
+      // Check if either WebRTC DataChannel is open or TLS signaling is active
+      for (let i = 0; i < 15; i++) {
+        if (rtc.isOpen || signalRef.current?.connected) {
           setRtcStatus('connected');
           void flushOutbox();
           return true;
@@ -569,24 +573,24 @@ export default function App() {
         await new Promise<void>(r => setTimeout(r, 200));
       }
 
-      const isOpen = rtc.isOpen;
-      if (isOpen) {
-        setRtcStatus('connected');
-        void flushOutbox();
-        return true;
-      }
-      if (signalRef.current?.connected) {
+      if (rtc.isOpen || signalRef.current?.connected) {
         setRtcStatus('connected');
         void flushOutbox();
         return true;
       } else {
         setRtcStatus('disconnected');
+        return false;
       }
-      return false;
     } catch (err) {
       console.warn('Auto-reconnect error:', err);
-      setRtcStatus('failed');
-      return false;
+      if (signalRef.current?.connected) {
+        setRtcStatus('connected');
+        void flushOutbox();
+        return true;
+      } else {
+        setRtcStatus('failed');
+        return false;
+      }
     } finally {
       reconnectingRef.current = false;
     }

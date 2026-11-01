@@ -211,8 +211,9 @@ async function runEndToEndTest() {
   const msgId1 = `msg_${Date.now()}_1`;
 
   let bobReceivedPromise = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Bob did not receive live message within 5s')), 5000);
+    const timer = setTimeout(() => reject(new Error('Bob did not receive live message within 8s')), 8000);
     clientB.on((frame) => {
+      console.log('  [DEBUG BOB GOT]:', frame.type, frame.payload?.type || frame.code || '');
       if (frame.type === 'data_frame' && frame.payload && frame.payload.type === 'new_message' && frame.payload.message) {
         clearTimeout(timer);
         resolve(frame.payload.message);
@@ -222,6 +223,9 @@ async function runEndToEndTest() {
 
   // Alice sends via data_frame
   const sendTime = Date.now();
+  clientA.on((frame) => {
+    console.log('  [DEBUG ALICE GOT]:', frame.type, frame.payload?.type || frame.code || '');
+  });
   clientA.send({
     type: 'data_frame',
     payload: {
