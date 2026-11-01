@@ -80,12 +80,12 @@ function optimizeSdp(sdp: string): string {
       if (fmtpRegex.test(optimized)) {
         optimized = optimized.replace(
           fmtpRegex,
-          `a=fmtp:${pt} $1;minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
+          `a=fmtp:${pt} $1;ptime=10;minptime=10;maxptime=20;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
         );
       } else {
         optimized = optimized.replace(
           `a=rtpmap:${pt} opus/48000/2`,
-          `a=rtpmap:${pt} opus/48000/2\r\na=fmtp:${pt} minptime=10;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
+          `a=rtpmap:${pt} opus/48000/2\r\na=fmtp:${pt} ptime=10;minptime=10;maxptime=20;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
         );
       }
     }

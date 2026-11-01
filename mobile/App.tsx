@@ -264,6 +264,7 @@ export default function App() {
           type: 'send_message',
           message_id: item.messageId,
           conversation_id: item.conversationId,
+          recipient_uid: item.recipientUid,
           ciphertext_b64: item.ciphertextB64,
           msg_type: item.msgType,
         };
@@ -1085,6 +1086,7 @@ export default function App() {
         type: 'send_message',
         message_id: tempMsgId,
         conversation_id: conversationId,
+        recipient_uid: recipientUid,
         ciphertext_b64: body_b64,
         msg_type: msgType,
       };

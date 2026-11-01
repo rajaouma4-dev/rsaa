@@ -55,14 +55,14 @@ async fn main() -> Result<()> {
     let store = Store::connect(&url, &token).await?;
     store.migrate().await?;
 
-    let channels: LiveChannels = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    let live_signaling: LiveSignaling = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let channels: LiveChannels = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let live_signaling: LiveSignaling = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let auth_limiter = AuthRateLimiter::default();
-    let max_connections = env::var("MAX_SIGNAL_CONNECTIONS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(500).clamp(10, 10_000);
+    let max_connections = env::var("MAX_SIGNAL_CONNECTIONS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(100_000).clamp(10, 1_000_000);
     let connection_slots = Arc::new(Semaphore::new(max_connections));
     tokio::spawn(run_delivery_worker(store.clone(), channels.clone(), live_signaling.clone()));
     let ice_urls: Vec<String> = env::var("ICE_URLS")
-        .unwrap_or_else(|_| "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302,stun:stun2.l.google.com:19302,stun:stun3.l.google.com:19302,stun:stun4.l.google.com:19302".into())
+        .unwrap_or_else(|_| "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302".into())
         .split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
 
     // 1. WebSocket listener (Port 80/443 on Render via $PORT, or 7444 for local dev)
@@ -195,7 +195,7 @@ fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
 }
 
 async fn is_user_online(channels: &LiveChannels, live_signaling: &LiveSignaling, uid: &str) -> bool {
-    channels.lock().await.contains_key(uid) || live_signaling.lock().await.contains_key(uid)
+    channels.read().await.contains_key(uid) || live_signaling.read().await.contains_key(uid)
 }
 
 async fn handle_client<S>(stream: S, store: Store, channels: LiveChannels, live_signaling: LiveSignaling, ice_urls: Vec<String>, auth_limiter: AuthRateLimiter, client_ip: IpAddr) -> Result<()>
@@ -238,7 +238,7 @@ where
                 match store.authenticate(&token).await {
                     Ok(user) => current_user = Some(user),
                     Err(_) => {
-                        if let Some(u) = current_user.as_ref() { live_signaling.lock().await.remove(&u.uid); }
+                        if let Some(u) = current_user.as_ref() { live_signaling.write().await.remove(&u.uid); }
                         current_user = None;
                         current_session_token = None;
                         if let Some(peer) = current_peer.take() { let _ = peer.close().await; }
@@ -267,7 +267,7 @@ where
                         current_user = Some(user.clone());
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
-                        live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
+                        live_signaling.write().await.insert(user.uid.clone(), signal_tx.clone());
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
@@ -290,7 +290,7 @@ where
                         current_user = Some(user.clone());
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
-                        live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
+                        live_signaling.write().await.insert(user.uid.clone(), signal_tx.clone());
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
@@ -309,7 +309,7 @@ where
                         current_user = Some(user.clone());
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
-                        live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
+                        live_signaling.write().await.insert(user.uid.clone(), signal_tx.clone());
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
@@ -320,7 +320,7 @@ where
             }
             ClientFrame::Logout => {
                 if let Some(user) = current_user.as_ref() {
-                    live_signaling.lock().await.remove(&user.uid);
+                    live_signaling.write().await.remove(&user.uid);
                 }
                 if let Some(token) = current_session_token.as_ref() {
                     if let Err(err) = store.revoke_session(token).await {
@@ -441,7 +441,7 @@ where
                 let mut sent = false;
                 // 1. Try sending via TCP signaling socket
                 {
-                    let target_tx = { live_signaling.lock().await.get(&to_uid).cloned() };
+                    let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
                     if let Some(tx) = target_tx {
                         let _ = tx.send(ServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
@@ -452,7 +452,7 @@ where
                 }
                 // 2. If not sent via TCP, try sending via DataChannel
                 if !sent {
-                    let target_dc = { channels.lock().await.get(&to_uid).cloned() };
+                    let target_dc = { channels.read().await.get(&to_uid).cloned() };
                     if let Some(dc) = target_dc {
                         let frame = DataChannelServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
@@ -540,8 +540,8 @@ where
 
     if let Some(peer) = current_peer { let _ = peer.close().await; }
     if let Some(user) = current_user {
-        live_signaling.lock().await.remove(&user.uid);
-        channels.lock().await.remove(&user.uid);
+        live_signaling.write().await.remove(&user.uid);
+        channels.write().await.remove(&user.uid);
         let still_online = is_user_online(&channels, &live_signaling, &user.uid).await;
         if !still_online {
             crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
@@ -687,7 +687,7 @@ async fn handle_ws_client(
                 match store.authenticate(&token).await {
                     Ok(user) => current_user = Some(user),
                     Err(_) => {
-                        if let Some(u) = current_user.as_ref() { live_signaling.lock().await.remove(&u.uid); }
+                        if let Some(u) = current_user.as_ref() { live_signaling.write().await.remove(&u.uid); }
                         current_user = None;
                         current_session_token = None;
                         if let Some(peer) = current_peer.take() { let _ = peer.close().await; }
@@ -716,7 +716,7 @@ async fn handle_ws_client(
                         current_user = Some(user.clone());
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
-                        live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
+                        live_signaling.write().await.insert(user.uid.clone(), signal_tx.clone());
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
@@ -739,7 +739,7 @@ async fn handle_ws_client(
                         current_user = Some(user.clone());
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
-                        live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
+                        live_signaling.write().await.insert(user.uid.clone(), signal_tx.clone());
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
@@ -758,7 +758,7 @@ async fn handle_ws_client(
                         current_user = Some(user.clone());
                         current_session_token = Some(token.clone());
                         last_session_check = Instant::now();
-                        live_signaling.lock().await.insert(user.uid.clone(), signal_tx.clone());
+                        live_signaling.write().await.insert(user.uid.clone(), signal_tx.clone());
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
@@ -769,7 +769,7 @@ async fn handle_ws_client(
             }
             ClientFrame::Logout => {
                 if let Some(user) = current_user.as_ref() {
-                    live_signaling.lock().await.remove(&user.uid);
+                    live_signaling.write().await.remove(&user.uid);
                 }
                 if let Some(token) = current_session_token.as_ref() {
                     if let Err(err) = store.revoke_session(token).await {
@@ -889,7 +889,7 @@ async fn handle_ws_client(
                 let from_uid = user.uid.clone();
                 let mut sent = false;
                 {
-                    let target_tx = { live_signaling.lock().await.get(&to_uid).cloned() };
+                    let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
                     if let Some(tx) = target_tx {
                         let _ = tx.send(ServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
@@ -899,7 +899,7 @@ async fn handle_ws_client(
                     }
                 }
                 if !sent {
-                    let target_dc = { channels.lock().await.get(&to_uid).cloned() };
+                    let target_dc = { channels.read().await.get(&to_uid).cloned() };
                     if let Some(dc) = target_dc {
                         let frame = DataChannelServerFrame::CallSignal {
                             from_uid: from_uid.clone(),
@@ -983,8 +983,8 @@ async fn handle_ws_client(
 
     if let Some(peer) = current_peer { let _ = peer.close().await; }
     if let Some(user) = current_user {
-        live_signaling.lock().await.remove(&user.uid);
-        channels.lock().await.remove(&user.uid);
+        live_signaling.write().await.remove(&user.uid);
+        channels.write().await.remove(&user.uid);
         let still_online = is_user_online(&channels, &live_signaling, &user.uid).await;
         if !still_online {
             crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;

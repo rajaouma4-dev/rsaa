@@ -77,6 +77,8 @@ pub enum DataChannelClientFrame {
     SendMessage {
         message_id: String,
         conversation_id: String,
+        #[serde(default)]
+        recipient_uid: Option<String>,
         ciphertext_b64: String,
         #[serde(default)]
         msg_type: Option<u8>,

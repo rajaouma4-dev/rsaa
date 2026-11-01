@@ -30,13 +30,13 @@ impl Store {
 
     async fn connection(&self) -> Result<libsql::Connection> {
         let conn = self.db.connect()?;
-        let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
-        let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
         Ok(conn)
     }
 
     pub async fn migrate(&self) -> Result<()> {
         let conn = self.connection().await?;
+        let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
+        let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
         let statements = [
             "CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL COLLATE NOCASE UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS user_profiles (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, display_name TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', avatar_url TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
@@ -372,6 +372,56 @@ impl Store {
         Ok((recipient_uid, is_new))
     }
 
+    /// Fast path: lookup recipient UID for a 1-on-1 conversation
+    pub async fn get_conversation_recipient(&self, conversation_id: &str, sender_uid: &str) -> Result<String> {
+        let conn = self.connection().await?;
+        let mut rows = conn.query(
+            "SELECT uid FROM conversation_members WHERE conversation_id = ?1 AND uid <> ?2 LIMIT 1",
+            libsql::params![conversation_id.to_owned(), sender_uid.to_owned()],
+        ).await?;
+        let r: String = rows.next().await?.ok_or_else(|| anyhow!("conversation member not found"))?.get(0)?;
+        Ok(r)
+    }
+
+    /// Fast path: asynchronously saves message and schedules outbox row with minimal statements
+    pub async fn save_ciphertext_direct(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_uid: &str,
+        recipient_uid: &str,
+        ciphertext: &[u8],
+        msg_type: Option<u8>,
+    ) -> Result<()> {
+        let conn = self.connection().await?;
+        let created_at = if let Some(ts_str) = message_id.strip_prefix("m_").and_then(|rest| rest.split('_').next()) {
+            if let Ok(ts_ms) = ts_str.parse::<u64>() {
+                if ts_ms > 100_000_000_000 {
+                    format!("{}", ts_ms / 1000)
+                } else {
+                    now_epoch_string()
+                }
+            } else {
+                now_epoch_string()
+            }
+        } else {
+            now_epoch_string()
+        };
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status, msg_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'SAVED', ?7)",
+            libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), recipient_uid.to_owned(), ciphertext.to_vec(), created_at, msg_type.unwrap_or(0) as i64],
+        ).await?;
+        if inserted == 1 {
+            let event_id = format!("deliver:{message_id}");
+            let next_attempt = now_seconds();
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params![event_id, message_id.to_owned(), recipient_uid.to_owned(), next_attempt],
+            ).await;
+        }
+        Ok(())
+    }
+
     pub async fn pending_deliveries(&self, recipient_uid: &str, limit: i64) -> Result<Vec<PendingDelivery>> {
         let conn = self.connection().await?;
         let mut rows = conn.query(
@@ -508,12 +558,12 @@ mod tests {
                 let ciphertext = vec![0x33, 0x11, 0x22, 0x33];
 
                 // First delivery attempt
-                let (rec1, is_new1) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext).await.expect("Save 1");
+                let (rec1, is_new1) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext, None).await.expect("Save 1");
                 assert_eq!(rec1, u2.uid);
                 assert!(is_new1, "Live Turso: First delivery attempt must be marked as new");
 
                 // Duplicate delivery attempt with identical payload
-                let (rec2, is_new2) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext).await.expect("Save 2");
+                let (rec2, is_new2) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext, None).await.expect("Save 2");
                 assert_eq!(rec2, u2.uid);
                 assert!(!is_new2, "Live Turso: Duplicate delivery attempt must NOT be marked as new");
 
@@ -638,16 +688,16 @@ mod tests {
         let msg_id = "msg_test_dup_001";
         let ciphertext = vec![0x33, 0x01, 0x02, 0x03];
 
-        let (recipient, is_new1) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext).await.unwrap();
+        let (recipient, is_new1) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
         assert_eq!(recipient, u2.uid);
         assert!(is_new1, "First delivery attempt must be marked as new");
 
-        let (recipient2, is_new2) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext).await.unwrap();
+        let (recipient2, is_new2) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
         assert_eq!(recipient2, u2.uid);
         assert!(!is_new2, "Duplicate delivery attempt must NOT be marked as new");
 
         let conflict_bytes = vec![0x33, 0x99, 0x88];
-        let conflict_res = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &conflict_bytes).await;
+        let conflict_res = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &conflict_bytes, None).await;
         assert!(conflict_res.is_err(), "Conflicting message payload with same ID must be rejected");
 
         let pending = store.pending_deliveries(&u2.uid, 10).await.unwrap();
