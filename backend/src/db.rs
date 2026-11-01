@@ -364,7 +364,7 @@ impl Store {
     pub async fn pending_deliveries(&self, recipient_uid: &str, limit: i64) -> Result<Vec<PendingDelivery>> {
         let conn = self.connection().await?;
         let mut rows = conn.query(
-            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.created_at LIMIT ?3",
+            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.rowid ASC LIMIT ?3",
             libsql::params![recipient_uid.to_owned(), now_seconds(), limit.clamp(1, 100)],
         ).await?;
         let mut items = Vec::new();
