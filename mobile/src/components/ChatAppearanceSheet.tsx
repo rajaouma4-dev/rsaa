@@ -5,8 +5,9 @@ export function ChatAppearanceSheet({value,wallpapers,loading,error,onRetry,onCl
  value:Appearance;wallpapers:Wallpaper[];loading:boolean;error:string;onRetry:()=>void;onClose:()=>void;onSave:(value:Appearance)=>Promise<void>;
 }) {
  const [draft,setDraft]=useState(value),[tab,setTab]=useState<'background'|'color'>('background'),[saving,setSaving]=useState(false);
+ const [hex,setHex]=useState(value.color);
  const image=wallpapers.find(w=>w.id===draft.wallpaper)?.data_uri;
- const save=async()=>{setSaving(true);try{await onSave(draft);}catch{Alert.alert('Could not save','Please try again.');}finally{setSaving(false);}};
+ const save=async()=>{if(!/^#[0-9a-f]{6}$/i.test(hex)){Alert.alert('Choose a color','Enter a six-digit hex color, such as #7957E8.');return;}setSaving(true);try{await onSave(draft);}catch{Alert.alert('Could not save','Please try again.');}finally{setSaving(false);}};
  return <Modal transparent animationType="slide" onRequestClose={onClose}><View style={s.shade}><View style={s.sheet}>
  <View style={s.head}><View><Text style={s.title}>Make it yours</Text><Text style={s.sub}>Personalize this chat · only on your device</Text></View><Pressable accessibilityLabel="Close appearance" onPress={onClose} style={s.close}><Text style={s.white}>✕</Text></Pressable></View>
  <ImageBackground source={image?{uri:image}:undefined} resizeMode="cover" style={s.preview} imageStyle={{opacity:.32}}>
@@ -17,7 +18,7 @@ export function ChatAppearanceSheet({value,wallpapers,loading,error,onRetry,onCl
  <Pressable onPress={()=>setDraft({...draft,wallpaper:'none'})} style={[s.tile,draft.wallpaper==='none'&&s.selected]}><Text style={s.white}>Plain</Text></Pressable>
  {wallpapers.map(w=><Pressable key={w.id} accessibilityLabel={'Wallpaper '+w.name} onPress={()=>setDraft({...draft,wallpaper:w.id})} style={[s.tile,draft.wallpaper===w.id&&s.selected]}><ImageBackground source={{uri:w.data_uri}} style={s.thumb} resizeMode="cover"><Text style={s.tileName}>{w.name}</Text></ImageBackground></Pressable>)}
  {loading?<ActivityIndicator color="#B9A5FF"/>:null}
- </ScrollView>:<View style={s.colors}>{BUBBLE_COLORS.map(color=><Pressable key={color} accessibilityLabel={'Bubble color '+color} onPress={()=>setDraft({...draft,color})} style={[s.swatch,{backgroundColor:color},draft.color===color&&s.selected]}/>)}<TextInput accessibilityLabel="Custom bubble color hex" defaultValue={draft.color} autoCapitalize="none" maxLength={7} onChangeText={color=>{if(/^#[0-9a-f]{6}$/i.test(color))setDraft({...draft,color});}} style={s.hex} placeholder="#7957E8" placeholderTextColor="#98A2BA"/></View>}
+ </ScrollView>:<View style={s.colors}>{BUBBLE_COLORS.map(color=><Pressable key={color} accessibilityLabel={'Bubble color '+color} onPress={()=>{setHex(color);setDraft({...draft,color});}} style={[s.swatch,{backgroundColor:color},draft.color===color&&s.selected]}/>)}<TextInput accessibilityLabel="Custom bubble color hex" value={hex} returnKeyType="done" autoCapitalize="none" maxLength={7} onChangeText={color=>{setHex(color);if(/^#[0-9a-f]{6}$/i.test(color))setDraft({...draft,color});}} style={s.hex} placeholder="#7957E8" placeholderTextColor="#98A2BA"/></View>}
  {tab==='color'?<View style={{flexDirection:'row',gap:10}}>{(['solid','gradient','glow'] as const).map(effect=><Pressable key={effect} onPress={()=>setDraft({...draft,effect})} style={[s.tab,{backgroundColor:draft.effect===effect?'#493979':'#243149'}]}><Text style={s.white}>{effect}</Text></Pressable>)}</View>:null}
  {error?<Pressable onPress={onRetry}><Text style={s.sub}>{error} · Tap to retry</Text></Pressable>:null}
  <Pressable disabled={saving} onPress={()=>{void save();}} style={s.save}><Text style={s.saveText}>{saving?'Saving…':'Save appearance'}</Text></Pressable>

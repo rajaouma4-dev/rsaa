@@ -88,7 +88,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   counterText: {
-    color: '#E4E6EB',
+    color: '#F2F5FC',
     fontSize: 12,
     fontWeight: '600',
   },

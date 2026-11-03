@@ -382,7 +382,6 @@ export function ChatScreen({
               <View
                 style={[
                   styles.bubble,
-                  isMe && {backgroundColor:appearance.color,...bubbleEffect(appearance)},
                   isMe ? [styles.bubbleMe,{backgroundColor:appearance.color,...bubbleEffect(appearance)}] : styles.bubbleThem,
                   isMe
                     ? {
@@ -450,14 +449,14 @@ export function ChatScreen({
         <View style={styles.headerActions}>
           <Pressable
             onPress={() => onStartCall?.(chat.user, 'audio')}
-            accessibilityLabel="Start call"
+            accessibilityLabel="Start audio call"
             hitSlop={8}
             style={styles.headerCallBtn}>
             <ChatIcon name="phone"/>
           </Pressable>
           <Pressable
             onPress={() => onStartCall?.(chat.user, 'video')}
-            accessibilityLabel="Start call"
+            accessibilityLabel="Start video call"
             hitSlop={8}
             style={styles.headerCallBtn}>
             <ChatIcon name="camera"/>

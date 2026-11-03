@@ -1,3 +1,9 @@
+# Current chat design — 4 November 2026
+
+Version 1.0.7 (code 8) adds the redesigned conversation/composer/call cards and database-backed wallpapers with persistent caching. Overflow menu offers Background and Bubble color, live preview, hex presets and solid/gradient/glow effects. Four supplied images are stored in Turso. Theme loading, saved appearance after restart and text delivery were verified on the updated app. See [chat appearance validation](docs/CHAT_APPEARANCE_VALIDATION.md) for exact tests, screenshots and APK hash. Preferences apply to this chat on this device.
+
+---
+
 # Current call delivery fix — 4 November 2026
 
 Version 1.0.6 (code 7) fixes abandoned server busy reservations after app restart and reconnects signaling before dialing. Server fix `1d843f5` was confirmed live on Render. Three-emulator testing verified audio ringing/accept/connect, third-caller busy without disrupting an active call, force-stop/restart then successful redial, and video ringing/accept/connect. Gray emulator camera content and real audio/video quality remain unresolved. Install 1.0.6 on both calling devices. See [call recovery verification](docs/CALL_RECOVERY_VALIDATION.md) for evidence, checks and APK hash.

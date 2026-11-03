@@ -116,7 +116,7 @@ const styles = StyleSheet.create({
     width: 38,
     height: 38,
     borderRadius: 19,
-    backgroundColor: '#0084FF',
+    backgroundColor: '#7957E8',
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 12,
@@ -131,7 +131,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   previewLabel: {
-    color: '#8A8D91',
+    color: '#A4B1C7',
     fontSize: 11,
     fontWeight: '600',
   },
