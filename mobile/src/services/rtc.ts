@@ -130,11 +130,7 @@ export class ServerDataChannel {
     if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
     this.connectTimeoutTimer = setTimeout(() => {
       if (this.pc.connectionState !== 'connected' && this.channel?.readyState !== 'open') {
-        if (this.signal.connected) {
-          this.onStatus?.('connected');
-        } else {
-          this.onStatus?.('failed');
-        }
+        this.onStatus?.('failed');
       }
     }, 15000);
 
@@ -155,11 +151,7 @@ export class ServerDataChannel {
     this.channel.onclose = () => {
       if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = undefined;
-      if (this.signal.connected) {
-        this.onStatus?.('connected');
-      } else {
-        this.onStatus?.('disconnected');
-      }
+      this.onStatus?.('disconnected');
     };
 
     this.channel.onerror = (e: any) => {
@@ -170,26 +162,14 @@ export class ServerDataChannel {
       const state = this.pc.connectionState;
       if (state === 'connected') {
         if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
-        this.onStatus?.('connected');
+        if (this.isOpen) this.onStatus?.('connected');
         void this.getSelectedCandidatePair();
       } else if (state === 'failed') {
-        if (this.signal.connected) {
-          this.onStatus?.('connected');
-        } else {
-          this.onStatus?.('failed');
-        }
+        this.onStatus?.('failed');
       } else if (state === 'closed' || state === 'disconnected') {
-        if (this.signal.connected) {
-          this.onStatus?.('connected');
-        } else {
-          this.onStatus?.('disconnected');
-        }
+        this.onStatus?.('disconnected');
       } else if (state === 'connecting') {
-        if (this.signal.connected) {
-          this.onStatus?.('connected');
-        } else {
-          this.onStatus?.('connecting');
-        }
+        this.onStatus?.('connecting');
       }
     };
 
@@ -198,11 +178,7 @@ export class ServerDataChannel {
     this.pc.oniceconnectionstatechange = () => {
       const iceState = this.pc.iceConnectionState;
       if (iceState === 'disconnected' || iceState === 'failed') {
-        if (this.signal.connected) {
-          this.onStatus?.('connected');
-        } else {
-          this.onStatus?.(iceState === 'failed' ? 'failed' : 'disconnected');
-        }
+        this.onStatus?.(iceState === 'failed' ? 'failed' : 'disconnected');
       }
     };
 
@@ -285,15 +261,11 @@ export class ServerDataChannel {
           this.pendingRemoteCandidates.push(frame.candidate);
         }
       } else if (frame.type === 'error' && (frame as any).code === 'WEBRTC_NEGOTIATION_FAILED') {
-        if (this.signal.connected) {
-          this.onStatus?.('connected');
-        } else {
-          this.onStatus?.('failed');
-        }
+        this.onStatus?.('failed');
       }
     });
 
-    this.onStatus?.(this.signal.connected ? 'connected' : 'signaling');
+    this.onStatus?.('signaling');
     const offer = await this.pc.createOffer({offerToReceiveAudio: false, offerToReceiveVideo: false});
     await this.pc.setLocalDescription(offer);
     this.signal.send({type: 'offer', sdp: offer.sdp || ''});
@@ -313,11 +285,7 @@ export class ServerDataChannel {
       }
       this.pendingRemoteCandidates = [];
     } catch {
-      if (this.signal.connected) {
-        this.onStatus?.('connected');
-      } else {
-        this.onStatus?.('failed');
-      }
+      this.onStatus?.('failed');
     }
   }
 

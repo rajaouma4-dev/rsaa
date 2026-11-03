@@ -111,7 +111,7 @@ export class TlsSignalingClient {
       });
 
       this.connectPromise = promise;
-      promise.finally(() => { this.connectPromise = undefined; });
+      void promise.then(() => { this.connectPromise = undefined; }, () => { this.connectPromise = undefined; });
       return promise;
     }
 
@@ -158,8 +158,8 @@ export class TlsSignalingClient {
           host,
           port: APP_CONFIG.SIGNALING_PORT,
           connectTimeout: 5000,
-          tlsCheckValidity: false,
-          rejectUnauthorized: false,
+          tlsCheckValidity: true,
+          rejectUnauthorized: true,
         } as any, async () => {
           if (settled) return;
           try {
@@ -187,7 +187,7 @@ export class TlsSignalingClient {
               host.startsWith('192.168.') ||
               host.startsWith('172.');
 
-            if (fingerprint && !allowedPins.includes(fingerprint) && !isLocal) {
+            if (fingerprint.length !== 64 || !allowedPins.includes(fingerprint)) {
               fail(new Error('TLS certificate pin mismatch. Check the server certificate and configured primary/backup pins.'));
               return;
             }

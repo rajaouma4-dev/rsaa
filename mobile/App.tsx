@@ -248,42 +248,37 @@ export default function App() {
     recipientUid: string;
     ciphertextB64: string;
     msgType?: number;
+    lastAttempt?: number;
   }[]>([]);
+  const flushingOutboxRef = useRef(false);
 
   const flushOutbox = useCallback(async () => {
     if (outboxRef.current.length === 0) return;
     const rtc = rtcRef.current;
-    const sig = signalRef.current;
-    if ((!rtc || !rtc.isOpen) && (!sig || !sig.connected)) return;
-
-    const queue = [...outboxRef.current];
-    outboxRef.current = [];
-    for (const item of queue) {
-      try {
-        const payloadObj = {
-          type: 'send_message',
-          message_id: item.messageId,
-          conversation_id: item.conversationId,
-          recipient_uid: item.recipientUid,
-          ciphertext_b64: item.ciphertextB64,
-          msg_type: item.msgType,
-        };
-        if (rtc && rtc.isOpen) {
-          await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
-        } else if (sig && sig.connected) {
-          sig.send({type: 'data_frame', payload: payloadObj});
-        } else {
-          outboxRef.current.push(item);
-        }
-      } catch {
-        outboxRef.current.push(item);
+    if (!rtc?.isOpen || flushingOutboxRef.current) return;
+    flushingOutboxRef.current = true;
+    try {
+      for (const item of [...outboxRef.current]) {
+        if (item.lastAttempt && Date.now() - item.lastAttempt < 5000) continue;
+        item.lastAttempt = Date.now();
+        try {
+          await rtc.sendEncryptedEnvelope(JSON.stringify({
+            type: 'send_message', message_id: item.messageId,
+            conversation_id: item.conversationId, recipient_uid: item.recipientUid,
+            ciphertext_b64: item.ciphertextB64, msg_type: item.msgType,
+          }));
+        } catch { item.lastAttempt = undefined; break; }
       }
-    }
+    } finally { flushingOutboxRef.current = false; }
+
   }, []);
 
   useEffect(() => {
     selectedRef.current = selected;
   }, [selected]);
+
+  const incomingQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const lastRtcAttemptRef = useRef(0);
 
   const processDataEnvelope = useCallback(async (envelope: any) => {
     try {
@@ -295,6 +290,7 @@ export default function App() {
       } else if (['saved_ack', 'delivered_ack', 'seen_ack'].includes(envelope.type || '') && envelope.message_id) {
         const nextStatus = envelope.type === 'saved_ack' ? 'saved' : envelope.type === 'delivered_ack' ? 'delivered' : 'seen';
         const msgId = envelope.message_id;
+        outboxRef.current = outboxRef.current.filter(item => item.messageId !== msgId);
         const convId = envelope.conversation_id || selectedRef.current?.id;
         if (convId) {
           void updateLocalMessageStatus(convId, msgId, nextStatus as any);
@@ -352,6 +348,21 @@ export default function App() {
       } else if (envelope.type === 'new_message' && envelope.message) {
         const incoming = envelope.message;
         const handleIncoming = async () => {
+          const isCurrentChat = selectedRef.current?.id === incoming.conversation_id;
+          // A retry after a lost ACK must not decrypt the same ratchet message twice.
+          const known = (await getLocalMessages(incoming.conversation_id)).find(m => m.id === incoming.message_id);
+          if (known && !known.text.startsWith('Encrypted message') && !known.text.startsWith('Decryption failed')) {
+            try { rtcRef.current?.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id}); } catch {}
+            return;
+          }
+
+          let decryptedText = 'Encrypted message';
+          try {
+            decryptedText = await e2eeService.decrypt(incoming.sender_uid, (incoming as any).msg_type || 0, incoming.ciphertext_b64);
+          } catch (err) {
+            console.warn('Decryption failed; leaving message pending:', err);
+            return;
+          }
           // Acknowledge delivered receipt immediately
           try {
             if (rtcRef.current?.isOpen) {
@@ -361,7 +372,7 @@ export default function App() {
             }
           } catch {}
 
-          const isCurrentChat = selectedRef.current?.id === incoming.conversation_id;
+
           if (isCurrentChat) {
             try {
               if (rtcRef.current?.isOpen) {
@@ -372,31 +383,6 @@ export default function App() {
             } catch {}
           }
 
-          // Check in-memory first to avoid slow disk read on duplicates
-          const currentSelected = selectedRef.current;
-          if (currentSelected && currentSelected.id === incoming.conversation_id) {
-            const alreadyInMemory = currentSelected.messages.find(m => m.id === incoming.message_id);
-            if (alreadyInMemory && !alreadyInMemory.text.startsWith('Encrypted message') && !alreadyInMemory.text.startsWith('Decryption failed')) {
-              return;
-            }
-          }
-
-          let decryptedText = 'Encrypted message';
-          try {
-            decryptedText = await e2eeService.decrypt(incoming.sender_uid, (incoming as any).msg_type || 0, incoming.ciphertext_b64);
-          } catch (err) {
-            console.warn('Decryption failed:', err);
-            decryptedText = 'Decryption failed · Bad MAC or missing session';
-            // Request sender to re-key with a fresh session
-            try {
-              const repairPayload = {type: 'session_repair' as const, peer_uid: incoming.sender_uid};
-              if (rtcRef.current?.isOpen) {
-                rtcRef.current.sendControlFrame(repairPayload);
-              } else if (signalRef.current?.connected) {
-                signalRef.current.send({type: 'data_frame', payload: repairPayload});
-              }
-            } catch {}
-          }
 
           let msgMediaType: 'text' | 'image' | 'voice' = 'text';
           let msgImages: MediaImageItem[] | undefined = undefined;
@@ -471,9 +457,9 @@ export default function App() {
           });
 
           // 2. Persist to storage in background without blocking realtime flow
-          void appendLocalMessage(incoming.conversation_id, incomingMsg);
+          await appendLocalMessage(incoming.conversation_id, incomingMsg);
         };
-        void handleIncoming();
+        incomingQueueRef.current = incomingQueueRef.current.then(handleIncoming).catch(err => { console.warn('Incoming message failed:', err); });
       }
     } catch (err) {
       console.warn('Error processing data envelope:', err);
@@ -486,9 +472,10 @@ export default function App() {
   }, [processDataEnvelope]);
 
   const createRealtime = useCallback((signal: TlsSignalingClient) => {
+    lastRtcAttemptRef.current = Date.now();
     const rtc = new ServerDataChannel(signal);
     rtc.onConnectionStatus(status => {
-      if (status === 'connected' || (signalRef.current?.connected && signalRef.current?.authenticated)) {
+      if (status === 'connected' && rtc.isOpen) {
         setRtcStatus('connected');
         void flushOutbox();
       } else {
@@ -578,7 +565,12 @@ export default function App() {
     if (!session?.live) return false;
     const currentSig = signalRef.current;
     if (currentSig?.connected && currentSig?.authenticated) {
-      setRtcStatus('connected');
+      if (!rtcRef.current?.isOpen && !reconnectingRef.current && Date.now() - lastRtcAttemptRef.current > 20000) {
+        reconnectingRef.current = true;
+        lastRtcAttemptRef.current = Date.now();
+        try { await rtcRef.current?.reconnect(); } finally { reconnectingRef.current = false; }
+      }
+      setRtcStatus(rtcRef.current?.isOpen ? 'connected' : 'connecting');
       void flushOutbox();
       return true;
     }
@@ -654,7 +646,8 @@ export default function App() {
     const interval = setInterval(() => {
       if (AppState.currentState === 'active') {
         const sig = signalRef.current;
-        if (!sig || !sig.connected || !sig.authenticated) {
+        void flushOutbox();
+        if (!sig || !sig.connected || !sig.authenticated || !rtcRef.current?.isOpen) {
           void ensureConnected();
         } else {
           // Poll presence / conversation updates to keep online status live
@@ -1096,41 +1089,10 @@ export default function App() {
         msgType,
       };
 
-      const payloadObj = {
-        type: 'send_message',
-        message_id: tempMsgId,
-        conversation_id: conversationId,
-        recipient_uid: recipientUid,
-        ciphertext_b64: body_b64,
-        msg_type: msgType,
-      };
+      outboxRef.current.push(queueItem);
+      await flushOutbox();
+      if (!rtcRef.current?.isOpen) void ensureConnected();
 
-      if (rtc && rtc.isOpen) {
-        try {
-          await rtc.sendEncryptedEnvelope(JSON.stringify(payloadObj));
-        } catch (sendErr) {
-          if (signal?.connected) {
-            try {
-              signal.send({type: 'data_frame', payload: payloadObj});
-            } catch {
-              outboxRef.current.push(queueItem);
-            }
-          } else {
-            outboxRef.current.push(queueItem);
-          }
-        }
-      } else if (signal && signal.connected) {
-        try {
-          signal.send({type: 'data_frame', payload: payloadObj});
-        } catch {
-          outboxRef.current.push(queueItem);
-        }
-      } else {
-        outboxRef.current.push(queueItem);
-        void ensureConnected().then(connected => {
-          if (connected) void flushOutbox();
-        });
-      }
     } catch (err) {
       console.warn('Send issue:', err);
     }

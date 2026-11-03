@@ -303,7 +303,8 @@ impl Store {
     pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8], msg_type: Option<u8>) -> Result<(String, bool)> {
         validate_message_id(message_id)?;
         anyhow::ensure!(!ciphertext.is_empty() && ciphertext.len() <= 10 * 1024 * 1024, "invalid ciphertext size");
-        let conn = self.connection().await?;
+        let connection = self.connection().await?;
+        let conn = connection.transaction().await?;
         
         let recipient_uid = {
             let mut members = conn.query(
@@ -364,11 +365,12 @@ impl Store {
                 // Next attempt is immediately eligible (now_seconds()) so delivery to newly connected
                 // recipients is instant via OnOpen flush or background worker.
                 let next_attempt = now_seconds();
-                let _ = conn.execute("INSERT OR IGNORE INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![event_id, message_id.to_owned(), recipient_uid.clone(), next_attempt]).await;
+                conn.execute("INSERT OR IGNORE INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES (?1, ?2, ?3, ?4)",
+                    libsql::params![event_id, message_id.to_owned(), recipient_uid.clone(), next_attempt]).await?;
                 is_new = true;
             }
         }
+        conn.commit().await?;
         Ok((recipient_uid, is_new))
     }
 

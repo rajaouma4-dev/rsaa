@@ -541,8 +541,12 @@ where
 
     if let Some(peer) = current_peer { let _ = peer.close().await; }
     if let Some(user) = current_user {
-        live_signaling.write().await.remove(&user.uid);
-        channels.write().await.remove(&user.uid);
+        // A superseded socket must not remove the new login's sender/channel.
+        let mut connected = live_signaling.write().await;
+        if connected.get(&user.uid).is_some_and(|tx| tx.same_channel(&signal_tx)) {
+            connected.remove(&user.uid);
+        }
+        drop(connected);
         let still_online = is_user_online(&channels, &live_signaling, &user.uid).await;
         if !still_online {
             crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;
@@ -987,8 +991,12 @@ async fn handle_ws_client(
 
     if let Some(peer) = current_peer { let _ = peer.close().await; }
     if let Some(user) = current_user {
-        live_signaling.write().await.remove(&user.uid);
-        channels.write().await.remove(&user.uid);
+        // A superseded socket must not remove the new login's sender/channel.
+        let mut connected = live_signaling.write().await;
+        if connected.get(&user.uid).is_some_and(|tx| tx.same_channel(&signal_tx)) {
+            connected.remove(&user.uid);
+        }
+        drop(connected);
         let still_online = is_user_online(&channels, &live_signaling, &user.uid).await;
         if !still_online {
             crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, false).await;

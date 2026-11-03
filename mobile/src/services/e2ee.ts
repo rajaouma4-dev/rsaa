@@ -1,11 +1,30 @@
 import * as libsignal from '@privacyresearch/libsignal-protocol-typescript';
 import {PreKeyWhisperMessage} from '@privacyresearch/libsignal-protocol-protobuf-ts';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Keychain from 'react-native-keychain';
 import {Buffer} from 'buffer';
 
 const KEYCHAIN_SERVICE = 'com.nexa.chat.e2ee.identity';
 const STORAGE_PREFIX = 'nexa.e2ee.';
+
+// Ratchet records and private prekeys must never be persisted in AsyncStorage.
+// Existing installations require explicit secure reprovisioning; do not silently
+// import potentially exposed legacy secrets into a trusted session.
+const secureStore = {
+  async getItem(key: string): Promise<string | null> {
+    const result = await Keychain.getGenericPassword({service: key});
+    return result ? result.password : null;
+  },
+  async setItem(key: string, value: string): Promise<void> {
+    const result = await Keychain.setGenericPassword('signal', value, {
+      service: key,
+      accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    });
+    if (!result) throw new Error('Secure Signal storage unavailable');
+  },
+  async removeItem(key: string): Promise<void> {
+    await Keychain.resetGenericPassword({service: key});
+  },
+};
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return Buffer.from(buffer).toString('base64');
@@ -44,7 +63,7 @@ class SignalProtocolStore implements libsignal.StorageType {
         privKey: base64ToArrayBuffer(parsed.privKey),
       };
     } catch {
-      return undefined;
+      throw new Error('Cannot access Signal identity securely');
     }
   }
 
@@ -60,27 +79,32 @@ class SignalProtocolStore implements libsignal.StorageType {
   }
 
   async getLocalRegistrationId(): Promise<number | undefined> {
-    const raw = await AsyncStorage.getItem(STORAGE_PREFIX + 'registration_id');
+    const raw = await secureStore.getItem(STORAGE_PREFIX + 'registration_id');
     return raw ? parseInt(raw, 10) : undefined;
   }
 
   async saveLocalRegistrationId(regId: number): Promise<void> {
-    await AsyncStorage.setItem(STORAGE_PREFIX + 'registration_id', regId.toString());
+    await secureStore.setItem(STORAGE_PREFIX + 'registration_id', regId.toString());
   }
 
-  async isTrustedIdentity(_identifier: string, _identityKey: ArrayBuffer, _direction: libsignal.Direction): Promise<boolean> {
-    // In chat messenger lifecycle, allow re-keyed identities (e.g. peer app re-registration / new device)
-    return true;
+  async isTrustedIdentity(identifier: string, identityKey: ArrayBuffer, _direction: libsignal.Direction): Promise<boolean> {
+    const saved = await secureStore.getItem(STORAGE_PREFIX + 'identity_' + identifier);
+    return saved === null || saved === arrayBufferToBase64(identityKey);
   }
 
   async saveIdentity(encodedAddress: string, publicKey: ArrayBuffer): Promise<boolean> {
     const key = STORAGE_PREFIX + 'identity_' + encodedAddress;
-    await AsyncStorage.setItem(key, arrayBufferToBase64(publicKey));
-    return true;
+    const value = arrayBufferToBase64(publicKey);
+    const previous = await secureStore.getItem(key);
+    if (previous !== null && previous !== value) {
+      throw new Error('Peer identity changed; verify the new device before continuing');
+    }
+    await secureStore.setItem(key, value);
+    return false;
   }
 
   async loadPreKey(keyId: string | number): Promise<libsignal.KeyPairType | undefined> {
-    const raw = await AsyncStorage.getItem(STORAGE_PREFIX + 'prekey_' + keyId);
+    const raw = await secureStore.getItem(STORAGE_PREFIX + 'prekey_' + keyId);
     if (!raw) return undefined;
     const parsed = JSON.parse(raw);
     return {
@@ -94,7 +118,7 @@ class SignalProtocolStore implements libsignal.StorageType {
       pubKey: arrayBufferToBase64(keyPair.pubKey),
       privKey: arrayBufferToBase64(keyPair.privKey),
     });
-    await AsyncStorage.setItem(STORAGE_PREFIX + 'prekey_' + keyId, payload);
+    await secureStore.setItem(STORAGE_PREFIX + 'prekey_' + keyId, payload);
   }
 
   async removePreKey(_keyId: number | string): Promise<void> {
@@ -102,7 +126,7 @@ class SignalProtocolStore implements libsignal.StorageType {
   }
 
   async loadSignedPreKey(keyId: number | string): Promise<libsignal.KeyPairType | undefined> {
-    const raw = await AsyncStorage.getItem(STORAGE_PREFIX + 'signed_prekey_' + keyId);
+    const raw = await secureStore.getItem(STORAGE_PREFIX + 'signed_prekey_' + keyId);
     if (!raw) return undefined;
     const parsed = JSON.parse(raw);
     return {
@@ -116,18 +140,18 @@ class SignalProtocolStore implements libsignal.StorageType {
       pubKey: arrayBufferToBase64(keyPair.pubKey),
       privKey: arrayBufferToBase64(keyPair.privKey),
     });
-    await AsyncStorage.setItem(STORAGE_PREFIX + 'signed_prekey_' + keyId, payload);
+    await secureStore.setItem(STORAGE_PREFIX + 'signed_prekey_' + keyId, payload);
   }
 
   async removeSignedPreKey(keyId: number | string): Promise<void> {
-    await AsyncStorage.removeItem(STORAGE_PREFIX + 'signed_prekey_' + keyId);
+    await secureStore.removeItem(STORAGE_PREFIX + 'signed_prekey_' + keyId);
   }
 
   async loadSession(encodedAddress: string): Promise<libsignal.SessionRecordType | undefined> {
     if (this.inMemorySessions.has(encodedAddress)) {
       return this.inMemorySessions.get(encodedAddress);
     }
-    const val = await AsyncStorage.getItem(STORAGE_PREFIX + 'session_' + encodedAddress);
+    const val = await secureStore.getItem(STORAGE_PREFIX + 'session_' + encodedAddress);
     if (val) {
       this.inMemorySessions.set(encodedAddress, val);
     }
@@ -136,12 +160,12 @@ class SignalProtocolStore implements libsignal.StorageType {
 
   async storeSession(encodedAddress: string, record: libsignal.SessionRecordType): Promise<void> {
     this.inMemorySessions.set(encodedAddress, record);
-    await AsyncStorage.setItem(STORAGE_PREFIX + 'session_' + encodedAddress, record);
+    await secureStore.setItem(STORAGE_PREFIX + 'session_' + encodedAddress, record);
   }
 
   async clearSession(encodedAddress: string): Promise<void> {
     this.inMemorySessions.delete(encodedAddress);
-    await AsyncStorage.removeItem(STORAGE_PREFIX + 'session_' + encodedAddress);
+    await secureStore.removeItem(STORAGE_PREFIX + 'session_' + encodedAddress);
   }
 }
 
@@ -199,7 +223,7 @@ export class SignalE2EEService {
       // Generate signed prekey 1
       const signedPreKey = await libsignal.KeyHelper.generateSignedPreKey(identity, 1);
       await this.store.storeSignedPreKey(1, signedPreKey.keyPair);
-      await AsyncStorage.setItem(
+      await secureStore.setItem(
         STORAGE_PREFIX + 'signed_prekey_sig_1',
         arrayBufferToBase64(signedPreKey.signature),
       );
@@ -218,7 +242,7 @@ export class SignalE2EEService {
     const regId = await this.store.getLocalRegistrationId();
     const preKey = await this.store.loadPreKey(1);
     const signedPreKey = await this.store.loadSignedPreKey(1);
-    const signatureRaw = await AsyncStorage.getItem(STORAGE_PREFIX + 'signed_prekey_sig_1');
+    const signatureRaw = await secureStore.getItem(STORAGE_PREFIX + 'signed_prekey_sig_1');
 
     if (!identity || !regId || !preKey || !signedPreKey || !signatureRaw) {
       throw new Error('E2EE service not fully provisioned with prekeys');
@@ -321,54 +345,14 @@ export class SignalE2EEService {
     const binaryBody = rawBuffer.toString('binary');
     let decryptedBuffer: ArrayBuffer | null = null;
 
-    // Detect exact Signal protocol wire type:
-    // If explicitly provided (type === 3 or type === 1), honor it.
-    // Otherwise, inspect the protobuf envelope directly.
-    const isPreKey = type === 3 || (type !== 1 && this.isPreKeyWhisperPayload(rawBuffer));
-
-    let lastError: any = null;
-    if (isPreKey) {
-      try {
-        decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-      } catch (err) {
-        lastError = err;
-        try {
-          decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
-          lastError = null;
-        } catch (whisperErr) {
-          lastError = whisperErr;
-        }
-      }
+    // Authentication failures and replays must not reset a valid ratchet or
+    // trigger a retry under another wire format.
+    if (type === 3) {
+      decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
+    } else if (type === 1) {
+      decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
     } else {
-      try {
-        decryptedBuffer = await cipher.decryptWhisperMessage(binaryBody, 'binary');
-      } catch (err) {
-        lastError = err;
-        try {
-          decryptedBuffer = await cipher.decryptPreKeyWhisperMessage(binaryBody, 'binary');
-          lastError = null;
-        } catch (preKeyErr) {
-          lastError = preKeyErr;
-        }
-      }
-    }
-
-    if (!decryptedBuffer && lastError) {
-      const errMsg = lastError?.message || String(lastError);
-      console.warn(`[E2EE] Decryption error with peer ${remoteUid} (isPreKey=${isPreKey}):`, errMsg);
-
-      // If session is broken / Bad MAC / desynced, automatically clear the broken local session
-      // so subsequent messages can re-establish cleanly rather than failing permanently
-      if (
-        errMsg.includes('Bad MAC') ||
-        errMsg.includes('No record for device') ||
-        errMsg.includes('No session found') ||
-        errMsg.includes('Message key not found')
-      ) {
-        const addr = new libsignal.SignalProtocolAddress(remoteUid, 1);
-        await this.store.clearSession(addr.toString());
-      }
-      throw lastError;
+      throw new Error('Unsupported Signal message type');
     }
 
     if (!decryptedBuffer) {

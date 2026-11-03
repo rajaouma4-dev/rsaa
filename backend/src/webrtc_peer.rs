@@ -208,6 +208,10 @@ pub async fn handle_client_frame(
     live_signaling: &LiveSignaling,
     uid: &str,
 ) {
+    if channel.is_none() && matches!(&frame, DataChannelClientFrame::SendMessage { .. }) {
+        reply_error(channel, signal_tx, "DATACHANNEL_REQUIRED", "chat messages require WebRTC DataChannel").await;
+        return;
+    }
     match frame {
         DataChannelClientFrame::CallSignal { to_uid, payload } => {
             let from_uid = uid.to_string();
@@ -283,73 +287,20 @@ pub async fn handle_client_frame(
                 return;
             }
 
-            {
-                let mut cache = MESSAGE_SENDERS.lock().await;
-                if cache.len() > 20_000 { cache.clear(); }
-                cache.insert(message_id.clone(), uid.to_string());
-            }
-
-            // ZERO-DELAY REAL-TIME FORWARDING:
-            // Determine recipient UID from frame or fast in-memory routing cache without blocking on DB
-            let recipient_uid = if let Some(r) = frame_recipient_uid {
-                let mut cache = CONVERSATION_RECIPIENTS.write().await;
-                if cache.len() > 20_000 { cache.clear(); }
-                cache.insert((conversation_id.clone(), uid.to_string()), r.clone());
-                Some(r)
-            } else {
-                let cached = {
-                    let cache = CONVERSATION_RECIPIENTS.read().await;
-                    cache.get(&(conversation_id.clone(), uid.to_string())).cloned()
-                };
-                if let Some(r) = cached {
-                    Some(r)
-                } else {
-                    match db.get_conversation_recipient(&conversation_id, uid).await {
-                        Ok(r) => {
-                            let mut cache = CONVERSATION_RECIPIENTS.write().await;
-                            cache.insert((conversation_id.clone(), uid.to_string()), r.clone());
-                            Some(r)
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "could not determine recipient");
-                            None
-                        }
-                    }
+            // Authenticate membership and persist before acknowledging. Never trust
+            // the client's recipient hint or acknowledge an in-memory-only message.
+            let _ = frame_recipient_uid;
+            match db.save_ciphertext(&message_id, &conversation_id, uid, &ciphertext, msg_type).await {
+                Ok((recipient_uid, _)) => {
+                    reply_to_sender(channel, signal_tx, &DataChannelServerFrame::SavedAck {
+                        message_id: message_id.clone(),
+                    }).await;
+                    deliver_one(db, channels, &recipient_uid, &message_id).await;
                 }
-            };
-
-            if let Some(target_uid) = recipient_uid {
-                // 1. Instantly acknowledge sender (< 0.1ms)
-                let saved_ack = DataChannelServerFrame::SavedAck { message_id: message_id.clone() };
-                reply_to_sender(channel, signal_tx, &saved_ack).await;
-
-                // 2. Instantly forward message to recipient in memory via WebRTC DataChannel / WebSocket (< 0.1ms)
-                let msg = crate::protocol::MessageEnvelope {
-                    message_id: message_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    sender_uid: uid.to_string(),
-                    ciphertext_b64: ciphertext_b64.clone(),
-                    msg_type,
-                    created_at: crate::db::now_epoch_string(),
-                    status: "SAVED".to_string(),
-                };
-                let frame = DataChannelServerFrame::NewMessage { message: msg };
-                send_to_user(channels, live_signaling, &target_uid, &frame).await;
-
-                // 3. Persist to database asynchronously in the background
-                let db_clone = db.clone();
-                let m_id = message_id.clone();
-                let c_id = conversation_id.clone();
-                let s_uid = uid.to_string();
-                let r_uid = target_uid;
-                let ct = ciphertext;
-                tokio::spawn(async move {
-                    if let Err(err) = db_clone.save_ciphertext_direct(&m_id, &c_id, &s_uid, &r_uid, &ct, msg_type).await {
-                        tracing::warn!(error = %err, "async save_ciphertext_direct failed");
-                    }
-                });
-            } else {
-                reply_error(channel, signal_tx, "RECIPIENT_NOT_FOUND", "conversation recipient could not be found").await;
+                Err(err) => {
+                    tracing::warn!(error = %err, "message persistence failed");
+                    reply_error(channel, signal_tx, "SAVE_FAILED", "message not saved; retry with the same message id").await;
+                }
             }
         }
         DataChannelClientFrame::SessionRepair { peer_uid } => {
@@ -480,36 +431,13 @@ async fn deliver_one(db: &Store, channels: &LiveChannels, recipient_uid: &str, m
     }
 }
 
-pub async fn deliver_all_pending_via_signal(db: &Store, signal_tx: &mpsc::Sender<ServerFrame>, uid: &str) {
-    let pending = match db.pending_deliveries(uid, 100).await {
-        Ok(items) => items,
-        Err(err) => {
-            tracing::warn!(user_id = %uid, error = %err, "could not query pending deliveries on signal connect");
-            return;
-        }
-    };
-    for item in pending {
-        let claimed = match db.claim_delivery_attempt(&item.message.message_id, uid).await {
-            Ok(value) => value,
-            Err(_) => false,
-        };
-        if !claimed { continue; }
-        let frame = DataChannelServerFrame::NewMessage { message: item.message.clone() };
-        if let Ok(payload) = serde_json::to_value(&frame) {
-            let _ = signal_tx.send(ServerFrame::DataFrame { payload }).await;
-        }
-    }
+pub async fn deliver_all_pending_via_signal(_db: &Store, _signal_tx: &mpsc::Sender<ServerFrame>, _uid: &str) {
+    // Chat delivery waits for the authenticated WebRTC DataChannel.
 }
 
 pub async fn run_delivery_worker(db: Store, channels: LiveChannels, live_signaling: LiveSignaling) {
     loop {
-        let mut recipients: std::collections::HashSet<String> = {
-            channels.read().await.keys().cloned().collect()
-        };
-        {
-            let sig = live_signaling.read().await;
-            recipients.extend(sig.keys().cloned());
-        }
+        let recipients: Vec<String> = channels.read().await.keys().cloned().collect();
         for uid in recipients {
             let pending = match db.pending_deliveries(&uid, 100).await {
                 Ok(items) => items,
@@ -601,6 +529,8 @@ pub async fn send_to_user(
             return;
         }
     }
+
+    if matches!(frame, DataChannelServerFrame::NewMessage { .. }) { return; }
 
     // 2. Fall back to active WebSocket signaling connection
     let sig = { live_signaling.read().await.get(uid).cloned() };

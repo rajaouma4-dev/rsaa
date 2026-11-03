@@ -961,9 +961,27 @@ class CallService {
   /**
    * Dispatch incoming call signaling frames received from peer
    */
-  async handleSignal(fromUid: string, payload: any): Promise<void> {
+  private signalQueue: Promise<void> = Promise.resolve();
+  private earlyCandidates = new Map<string, {at: number; candidates: any[]}>();
+  handleSignal(fromUid: string, payload: any): Promise<void> {
+    const next = this.signalQueue.then(() => this.processSignal(fromUid, payload));
+    this.signalQueue = next.catch(() => {});
+    return next;
+  }
+  private async processSignal(fromUid: string, payload: any): Promise<void> {
     if (!payload || typeof payload !== 'object') return;
 
+    const candidateKey = `${fromUid}:${payload.callId}`;
+    for (const [key, entry] of this.earlyCandidates) {
+      if (Date.now() - entry.at > 30000) this.earlyCandidates.delete(key);
+    }
+    if (payload.type === 'call_candidate' && this.currentCallId !== payload.callId && payload.candidate) {
+      if (this.earlyCandidates.size >= 32) return;
+      const entry = this.earlyCandidates.get(candidateKey) || {at: Date.now(), candidates: []};
+      if (entry.candidates.length < 64) entry.candidates.push(payload.candidate);
+      this.earlyCandidates.set(candidateKey, entry);
+      return;
+    }
     switch (payload.type) {
       case 'call_invite': {
         // If this is a retransmitted invite for the current call, reaffirm ringing!
@@ -995,7 +1013,8 @@ class CallService {
         this.remoteOfferSdp = payload.sdp;
         this.status = 'incoming_ringing';
         this.durationSec = 0;
-        this.pendingCandidates = [];
+        this.pendingCandidates = this.earlyCandidates.get(candidateKey)?.candidates || [];
+        this.earlyCandidates.delete(candidateKey);
 
         // Notify caller that we are ringing
         this.signalSender?.(fromUid, {
