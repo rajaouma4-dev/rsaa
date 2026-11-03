@@ -33,7 +33,15 @@ export function CallHistoryBubble({
   let title = '';
   let subtitle = '';
 
-  if (isMissed) {
+  if (callDetails?.status === 'busy') {
+    title = isVideo ? 'Video call' : 'Audio call'; subtitle = 'User was on another call';
+  } else if (callDetails?.status === 'offline') {
+    title = isVideo ? 'Video call' : 'Audio call'; subtitle = 'User was offline';
+  } else if (callDetails?.status === 'failed') {
+    title = isVideo ? 'Video call' : 'Audio call'; subtitle = 'Connection failed';
+  } else if (callDetails?.status === 'cancelled') {
+    title = isVideo ? 'Video call' : 'Audio call'; subtitle = 'Cancelled';
+  } else if (isMissed) {
     title = isVideo ? 'Missed video call' : 'Missed audio call';
     subtitle = 'You missed a call';
   } else if (isNoAnswer) {

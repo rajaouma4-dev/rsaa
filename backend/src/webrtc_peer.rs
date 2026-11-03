@@ -4,6 +4,7 @@ use crate::{
     protocol::{DataChannelClientFrame, DataChannelServerFrame, ServerFrame},
 };
 use anyhow::{Context, Result};
+use futures_util::{stream, StreamExt};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use async_trait::async_trait;
 use serde_json::json;
@@ -67,6 +68,7 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
         let db = self.db.clone();
         let channels = self.channels.clone();
         let live_signaling = self.live_signaling.clone();
+        let signal_tx = self.signal_tx.clone();
         tokio::spawn(async move {
             loop {
                 let poll_result = tokio::time::timeout(std::time::Duration::from_secs(90), channel.poll()).await;
@@ -90,20 +92,7 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
                         // Immediately deliver all queued offline messages to this recipient
                         deliver_all_pending(&db, &channel, &uid).await;
 
-                        // Immediately inform this user about all currently connected users
-                        let other_online: Vec<String> = {
-                            let connected = channels.read().await;
-                            connected.keys().filter(|other_uid| *other_uid != &uid).cloned().collect()
-                        };
-                        for contact_uid in other_online {
-                            let frame = DataChannelServerFrame::PresenceUpdate {
-                                uid: contact_uid,
-                                online: true,
-                            };
-                            if let Ok(text) = serde_json::to_string(&frame) {
-                                let _ = channel.send_text(&text).await;
-                            }
-                        }
+                        send_initial_presence_via_signal(&db, &channels, &live_signaling, &signal_tx, &uid).await;
                     }
                     DataChannelEvent::OnMessage(message) => {
                         let parsed = serde_json::from_slice::<DataChannelClientFrame>(&message.data);
@@ -209,6 +198,35 @@ async fn reply_error(
     reply_to_sender(channel, signal_tx, &frame).await;
 }
 
+pub async fn route_call_signal(from: &str, to: &str, payload: serde_json::Value, channels: &LiveChannels, live_signaling: &LiveSignaling) {
+    use crate::calls::{CALLS, Decision};
+    let decision = CALLS.lock().await.decide(from, to, &payload);
+    let reason = match decision {
+        Decision::Ignore => return,
+        Decision::Busy => Some("in_call"),
+        Decision::RateLimited => Some("rate_limited"),
+        Decision::Forward => {
+            let mut sent = false;
+            let target = live_signaling.read().await.get(to).cloned();
+            if let Some(tx) = target {
+                sent = tx.try_send(ServerFrame::CallSignal { from_uid: from.to_owned(), payload: payload.clone() }).is_ok();
+            }
+            let dc = channels.read().await.get(to).cloned();
+            if let Some(dc) = dc {
+                let frame = DataChannelServerFrame::CallSignal { from_uid: from.to_owned(), payload: payload.clone() };
+                if let Ok(text) = serde_json::to_string(&frame) {
+                    sent |= matches!(tokio::time::timeout(Duration::from_secs(2), dc.send_text(&text)).await, Ok(Ok(_)));
+                }
+            }
+            if sent || payload.get("type").and_then(|v| v.as_str()) != Some("call_invite") { return; }
+            if let Some(id) = payload.get("callId").and_then(|v| v.as_str()) { CALLS.lock().await.undelivered(id); }
+            Some("offline")
+        }
+    };
+    let frame = DataChannelServerFrame::CallSignal { from_uid: to.to_owned(), payload: json!({"type":"call_busy","callId":payload.get("callId"),"reason":reason}) };
+    let _ = tokio::time::timeout(Duration::from_secs(2), send_to_user(channels, live_signaling, from, &frame)).await;
+}
+
 pub async fn handle_client_frame(
     frame: DataChannelClientFrame,
     channel: Option<&Arc<dyn DataChannel>>,
@@ -224,45 +242,7 @@ pub async fn handle_client_frame(
     }
     match frame {
         DataChannelClientFrame::CallSignal { to_uid, payload } => {
-            let from_uid = uid.to_string();
-            let mut sent = false;
-            // 1. Send via target's live signaling socket (guaranteed delivery over TLS WebSocket/TCP)
-            {
-                let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
-                if let Some(target_tx) = target_tx {
-                    let _ = target_tx.send(ServerFrame::CallSignal {
-                        from_uid: from_uid.clone(),
-                        payload: payload.clone(),
-                    }).await;
-                    sent = true;
-                }
-            }
-            // 2. Also forward via DataChannel if target has an active DataChannel
-            {
-                let target_dc = { channels.read().await.get(&to_uid).cloned() };
-                if let Some(target_dc) = target_dc {
-                    let s_frame = DataChannelServerFrame::CallSignal {
-                        from_uid: from_uid.clone(),
-                        payload: payload.clone(),
-                    };
-                    if let Ok(text) = serde_json::to_string(&s_frame) {
-                        send_safe_text(&target_dc, &text).await;
-                        sent = true;
-                    }
-                }
-            }
-            tracing::info!(from = %from_uid, to = %to_uid, signal_type = ?payload.get("type"), sent = %sent, "call_signal dispatched");
-            if !sent && payload.get("type").and_then(|t| t.as_str()) == Some("call_invite") {
-                let s_frame = DataChannelServerFrame::CallSignal {
-                    from_uid: to_uid.clone(),
-                    payload: serde_json::json!({
-                        "type": "call_busy",
-                        "callId": payload.get("callId"),
-                        "reason": "offline"
-                    }),
-                };
-                reply_to_sender(channel, signal_tx, &s_frame).await;
-            }
+            route_call_signal(uid, &to_uid, payload, channels, live_signaling).await;
         }
         DataChannelClientFrame::SendMessage {
             message_id,
@@ -376,6 +356,7 @@ pub async fn handle_client_frame(
             }
         }
         DataChannelClientFrame::Ping => {
+            crate::calls::CALLS.lock().await.touch(uid);
             reply_to_sender(channel, signal_tx, &DataChannelServerFrame::Pong).await;
         }
         DataChannelClientFrame::PresenceOffline => {
@@ -473,80 +454,68 @@ pub async fn deliver_all_pending_via_signal(_db: &Store, _signal_tx: &mpsc::Send
 
 pub async fn run_delivery_worker(db: Store, channels: LiveChannels, live_signaling: LiveSignaling) {
     loop {
-        let recipients: Vec<String> = channels.read().await.keys().cloned().collect();
-        for uid in recipients {
-            let pending = match db.pending_deliveries(&uid, 100).await {
-                Ok(items) => items,
-                Err(err) => {
-                    tracing::warn!(user_id = %uid, error = %err, "outbox polling failed");
-                    continue;
+        let mut recipients: Vec<String> = channels.read().await.keys().cloned().collect();
+        recipients.sort();
+        // At most four queries and sixteen claims/forwards run concurrently.
+        stream::iter(recipients.chunks(100).map(|batch| batch.to_vec()))
+            .for_each_concurrent(4, |batch| {
+                let db = db.clone(); let channels = channels.clone(); let live_signaling = live_signaling.clone();
+                async move {
+                    let pending = match db.pending_online_deliveries(&batch).await {
+                        Ok(items) => items,
+                        Err(err) => { tracing::warn!(error = %err, "outbox batch polling failed"); return; }
+                    };
+                    stream::iter(pending).for_each_concurrent(4, |item| {
+                        let db = db.clone(); let channels = channels.clone(); let live_signaling = live_signaling.clone();
+                        async move {
+                            if !channels.read().await.contains_key(&item.recipient_uid) { return; }
+                            match db.claim_delivery_attempt(&item.message.message_id, &item.recipient_uid).await {
+                                Ok(true) => {
+                                    let frame = DataChannelServerFrame::NewMessage { message: item.message };
+                                    send_to_user(&channels, &live_signaling, &item.recipient_uid, &frame).await;
+                                },
+                                Ok(false) => {},
+                                Err(err) => tracing::warn!(error = %err, "outbox claim failed"),
+                            }
+                        }
+                    }).await;
                 }
-            };
-            for item in pending {
-                let claimed = match db.claim_delivery_attempt(&item.message.message_id, &uid).await {
-                    Ok(value) => value,
-                    Err(err) => { tracing::warn!(message_id = %item.message.message_id, error = %err, "outbox claim failed"); false }
-                };
-                if !claimed { continue; }
-                let frame = DataChannelServerFrame::NewMessage { message: item.message.clone() };
-                send_to_user(&channels, &live_signaling, &uid, &frame).await;
-            }
-        }
+            }).await;
         sleep(Duration::from_secs(1)).await;
     }
 }
 
-pub async fn broadcast_presence(_db: &Store, channels: &LiveChannels, live_signaling: &LiveSignaling, changed_uid: &str, online: bool) {
-    let frame = DataChannelServerFrame::PresenceUpdate {
-        uid: changed_uid.to_owned(),
-        online,
+pub async fn broadcast_presence(db: &Store, channels: &LiveChannels, live_signaling: &LiveSignaling, changed_uid: &str, online: bool) {
+    let contacts = match db.conversation_contacts(changed_uid).await {
+        Ok(contacts) => contacts,
+        Err(err) => { tracing::warn!(error = %err, "presence contacts unavailable"); return; }
     };
-    let Ok(text) = serde_json::to_string(&frame) else { return; };
-    let Ok(payload) = serde_json::to_value(&frame) else { return; };
-
-    // 1. Send to WebRTC DataChannel peers
-    let dc_recipients: Vec<Arc<dyn DataChannel>> = {
-        let connected = channels.read().await;
-        connected.iter().filter(|(uid, _)| *uid != changed_uid).map(|(_, channel)| Arc::clone(channel)).collect()
-    };
-    for channel in dc_recipients {
-        if let Err(err) = channel.send_text(&text).await {
-            tracing::debug!(error = %err, "presence update could not be sent to DataChannel");
+    let frame = DataChannelServerFrame::PresenceUpdate { uid: changed_uid.to_owned(), online };
+    stream::iter(contacts).for_each_concurrent(16, |uid| {
+        let frame = frame.clone();
+        async move {
+            let _ = tokio::time::timeout(Duration::from_secs(2), send_to_user(channels, live_signaling, &uid, &frame)).await;
         }
-    }
-
-    // 2. Send to WebSocket signaling peers
-    let sig_recipients: Vec<mpsc::Sender<ServerFrame>> = {
-        let sig = live_signaling.read().await;
-        sig.iter().filter(|(uid, _)| *uid != changed_uid).map(|(_, tx)| tx.clone()).collect()
-    };
-    for tx in sig_recipients {
-        let _ = tx.send(ServerFrame::DataFrame { payload: payload.clone() }).await;
-    }
+    }).await;
 }
 
 pub async fn send_initial_presence_via_signal(
+    db: &Store,
     channels: &LiveChannels,
     live_signaling: &LiveSignaling,
     signal_tx: &mpsc::Sender<ServerFrame>,
     current_uid: &str,
 ) {
-    let mut online_uids: std::collections::HashSet<String> = {
-        channels.read().await.keys().cloned().collect()
-    };
-    {
+    let Ok(contacts) = db.conversation_contacts(current_uid).await else { return; };
+    let online: HashSet<String> = {
+        let dc = channels.read().await;
         let sig = live_signaling.read().await;
-        online_uids.extend(sig.keys().cloned());
-    }
-    online_uids.remove(current_uid);
-
-    for other_uid in online_uids {
-        let frame = DataChannelServerFrame::PresenceUpdate {
-            uid: other_uid,
-            online: true,
-        };
-        if let Ok(payload) = serde_json::to_value(&frame) {
-            let _ = signal_tx.send(ServerFrame::DataFrame { payload }).await;
+        contacts.into_iter().filter(|uid| dc.contains_key(uid) || sig.contains_key(uid)).collect()
+    };
+    for uid in online {
+        let frame = DataChannelServerFrame::PresenceUpdate { uid, online: true };
+        if let Ok(payload) = serde_json::to_value(frame) {
+            if signal_tx.try_send(ServerFrame::DataFrame { payload }).is_err() { break; }
         }
     }
 }
@@ -593,20 +562,10 @@ pub async fn build_answerer(
     live_signaling: LiveSignaling,
     signal_tx: mpsc::Sender<ServerFrame>,
     offer_sdp: String,
-    _ice_urls: Vec<String>,
+    ice_urls: Vec<String>,
 ) -> Result<(Arc<dyn PeerConnection>, String)> {
     let handler = ServerPeerHandler { uid, db, channels, live_signaling, signal_tx };
-    let ice_servers = vec![
-        RTCIceServer {
-            urls: vec![
-                "stun:stun.l.google.com:19302".to_string(),
-                "stun:stun1.l.google.com:19302".to_string(),
-                "stun:stun2.l.google.com:19302".to_string(),
-                "stun:stun3.l.google.com:19302".to_string(),
-            ],
-            ..Default::default()
-        },
-    ];
+    let ice_servers = ice_urls.into_iter().map(|url| RTCIceServer { urls: vec![url], ..Default::default() }).collect();
     let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();
     let peer = PeerConnectionBuilder::new()
         .with_configuration(config)

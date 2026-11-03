@@ -9,6 +9,7 @@ import {clearDemoSession, clearLiveSession, readDemoSession, readLiveSession, sa
 import {APP_CONFIG, isLiveConfigReady, refreshTurnCredentials} from './src/config';
 import {TlsSignalingClient} from './src/services/signaling';
 import {ServerDataChannel, RtcStatus} from './src/services/rtc';
+import {DurableOutbox} from './src/services/outbox';
 import {advanceMessageStatus} from './src/services/messageStatus';
 import {e2eeService, RemotePreKeyBundle} from './src/services/e2ee';
 import {
@@ -139,6 +140,8 @@ export default function App() {
         }
       } else if (event.status === 'declined') {
         title = `${callIcon} ${isVideo ? 'Video call' : 'Audio call'} · Declined`;
+      } else if (['busy', 'offline', 'failed'].includes(event.status)) {
+        title = `${callIcon} ${event.status === 'busy' ? 'Busy' : event.status === 'offline' ? 'Offline' : 'Call failed'}`;
       } else {
         title = `${callIcon} ${isVideo ? 'Video call' : 'Audio call'} · Cancelled`;
       }
@@ -167,11 +170,8 @@ export default function App() {
       const existingChat = currentChats.find(c => c.user.id === remoteUid);
       const conversationId = existingChat?.id || `cv_${remoteUid}`;
 
-      // Mark remote peer as online since call just finished
-      onlineUsersRef.current.add(remoteUid);
-
       // Persist to local database (AsyncStorage via messageStore)
-      void appendLocalMessage(conversationId, callMsg);
+      void appendLocalMessage(conversationId, callMsg).catch(err => console.warn('Call history save failed:', err));
       void saveSentMessageText(msgId, title);
 
       // Update in-memory state
@@ -182,7 +182,7 @@ export default function App() {
             ...found,
             user: {
               ...found.user,
-              online: true,
+              online: onlineUsersRef.current.has(remoteUid),
               lastActive: undefined,
             },
             preview: title,
@@ -198,7 +198,7 @@ export default function App() {
               id: remoteUid,
               username: event.remoteUser.name.toLowerCase().replace(/\s+/g, '_'),
               name: event.remoteUser.name,
-              online: true,
+              online: onlineUsersRef.current.has(remoteUid),
               lastActive: undefined,
             },
             preview: title,
@@ -217,7 +217,7 @@ export default function App() {
             ...current,
             user: {
               ...current.user,
-              online: true,
+              online: onlineUsersRef.current.has(remoteUid),
               lastActive: undefined,
             },
             preview: title,
@@ -243,39 +243,29 @@ export default function App() {
     };
   }, []);
 
-  const outboxRef = useRef<{
-    messageId: string;
-    conversationId: string;
-    recipientUid: string;
-    ciphertextB64: string;
-    msgType?: number;
-    lastAttempt?: number;
-    sending?: boolean;
-  }[]>([]);
-
+  const outboxRef = useRef<DurableOutbox | null>(null);
+  const flushingRef = useRef(false);
+  const messageConversationsRef = useRef(new Map<string, string>());
 
   const flushOutbox = useCallback(async () => {
-    if (outboxRef.current.length === 0) return;
+    const queue = outboxRef.current;
     const rtc = rtcRef.current;
-    if (!rtc?.isOpen) return;
-    const pending: Promise<void>[] = [];
-    for (const item of [...outboxRef.current]) {
-      if (item.sending || (item.lastAttempt && Date.now() - item.lastAttempt < 2000)) continue;
-      item.sending = true;
-      pending.push((async () => {
-        try {
-          await rtc.sendEncryptedEnvelope(JSON.stringify({
+    if (!queue || !rtc?.isOpen || flushingRef.current) return;
+    flushingRef.current = true;
+    try {
+      const pending: Promise<unknown>[] = [];
+      for (const item of queue.due()) {
+        if (queue !== outboxRef.current || rtc !== rtcRef.current) break;
+        messageConversationsRef.current.set(item.messageId, item.conversationId);
+        queue.attempted(item.messageId);
+        pending.push(rtc.sendEncryptedEnvelope(JSON.stringify({
             type: 'send_message', message_id: item.messageId,
             conversation_id: item.conversationId, recipient_uid: item.recipientUid,
             ciphertext_b64: item.ciphertextB64, msg_type: item.msgType,
-          }));
-          item.lastAttempt = Date.now();
-        } catch { item.lastAttempt = undefined; }
-        finally { item.sending = false; }
-      })());
-    }
-    await Promise.all(pending);
-
+          })).catch(() => {}));
+      }
+      await Promise.all(pending);
+    } finally { flushingRef.current = false; }
   }, []);
 
   useEffect(() => {
@@ -303,10 +293,11 @@ export default function App() {
       } else if (['saved_ack', 'delivered_ack', 'seen_ack'].includes(envelope.type || '') && envelope.message_id) {
         const nextStatus = envelope.type === 'saved_ack' ? 'saved' : envelope.type === 'delivered_ack' ? 'delivered' : 'seen';
         const msgId = envelope.message_id;
-        outboxRef.current = outboxRef.current.filter(item => item.messageId !== msgId);
-        const convId = envelope.conversation_id || selectedRef.current?.id;
+        const queued = await outboxRef.current?.acknowledge(msgId);
+        const convId = queued?.conversationId || messageConversationsRef.current.get(msgId)
+          || chatsRef.current.find(c => c.messages.some(m => m.id === msgId))?.id;
         if (convId) {
-          void updateLocalMessageStatus(convId, msgId, nextStatus as any);
+          void updateLocalMessageStatus(convId, msgId, nextStatus as any).catch(err => console.warn('Receipt save failed:', err));
         }
         setChats(current => current.map(item => ({
           ...item,
@@ -361,10 +352,10 @@ export default function App() {
       } else if (envelope.type === 'new_message' && envelope.message) {
         const incoming = envelope.message;
         const handleIncoming = async () => {
-          const isCurrentChat = selectedRef.current?.id === incoming.conversation_id;
+          const isCurrentChat = selectedRef.current?.id === incoming.conversation_id && AppState.currentState === 'active' && callService.getState().status === 'idle';
           // A retry after a lost ACK must not decrypt the same ratchet message twice.
           const known = (await getLocalMessages(incoming.conversation_id)).find(m => m.id === incoming.message_id);
-          if (known && !known.text.startsWith('Encrypted message') && !known.text.startsWith('Decryption failed')) {
+          if (known) {
             try { rtcRef.current?.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id}); } catch {}
             return;
           }
@@ -376,27 +367,6 @@ export default function App() {
             console.warn('Decryption failed; leaving message pending:', err);
             return;
           }
-          // Acknowledge delivered receipt immediately
-          try {
-            if (rtcRef.current?.isOpen) {
-              rtcRef.current.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id});
-            } else if (signalRef.current?.connected) {
-              signalRef.current.send({type: 'data_frame', payload: {type: 'delivered_ack', message_id: incoming.message_id}});
-            }
-          } catch {}
-
-
-          if (isCurrentChat) {
-            try {
-              if (rtcRef.current?.isOpen) {
-                rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: incoming.message_id});
-              } else if (signalRef.current?.connected) {
-                signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: incoming.message_id}});
-              }
-            } catch {}
-          }
-
-
           let msgMediaType: 'text' | 'image' | 'voice' = 'text';
           let msgImages: MediaImageItem[] | undefined = undefined;
           let msgIsHd: boolean | undefined = undefined;
@@ -438,7 +408,29 @@ export default function App() {
             voice: msgVoice,
           };
 
-          // 1. Instantly update UI (0ms delay) so incoming message appears in real time
+          await appendLocalMessage(incoming.conversation_id, incomingMsg);
+          // Acknowledge only after the local message write succeeds.
+          try {
+            if (rtcRef.current?.isOpen) {
+              rtcRef.current.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id});
+            } else if (signalRef.current?.connected) {
+              signalRef.current.send({type: 'data_frame', payload: {type: 'delivered_ack', message_id: incoming.message_id}});
+            }
+          } catch {}
+
+
+          if (isCurrentChat) {
+            try {
+              if (rtcRef.current?.isOpen) {
+                rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: incoming.message_id});
+              } else if (signalRef.current?.connected) {
+                signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: incoming.message_id}});
+              }
+            } catch {}
+          }
+
+
+          // Reflect the durably stored incoming message in the UI.
           setChats(current => current.map(item => {
             if (item.id !== incoming.conversation_id) return item;
             const exists = item.messages.some(m => m.id === incoming.message_id);
@@ -469,8 +461,7 @@ export default function App() {
             return updatedChat;
           });
 
-          // 2. Persist to storage in background without blocking realtime flow
-          await appendLocalMessage(incoming.conversation_id, incomingMsg);
+
         };
         incomingQueueRef.current = incomingQueueRef.current.then(handleIncoming).catch(err => { console.warn('Incoming message failed:', err); });
       }
@@ -535,6 +526,7 @@ export default function App() {
 
         await saveLiveSession({uid: result.uid, username: result.username, displayName: result.display_name, about: result.about, token: result.token});
         if (cancelled) { bootSignal.close(); return; }
+        outboxRef.current = await DurableOutbox.open(result.uid);
         signalRef.current = bootSignal;
         await publishPrekeys(bootSignal);
         bootRtc = createRealtime(bootSignal);
@@ -984,6 +976,7 @@ export default function App() {
         },
   ) => {
     if (!selected) return;
+    const sendingQueue = outboxRef.current;
     const recipientUid = selected.user.id;
     let conversationId = selected.id;
     const signal = signalRef.current;
@@ -1053,7 +1046,7 @@ export default function App() {
       text,
       time: new Date(now).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}),
       timestamp: now,
-      status: 'saved',
+      status: 'sent',
       mediaType,
       images,
       isHd,
@@ -1061,15 +1054,20 @@ export default function App() {
     };
 
     // 1. Instantly update in-memory UI (0ms delay) so sent bubble appears immediately
-    const optimisticMessages = [...selected.messages, tempMsg];
-    const updated = {...selected, id: conversationId, preview: text, time: 'Now', timestamp: now, unread: 0, messages: optimisticMessages};
-    setSelected(updated);
-    selectedRef.current = updated;
-    setChats(prev => [updated, ...prev.filter(chat => chat.id !== conversationId && chat.user.id !== recipientUid)]);
+    const addOutgoing = (chat: Chat): Chat => ({...chat, id: conversationId, preview: text, time: 'Now', timestamp: now, unread: 0,
+      messages: chat.messages.some(m => m.id === tempMsgId) ? chat.messages : [...chat.messages, tempMsg]});
+    setSelected(current => {
+      if (!current || current.user.id !== recipientUid) return current;
+      const updated = addOutgoing(current); selectedRef.current = updated; return updated;
+    });
+    setChats(prev => {
+      const current = prev.find(c => c.user.id === recipientUid) || selected;
+      return [addOutgoing(current), ...prev.filter(c => c.user.id !== recipientUid)];
+    });
 
     // 2. Persist to storage in background without blocking realtime network send
     void saveSentMessageText(tempMsgId, text);
-    void appendLocalMessage(conversationId, tempMsg);
+    void appendLocalMessage(conversationId, tempMsg).catch(err => console.warn('Local save failed:', err));
 
     try {
       const hasSession = await e2eeService.hasSession(recipientUid);
@@ -1107,12 +1105,16 @@ export default function App() {
         msgType,
       };
 
-      outboxRef.current.push(queueItem);
+      const queue = outboxRef.current;
+      if (!queue || queue !== sendingQueue) throw new Error('Account changed while preparing the message');
+      await queue.enqueue(queueItem);
+      messageConversationsRef.current.set(tempMsgId, conversationId);
       await flushOutbox();
       if (!rtcRef.current?.isOpen) void ensureConnected();
 
     } catch (err) {
       console.warn('Send issue:', err);
+      Alert.alert('Message not queued', err instanceof Error ? err.message : 'Please try again.');
     }
   };
 
@@ -1156,6 +1158,7 @@ export default function App() {
         token: result.token,
       });
 
+      outboxRef.current = await DurableOutbox.open(result.uid);
       signalRef.current = pendingSignal;
       await publishPrekeys(pendingSignal);
       const rtc = createRealtime(pendingSignal);
@@ -1211,6 +1214,10 @@ export default function App() {
   };
 
   const logout = async () => {
+    callService.endCall('Signed out');
+    outboxRef.current = null;
+    onlineUsersRef.current.clear();
+    messageConversationsRef.current.clear();
     const activeSignal = signalRef.current;
     if (session?.live && activeSignal?.connected) {
       try { await activeSignal.request({type: 'logout'}, 'logged_out', 5000); } catch {}

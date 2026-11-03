@@ -5,7 +5,16 @@ use libsql::{Builder, Database};
 use password_hash::SaltString;
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+static PASSWORD_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+
+async fn password_work<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    let permit = tokio::time::timeout(std::time::Duration::from_secs(5), PASSWORD_SLOTS.clone().acquire_owned())
+        .await.context("login capacity busy; retry shortly")??;
+    tokio::task::spawn_blocking(move || { let _permit = permit; work() }).await.context("password worker stopped")?
+}
+
 use uuid::Uuid;
 
 use crate::protocol::{ConversationSummary, MessageEnvelope, UserSummary};
@@ -20,6 +29,18 @@ pub struct PendingDelivery {
 }
 
 impl Store {
+    #[cfg(test)]
+    pub async fn load_test_store(path: &str, users: &[String]) -> Result<Self> {
+        let db = Builder::new_local(path).build().await?;
+        let store = Self { db: Arc::new(db) };
+        store.migrate().await?;
+        let conn = store.connection().await?;
+        for uid in users {
+            conn.execute("INSERT INTO users(uid,username,display_name,password_hash) VALUES(?1,?1,?1,'test-fixture-not-a-password')", [uid.as_str()]).await?;
+        }
+        Ok(store)
+    }
+
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
         anyhow::ensure!(url.starts_with("libsql://") || url.starts_with("https://"), "TURSO_DATABASE_URL must be the database connection URL, not app.turso.tech");
         anyhow::ensure!(!token.trim().is_empty() && !token.starts_with("PASTE_"), "Set TURSO_AUTH_TOKEN in backend/.env");
@@ -30,6 +51,9 @@ impl Store {
 
     async fn connection(&self) -> Result<libsql::Connection> {
         let conn = self.db.connect()?;
+        // Local SQLite connections do not inherit the migration connection's
+        // busy handler. Remote transports may not support this local API.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         Ok(conn)
     }
 
@@ -110,8 +134,11 @@ impl Store {
         let display_name = display_name.trim();
         anyhow::ensure!(display_name.chars().count() >= 2 && display_name.chars().count() <= 60, "display name must be 2-60 characters");
         validate_password(password)?;
-        let salt = SaltString::generate(&mut OsRng);
-        let password_hash = Argon2::default().hash_password(password.as_bytes(), &salt)?.to_string();
+        let password = password.to_owned();
+        let password_hash = password_work(move || {
+            let salt = SaltString::generate(&mut OsRng);
+            Ok(Argon2::default().hash_password(password.as_bytes(), &salt)?.to_string())
+        }).await?;
         let uid = format!("nx_{}", Uuid::new_v4().simple());
         let conn = self.connection().await?;
         conn.execute(
@@ -134,10 +161,11 @@ impl Store {
             (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)
         };
 
-        let parsed = PasswordHash::new(&stored_hash)
-            .map_err(|_| anyhow!("invalid username or password"))?;
-        Argon2::default().verify_password(password.as_bytes(), &parsed)
-            .map_err(|_| anyhow!("invalid username or password"))?;
+        let password = password.to_owned();
+        password_work(move || {
+            let parsed = PasswordHash::new(&stored_hash).map_err(|_| anyhow!("invalid username or password"))?;
+            Argon2::default().verify_password(password.as_bytes(), &parsed).map_err(|_| anyhow!("invalid username or password"))
+        }).await?;
         let token = self.issue_session(&uid).await?;
         Ok((UserSummary { uid, username: stored_username, display_name, about, online: true }, token))
     }
@@ -404,6 +432,32 @@ impl Store {
         Ok(items)
     }
 
+    /// Bounded indexed query for a batch of connected accounts. Each recipient
+    /// gets at most four messages per pass so a large inbox cannot starve others.
+    pub async fn pending_online_deliveries(&self, recipients: &[String]) -> Result<Vec<PendingDelivery>> {
+        anyhow::ensure!(recipients.len() <= 100, "online delivery batch too large");
+        if recipients.is_empty() { return Ok(Vec::new()); }
+        let placeholders = (0..recipients.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
+        let sql = format!("WITH due AS (SELECT o.message_id,o.recipient_uid,ROW_NUMBER() OVER (PARTITION BY o.recipient_uid ORDER BY o.next_attempt_at,o.rowid) AS position FROM outbox o WHERE o.delivered_at IS NULL AND o.next_attempt_at <= ?1 AND o.recipient_uid IN ({placeholders})) SELECT m.message_id,m.conversation_id,m.sender_uid,m.ciphertext,m.created_at,m.status,m.msg_type,d.recipient_uid FROM due d JOIN messages m ON m.message_id=d.message_id WHERE d.position <= 4");
+        let mut params = vec![libsql::Value::Integer(now_seconds())];
+        params.extend(recipients.iter().cloned().map(libsql::Value::Text));
+        let conn = self.connection().await?;
+        let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let bytes: Vec<u8> = row.get(3)?;
+            let mt: i64 = row.get(6).unwrap_or(0);
+            items.push(PendingDelivery {
+                message: MessageEnvelope {
+                    message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
+                    ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None },
+                    created_at: row.get(4)?, status: row.get(5)?,
+                }, recipient_uid: row.get(7)?,
+            });
+        }
+        Ok(items)
+    }
+
     /// Atomically claims a due outbox event before network send, preventing two workers
     /// from sending the same retry simultaneously. A failed send is retried after backoff.
     pub async fn claim_delivery_attempt(&self, message_id: &str, recipient_uid: &str) -> Result<bool> {
@@ -495,6 +549,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "Requires an explicitly configured disposable remote Turso database; writes integration fixtures"]
     async fn remote_turso_connection_test() {
         dotenvy::dotenv().ok();
         if let (Ok(url), Ok(token)) = (std::env::var("TURSO_DATABASE_URL"), std::env::var("TURSO_AUTH_TOKEN")) {

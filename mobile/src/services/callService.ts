@@ -8,6 +8,8 @@ import {
 import {PermissionsAndroid, Platform} from 'react-native';
 import {APP_CONFIG} from '../config';
 
+export type CallOutcome = 'completed' | 'missed' | 'declined' | 'cancelled' | 'busy' | 'offline' | 'failed';
+
 export type CallType = 'audio' | 'video';
 export type CallQuality = 'hd' | 'sd' | 'low';
 export type CallStatus =
@@ -44,7 +46,7 @@ export interface CallEndEvent {
   isCaller: boolean;
   durationSec: number;
   durationFormatted: string;
-  status: 'completed' | 'missed' | 'declined' | 'cancelled';
+  status: CallOutcome;
   timestamp: number;
 }
 
@@ -99,6 +101,8 @@ class CallService {
   private pc: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
   private remoteStream: MediaStream | null = null;
+  private recentCalls = new Map<string, number>();
+  private endReason?: string;
   private currentCallId: string | null = null;
   private remoteUser: {uid: string; name: string} | null = null;
   private callType: CallType = 'audio';
@@ -169,6 +173,7 @@ class CallService {
       isPeerScreenSharing: this.isPeerScreenSharing,
       quality: this.quality,
       durationSec: this.durationSec,
+      endReason: this.endReason,
     };
   }
 
@@ -217,14 +222,6 @@ class CallService {
       return;
     }
 
-    const permOk = await this.requestPermissions(callType);
-    if (!permOk) {
-      this.status = 'ended';
-      this.notify();
-      setTimeout(() => this.resetCall('Permission denied'), 1000);
-      return;
-    }
-
     const callId = 'call_' + Math.random().toString(36).substring(2, 9) + Date.now().toString(36);
     this.currentCallId = callId;
     this.remoteUser = remoteUser;
@@ -238,6 +235,10 @@ class CallService {
     this.durationSec = 0;
     this.pendingCandidates = [];
     this.notify();
+
+    const permOk = await this.requestPermissions(callType);
+    if (this.currentCallId !== callId) return;
+    if (!permOk) { this.resetCall('Permission denied'); return; }
 
     try {
       // 1. Get local user media - audio call only acquires audio (NO camera opened automatically!)
@@ -260,6 +261,11 @@ class CallService {
           video: false,
         })) as MediaStream;
         this.isCameraOff = true;
+      }
+      if (this.currentCallId !== callId || ['idle', 'ended'].includes(this.status)) {
+        stream.getTracks().forEach(track => track.stop());
+        stream.release(true);
+        return;
       }
       this.localStream = stream;
 
@@ -290,6 +296,7 @@ class CallService {
 
       // 5. Handle remote stream tracks
       pc.addEventListener('track', (event: any) => {
+        if (this.pc !== pc || this.currentCallId !== callId) return;
         const track = event.track;
         if (event.streams && event.streams[0]) {
           this.remoteStream = event.streams[0];
@@ -324,7 +331,9 @@ class CallService {
       });
       const optimizedOfferSdp = optimizeSdp(offer.sdp || '');
       await pc.setLocalDescription(new RTCSessionDescription({type: 'offer', sdp: optimizedOfferSdp}));
+      if (this.currentCallId !== callId) return;
       if (callType === 'video') await this.setQuality(this.quality);
+      if (this.currentCallId !== callId) return;
 
       // 8. Send call_invite with offer SDP to peer
       this.signalSender?.(remoteUser.uid, {
@@ -345,7 +354,7 @@ class CallService {
       this.notify();
     } catch (err) {
       console.warn('startCall failed:', err);
-      this.resetCall('Failed to start call');
+      if (this.currentCallId === callId) this.resetCall('Failed to start call');
     }
   }
 
@@ -362,13 +371,19 @@ class CallService {
       this.ringingTimeoutTimer = null;
     }
 
+    const acceptedCallId = this.currentCallId;
+    this.status = 'connecting';
+    this.notify();
     const permOk = await this.requestPermissions(this.callType);
+    if (this.currentCallId !== acceptedCallId) return;
     if (!permOk) {
       this.rejectCall('Permission denied');
       return;
     }
 
     const callId = this.currentCallId!;
+    this.status = 'connecting';
+    this.notify();
 
     try {
       // 1. Get local media - pure audio for audio calls, dual audio/video for video calls
@@ -391,6 +406,11 @@ class CallService {
           video: false,
         })) as MediaStream;
         this.isCameraOff = true;
+      }
+      if (this.currentCallId !== callId || ['idle', 'ended'].includes(this.status)) {
+        stream.getTracks().forEach(track => track.stop());
+        stream.release(true);
+        return;
       }
       this.localStream = stream;
 
@@ -421,6 +441,7 @@ class CallService {
 
       // 5. Handle remote stream tracks
       pc.addEventListener('track', (event: any) => {
+        if (this.pc !== pc || this.currentCallId !== callId) return;
         const track = event.track;
         if (event.streams && event.streams[0]) {
           this.remoteStream = event.streams[0];
@@ -467,7 +488,9 @@ class CallService {
       const answer = await pc.createAnswer();
       const optimizedAnswerSdp = optimizeSdp(answer.sdp || '');
       await pc.setLocalDescription(new RTCSessionDescription({type: 'answer', sdp: optimizedAnswerSdp}));
+      if (this.currentCallId !== callId) return;
       if (this.callType === 'video') await this.setQuality(this.quality);
+      if (this.currentCallId !== callId) return;
 
       // 9. Send call_answer back to caller
       this.signalSender?.(this.remoteUser.uid, {
@@ -480,7 +503,7 @@ class CallService {
       this.notify();
     } catch (err) {
       console.warn('acceptCall failed:', err);
-      this.rejectCall('Connection failed');
+      if (this.currentCallId === callId) this.rejectCall('Connection failed');
     }
   }
 
@@ -860,7 +883,7 @@ class CallService {
     });
   }
 
-  private resetCall(reason?: string): void {
+  private resetCall(reason?: string, previousStatus?: CallStatus): void {
     if (this.connectionGraceTimer) clearTimeout(this.connectionGraceTimer);
     this.connectionGraceTimer = null;
     if (this.durationTimer) {
@@ -879,20 +902,19 @@ class CallService {
       const callType = this.callType;
       const remoteUser = this.remoteUser;
       const callId = this.currentCallId;
-      const prevStatus = this.status;
+      const prevStatus = previousStatus || this.status;
+      this.recentCalls.set(callId, Date.now() + 120000);
 
-      let callEndStatus: 'completed' | 'missed' | 'declined' | 'cancelled' = 'completed';
-      if (durationSec > 0 || prevStatus === 'connected') {
-        callEndStatus = 'completed';
-      } else if (!isCaller && (prevStatus === 'incoming_ringing' || reason === 'Missed call' || reason === 'Call declined')) {
-        callEndStatus = reason === 'Call declined' ? 'declined' : 'missed';
-      } else if (isCaller && reason === 'Call declined') {
-        callEndStatus = 'declined';
-      } else if (isCaller && (prevStatus === 'outgoing_calling' || prevStatus === 'outgoing_ringing')) {
-        callEndStatus = reason === 'No answer' ? 'missed' : 'cancelled';
-      } else {
-        callEndStatus = 'completed';
-      }
+      let callEndStatus: CallOutcome;
+      if (reason === 'rate_limited') callEndStatus = 'failed';
+      else if (reason === 'in_call' || reason === 'User busy') callEndStatus = 'busy';
+      else if (reason === 'offline') callEndStatus = 'offline';
+      else if (reason === 'Call declined') callEndStatus = 'declined';
+      else if (reason === 'Missed call' || reason === 'No answer') callEndStatus = 'missed';
+      else if (reason && /failed|lost|denied/i.test(reason)) callEndStatus = 'failed';
+      else if (durationSec > 0 || prevStatus === 'connected') callEndStatus = 'completed';
+      else if (!isCaller && prevStatus === 'incoming_ringing') callEndStatus = 'missed';
+      else callEndStatus = 'cancelled';
 
       const durationFormatted = formatCallDuration(durationSec);
       const event: CallEndEvent = {
@@ -931,6 +953,7 @@ class CallService {
     this.currentCallId = null;
     this.remoteUser = null;
     this.status = 'idle';
+    this.endReason = undefined;
     this.isMicMuted = false;
     this.isCameraOff = false;
     this.isFrontCamera = true;
@@ -964,6 +987,17 @@ class CallService {
     }, 150);
   }
 
+  private finishRemote(reason: string): void {
+    const callId = this.currentCallId;
+    const previous = this.status;
+    this.endReason = ({rate_limited: 'Too many call attempts. Try again shortly.', in_call: 'User is on another call', offline: 'User is offline', 'Missed call': 'No answer'} as Record<string, string>)[reason] || reason;
+    this.status = 'ended';
+    this.notify();
+    setTimeout(() => {
+      if (this.currentCallId === callId && this.status === 'ended') this.resetCall(reason, previous);
+    }, 800);
+  }
+
   /**
    * Dispatch incoming call signaling frames received from peer
    */
@@ -977,6 +1011,10 @@ class CallService {
   private async processSignal(fromUid: string, payload: any): Promise<void> {
     if (!payload || typeof payload !== 'object') return;
 
+    while (this.recentCalls.size > 256) this.recentCalls.delete(this.recentCalls.keys().next().value!);
+    for (const [id, until] of this.recentCalls) if (until <= Date.now()) this.recentCalls.delete(id);
+    if (this.recentCalls.has(payload.callId)) return;
+    if (this.currentCallId === payload.callId && this.remoteUser?.uid !== fromUid) return;
     if (this.status === 'ended' && this.currentCallId === payload.callId) return;
     const candidateKey = `${fromUid}:${payload.callId}`;
     for (const [key, entry] of this.earlyCandidates) {
@@ -1002,6 +1040,9 @@ class CallService {
 
         // If already in an active or ringing call with someone else, reply busy
         if (this.status !== 'idle') {
+          this.recentCalls.set(payload.callId, Date.now() + 120000);
+          const event: CallEndEvent = {callId: payload.callId, callType: payload.callType === 'video' ? 'video' : 'audio', remoteUser: {uid: fromUid, name: payload.callerName || 'Caller'}, isCaller: false, durationSec: 0, durationFormatted: '0s', status: 'busy', timestamp: Date.now()};
+          this.callEndListeners.forEach(fn => { try { fn(event); } catch {} });
           this.signalSender?.(fromUid, {
             type: 'call_busy',
             callId: payload.callId,
@@ -1213,11 +1254,7 @@ class CallService {
           this.currentCallId === payload.callId &&
           (this.status === 'outgoing_calling' || this.status === 'outgoing_ringing')
         ) {
-          this.status = 'ended';
-          this.notify();
-          setTimeout(() => {
-            this.resetCall(payload.reason || 'User busy');
-          }, 800);
+          this.finishRemote(payload.reason || 'User busy');
         }
         break;
       }
@@ -1228,22 +1265,14 @@ class CallService {
           this.currentCallId === payload.callId &&
           (this.status === 'outgoing_calling' || this.status === 'outgoing_ringing')
         ) {
-          this.status = 'ended';
-          this.notify();
-          setTimeout(() => {
-            this.resetCall(payload.reason || 'Call declined');
-          }, 800);
+          this.finishRemote(payload.reason || 'Call declined');
         }
         break;
       }
 
       case 'call_end': {
         if (payload.callId && this.currentCallId === payload.callId) {
-          this.status = 'ended';
-          this.notify();
-          setTimeout(() => {
-            this.resetCall(payload.reason || 'Call ended');
-          }, 800);
+          this.finishRemote(payload.reason || 'Call ended');
         }
         break;
       }

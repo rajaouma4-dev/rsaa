@@ -1,7 +1,10 @@
+import {signalCrypto, ensureNativeCrypto} from './nativeCrypto';
 import * as libsignal from '@privacyresearch/libsignal-protocol-typescript';
 import {PreKeyWhisperMessage} from '@privacyresearch/libsignal-protocol-protobuf-ts';
 import * as Keychain from 'react-native-keychain';
 import {Buffer} from 'buffer';
+
+libsignal.setWebCrypto(signalCrypto as any);
 
 const KEYCHAIN_SERVICE = 'com.nexa.chat.e2ee.identity';
 const STORAGE_PREFIX = 'nexa.e2ee.';
@@ -52,6 +55,7 @@ export interface EncryptedMessagePayload {
 
 class SignalProtocolStore implements libsignal.StorageType {
   private inMemorySessions = new Map<string, string>();
+  private trustedIdentities = new Map<string, string | null>();
 
   async getIdentityKeyPair(): Promise<libsignal.KeyPairType | undefined> {
     try {
@@ -72,10 +76,11 @@ class SignalProtocolStore implements libsignal.StorageType {
       pubKey: arrayBufferToBase64(keyPair.pubKey),
       privKey: arrayBufferToBase64(keyPair.privKey),
     });
-    await Keychain.setGenericPassword('identity', payload, {
+    const result = await Keychain.setGenericPassword('identity', payload, {
       service: KEYCHAIN_SERVICE,
       accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
     });
+    if (!result) throw new Error('Cannot persist Signal identity securely');
   }
 
   async getLocalRegistrationId(): Promise<number | undefined> {
@@ -87,19 +92,33 @@ class SignalProtocolStore implements libsignal.StorageType {
     await secureStore.setItem(STORAGE_PREFIX + 'registration_id', regId.toString());
   }
 
+  private async trustedIdentity(identifier: string): Promise<string | null> {
+    // Signal checks a bare UID but saves UID.deviceId. Both refer to one pinned
+    // identity in this single-device implementation; retain legacy UID.1 pins.
+    const uid = identifier.replace(/\.[0-9]+$/, '');
+    if (this.trustedIdentities.has(uid)) return this.trustedIdentities.get(uid)!;
+    const saved = await secureStore.getItem(STORAGE_PREFIX + 'identity_' + uid)
+      ?? await secureStore.getItem(STORAGE_PREFIX + 'identity_' + uid + '.1');
+    this.trustedIdentities.set(uid, saved);
+    return saved;
+  }
+
   async isTrustedIdentity(identifier: string, identityKey: ArrayBuffer, _direction: libsignal.Direction): Promise<boolean> {
-    const saved = await secureStore.getItem(STORAGE_PREFIX + 'identity_' + identifier);
+    const saved = await this.trustedIdentity(identifier);
     return saved === null || saved === arrayBufferToBase64(identityKey);
   }
 
   async saveIdentity(encodedAddress: string, publicKey: ArrayBuffer): Promise<boolean> {
-    const key = STORAGE_PREFIX + 'identity_' + encodedAddress;
+    const uid = encodedAddress.replace(/\.[0-9]+$/, '');
     const value = arrayBufferToBase64(publicKey);
-    const previous = await secureStore.getItem(key);
+    const previous = await this.trustedIdentity(uid);
     if (previous !== null && previous !== value) {
       throw new Error('Peer identity changed; verify the new device before continuing');
     }
-    await secureStore.setItem(key, value);
+    // Signal calls this for every message. Persist only a newly accepted pin.
+    if (previous === value) return false;
+    await secureStore.setItem(STORAGE_PREFIX + 'identity_' + uid, value);
+    this.trustedIdentities.set(uid, value);
     return false;
   }
 
@@ -159,8 +178,8 @@ class SignalProtocolStore implements libsignal.StorageType {
   }
 
   async storeSession(encodedAddress: string, record: libsignal.SessionRecordType): Promise<void> {
-    this.inMemorySessions.set(encodedAddress, record);
     await secureStore.setItem(STORAGE_PREFIX + 'session_' + encodedAddress, record);
+    this.inMemorySessions.set(encodedAddress, record);
   }
 
   async clearSession(encodedAddress: string): Promise<void> {
@@ -172,6 +191,7 @@ class SignalProtocolStore implements libsignal.StorageType {
 export class SignalE2EEService {
   private store = new SignalProtocolStore();
   private initialized = false;
+  private initialization?: Promise<void>;
   private peerLocks = new Map<string, Promise<any>>();
 
   private async runForPeer<T>(remoteUid: string, fn: () => Promise<T>): Promise<T> {
@@ -210,25 +230,43 @@ export class SignalE2EEService {
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
+    if (!this.initialization) {
+      this.initialization = this.provision().catch(error => {
+        this.initialization = undefined;
+        throw error;
+      });
+    }
+    return this.initialization;
+  }
+
+  private async provision(): Promise<void> {
+    await ensureNativeCrypto();
 
     let identity = await this.store.getIdentityKeyPair();
     let regId = await this.store.getLocalRegistrationId();
 
-    if (!identity || !regId) {
-      regId = libsignal.KeyHelper.generateRegistrationId();
+    if (!identity) {
       identity = await libsignal.KeyHelper.generateIdentityKeyPair();
-      await this.store.saveLocalRegistrationId(regId);
       await this.store.saveIdentityKeyPair(identity);
+    }
+    if (!regId) {
+      regId = libsignal.KeyHelper.generateRegistrationId();
+      await this.store.saveLocalRegistrationId(regId);
+    }
 
-      // Generate signed prekey 1
+    // Resume interrupted first-time provisioning without replacing the identity.
+    // The bundle is published only after every component is persisted.
+    const signedKey = await this.store.loadSignedPreKey(1);
+    const signature = await secureStore.getItem(STORAGE_PREFIX + 'signed_prekey_sig_1');
+    if (!signedKey || !signature) {
       const signedPreKey = await libsignal.KeyHelper.generateSignedPreKey(identity, 1);
       await this.store.storeSignedPreKey(1, signedPreKey.keyPair);
       await secureStore.setItem(
         STORAGE_PREFIX + 'signed_prekey_sig_1',
         arrayBufferToBase64(signedPreKey.signature),
       );
-
-      // Generate prekey 1
+    }
+    if (!await this.store.loadPreKey(1)) {
       const preKey = await libsignal.KeyHelper.generatePreKey(1);
       await this.store.storePreKey(1, preKey.keyPair);
     }

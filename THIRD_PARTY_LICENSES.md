@@ -38,6 +38,12 @@ This document details the open-source software, third-party libraries, and licen
 - **License**: MIT
 - **Copyright**: (c) 2016 Joel Arvidsson
 
+### Native cryptography and transport encoding
+- `react-native-quick-crypto` 1.1.9 — MIT; native OpenSSL-backed crypto provider.
+- `react-native-nitro-modules` 0.37.1 — MIT; native bindings.
+- `react-native-quick-base64` 3.0.1 — MIT; native Base64 support.
+- Preserve the license files and bundled native dependency notices shipped with these packages when distributing the app.
+
 ### `react-native-tcp-socket`
 - **License**: MIT
 - **Copyright**: (c) 2020 Raphaël Colboc

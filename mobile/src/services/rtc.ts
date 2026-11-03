@@ -242,7 +242,9 @@ export class ServerDataChannel {
       });
 
       if (this.offerSent) {
-        this.signal.send({type: 'ice_candidate', candidate: candidateObj});
+        if (this.isDestroyed || !this.signal.connected) return;
+        try { this.signal.send({type: 'ice_candidate', candidate: candidateObj}); }
+        catch { this.onStatus?.('failed'); }
       } else {
         this.pendingLocalCandidates.push(candidateObj);
       }
@@ -360,7 +362,16 @@ export class ServerDataChannel {
     if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     this.incomingChunks.forEach(item => clearTimeout(item.timer));
     this.incomingChunks.clear();
-    this.channel?.close();
+    if (this.channel) {
+      this.channel.onopen = null;
+      this.channel.onclose = null;
+      this.channel.onmessage = null;
+      this.channel.onerror = null;
+      this.channel.close();
+    }
+    this.pc.onicecandidate = null;
+    this.pc.onconnectionstatechange = null;
+    this.pc.oniceconnectionstatechange = null;
     this.pc.close();
     this.pendingLocalCandidates = [];
     this.pendingRemoteCandidates = [];

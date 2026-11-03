@@ -8,64 +8,55 @@ const SENT_TEXT_PREFIX = 'nexa.sent_text.v1.';
 
 // High-speed in-memory cache to eliminate repetitive AsyncStorage JSON parsing lag
 const memoryCache = new Map<string, ChatMessage[]>();
-const pendingSaveTimers = new Map<string, any>();
+const mutations = new Map<string, Promise<unknown>>();
+
+function serial<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
+  const next = (mutations.get(conversationId) || Promise.resolve()).catch(() => {}).then(operation);
+  mutations.set(conversationId, next);
+  void next.finally(() => {
+    if (mutations.get(conversationId) === next) mutations.delete(conversationId);
+  }).catch(() => {});
+  return next;
+}
 
 export async function getLocalMessages(conversationId: string): Promise<ChatMessage[]> {
-  if (memoryCache.has(conversationId)) {
-    return memoryCache.get(conversationId)!;
-  }
-  try {
-    const raw = await AsyncStorage.getItem(MSG_PREFIX + conversationId);
-    if (!raw) {
-      memoryCache.set(conversationId, []);
-      return [];
-    }
-    const list = JSON.parse(raw) as ChatMessage[];
-    const sorted = list.sort((a, b) => getMessageTimestamp(a) - getMessageTimestamp(b));
-    memoryCache.set(conversationId, sorted);
-    return sorted;
-  } catch {
-    return [];
-  }
+  const cached = memoryCache.get(conversationId);
+  if (cached) return cached;
+  const raw = await AsyncStorage.getItem(MSG_PREFIX + conversationId);
+  const list: ChatMessage[] = raw ? JSON.parse(raw) : [];
+  if (!Array.isArray(list)) throw new Error('Invalid local message history');
+  const sorted = list.sort((a, b) => getMessageTimestamp(a) - getMessageTimestamp(b));
+  // A read started before a committed write must not replace newer cache state.
+  if (!memoryCache.has(conversationId)) memoryCache.set(conversationId, sorted);
+  return memoryCache.get(conversationId)!;
+}
+
+async function persist(conversationId: string, messages: ChatMessage[]): Promise<ChatMessage[]> {
+  const sorted = [...messages].sort((a, b) => getMessageTimestamp(a) - getMessageTimestamp(b)).slice(-500);
+  await AsyncStorage.setItem(MSG_PREFIX + conversationId, JSON.stringify(sorted));
+  memoryCache.set(conversationId, sorted);
+  return sorted;
+}
+
+function mergeMessage(previous: ChatMessage | undefined, next: ChatMessage): ChatMessage {
+  return previous ? {...previous, ...next, status: advanceMessageStatus(previous.status, next.status)} : next;
 }
 
 export async function saveLocalMessages(conversationId: string, messages: ChatMessage[]): Promise<void> {
-  const sorted = [...messages].sort((a, b) => getMessageTimestamp(a) - getMessageTimestamp(b));
-  const trimmed = sorted.slice(-500);
-  memoryCache.set(conversationId, trimmed);
-
-  // Clear any existing debounce timer for this conversation
-  if (pendingSaveTimers.has(conversationId)) {
-    clearTimeout(pendingSaveTimers.get(conversationId));
-  }
-
-  // Debounced write to AsyncStorage so rapid status updates never lock the SQLite thread
-  const timer = setTimeout(async () => {
-    pendingSaveTimers.delete(conversationId);
-    try {
-      await AsyncStorage.setItem(MSG_PREFIX + conversationId, JSON.stringify(trimmed));
-    } catch (err) {
-      console.warn('Failed to persist local messages:', err);
-    }
-  }, 300);
-  pendingSaveTimers.set(conversationId, timer);
+  await serial(conversationId, async () => {
+    const byId = new Map((await getLocalMessages(conversationId)).map(m => [m.id, m]));
+    for (const message of messages) byId.set(message.id, mergeMessage(byId.get(message.id), message));
+    await persist(conversationId, [...byId.values()]);
+  });
 }
 
-export async function appendLocalMessage(conversationId: string, message: ChatMessage): Promise<ChatMessage[]> {
-  try {
+export function appendLocalMessage(conversationId: string, message: ChatMessage): Promise<ChatMessage[]> {
+  return serial(conversationId, async () => {
     const current = await getLocalMessages(conversationId);
-    let updated: ChatMessage[];
-    if (current.some(m => m.id === message.id)) {
-      updated = current.map(m => m.id === message.id ? {...m, ...message} : m);
-    } else {
-      updated = [...current, message];
-    }
-    updated.sort((a, b) => getMessageTimestamp(a) - getMessageTimestamp(b));
-    await saveLocalMessages(conversationId, updated);
-    return updated;
-  } catch {
-    return [message];
-  }
+    const previous = current.find(m => m.id === message.id);
+    const merged = mergeMessage(previous, message);
+    return persist(conversationId, previous ? current.map(m => m.id === message.id ? merged : m) : [...current, merged]);
+  });
 }
 
 export async function updateLocalMessageStatus(
@@ -73,20 +64,11 @@ export async function updateLocalMessageStatus(
   messageId: string,
   status: 'saved' | 'delivered' | 'seen',
 ): Promise<void> {
-  try {
+  await serial(conversationId, async () => {
     const current = await getLocalMessages(conversationId);
-    let changed = false;
-    const updated = current.map(m => {
-      if (m.id === messageId && m.status !== status) {
-        changed = true;
-        return {...m, status: advanceMessageStatus(m.status, status)};
-      }
-      return m;
-    });
-    if (changed) {
-      await saveLocalMessages(conversationId, updated);
-    }
-  } catch {}
+    const updated = current.map(m => m.id === messageId ? {...m, status: advanceMessageStatus(m.status, status)} : m);
+    if (updated.some((m, i) => m.status !== current[i].status)) await persist(conversationId, updated);
+  });
 }
 
 export async function getConversationPreview(conversationId: string): Promise<string | null> {

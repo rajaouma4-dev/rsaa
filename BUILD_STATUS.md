@@ -1,49 +1,63 @@
-# Nexa Chat — Build and integration status
+# Current continuation: multi-user changes
 
-**Current deliverable: source ZIP only. No installable APK is included.**
+Updated 3 November 2026. App source version 1.0.1 (code 2).
 
-## Current source state
+100 emulator-free real WebRTC clients exchanged 301/301 encrypted messages successfully, including an offline/reconnect delivery. Rust local tests: 14 passed, 2 opt-in integrations; the local DataChannel integration passed separately. Mobile semantic typecheck and storage/call/E2EE regressions passed. Rust optimized Windows build passed. See [full multi-user validation](docs/MULTI_USER_VALIDATION.md) for measured results, test scope and remaining release gaps.
 
-| Area | Implemented in source | Verified in this workspace |
-|---|---|---|
-| React Native screens | Auth/register, inbox, people search, profile, chat UI | TS/TSX syntax parse only; no native app run |
-| Live authentication | Mobile TLS signaling → Rust register/login; Argon2id; hashed server sessions; live token stored in Android Keystore/iOS Keychain | Not tested against a real server/Turso |
-| User/conversation APIs | Search, create/list conversation, profile update, history | SQL regression checks; end-to-end not tested |
-| WebRTC | React Native client and Rust answerer/DataChannel; ICE exchange scaffold | Not compiled or tested on two Android phones |
-| Presence | Same-process contact-scoped online/offline updates; search hides global online state; new-conversation notification | Static source only; no network test |
-| Message storage/outbox | Membership check, message+outbox transaction, post-commit ACK path and idempotency checks are in store code; relay is currently fail-closed | SQLite SQL regression; live DataChannel path intentionally rejects messages until E2EE exists |
-| Delivered/seen | Recipient-bound backend receipt handlers | SQL path tested, client ACK intentionally not enabled |
-| E2EE | No complete client E2EE/key-prekey relay | Not implemented; live send disabled |
-| Password protocol | Argon2id over TLS | Source only; OPAQUE not implemented |
-| TLS pinning | `react-native-tcp-socket.connectTLS()` + certificate validation + configured SHA-256 leaf-certificate fingerprint pin with primary/backup slots | API usage/source check only; real certificate pin and rotation not tested |
-| SDUI | Allowlist renderer/schema validation | Signature verification and live config endpoint are not complete |
-| Android APK | Bootstrap/build scripts + CI | Not built: Android SDK/Gradle unavailable |
-| Rust backend | Store, TLS signaling, session revalidation, WebRTC answerer and outbox worker source + Cargo manifest | Not compiled: Rust/Cargo unavailable |
+The source and new builds are local. The updated Rust backend has not been pushed/deployed. Universal APK 1.0.1 (code 2): `mobile/android/app/build/outputs/apk/release/app-universal-release.apk`, 143,569,018 bytes. APK signature verification passed (v2, existing test signing key). SHA-256: `c21412b4848389b185c60ed12ad6c9601e06035292e4d374d6957d9ebc50304b`. Four ABI-specific APKs also built. As requested, this new build was not installed on or run in an emulator. Earlier two-emulator observations below describe the previous build, not this continuation's runtime Android verification.
 
-## Local checks performed
+---
 
-Run `./scripts/check-project.sh`. The latest successful local run reported:
+# Nexa Chat — verified status
 
-- JSON config parsed.
-- 16 TypeScript/TSX files parsed for syntax (not a semantic typecheck).
-- TCP frame decoder test covers split Bengali UTF-8 characters, multiple frames, malformed JSON and oversized frames.
-- Source invariant checks guard the documented TLS `connectTLS()` API, leaf fingerprint pinning, Keychain token storage, session resume and fail-closed E2EE behavior.
-- 11 SQL migration statements exercised against SQLite, including current schema, old outbox migration, username search, conversation listing, contact-only presence lookup, history cursor, outbox retry claim, receipts and profile update.
-- GitHub Actions YAML parsed.
-- Rust compile/test skipped because `cargo` is not installed.
-- Android build skipped because native shell/Gradle wrapper and Android SDK are not installed.
+Updated: 3 November 2026, Asia/Kolkata.
 
-The GitHub Actions workflow is configured to run `cargo check`, `cargo test`, TypeScript semantic checking and Android `assembleRelease` after the source is pushed to a GitHub repository. Workflow success has not been observed yet.
+## Current build
 
-## Blocking items before production
+Universal APK: `mobile/android/app/build/outputs/apk/release/app-universal-release.apk` (143,560,154 bytes).
+SHA-256: `6b5d5ea7e0d1f74dee646d1fb7b60b6b8ff9c8eee346ec137639d06f2fe40d0d`.
+Android APK signature verification passed (v2). Uses the existing test signing configuration; this is a test release.
+Four ABI-specific APKs also built successfully. Final x86_64 APK installed on both existing MuMu test devices with app data retained.
 
-1. Integrate and test a maintained E2EE implementation on Android, including local encrypted state, identity/key distribution, prekey one-time consumption, relay and identity-change safety.
-2. Compile and test Rust backend; validate the exact `webrtc` crate API against `0.21.1`.
-3. Run two real Android clients through Wi-Fi, mobile data, CGNAT, reconnect and offline delivery tests.
-4. Configure public TLS certificate, set primary/backup leaf-certificate pins, test pin rotation, deploy TURN and implement dynamic/ephemeral TURN credentials.
-5. Configure Turso credentials on the deployed server; test transactions, concurrency, backups, PITR and restore.
-6. Add device lifecycle, background delivery/push, multi-device session policy and account recovery. Secure token persistence in Keychain/Android Keystore is present in source but still needs an Android runtime test.
-7. Wire signed SDUI config and Ed25519 verification/key rotation.
-8. Add monitoring, abuse controls, dependency review and independent security testing.
+## Work completed in this continuation
 
-The mobile app and backend both reject message sending until E2EE is implemented. Never distribute this starter as a finished secure messenger.
+- Verified the previously unfinished native crypto integration on Android: native AES/HMAC startup self-test passed on both devices.
+- Serialized E2EE initialization so concurrent callers cannot generate competing identities.
+- Made interrupted initial key provisioning retryable while retaining the existing identity.
+- Reject failed identity persistence and update the in-memory ratchet only after secure persistence succeeds.
+- Added production-service regression coverage for concurrent/interrupted initialization, old/new provider interoperability, persistent-session upgrades, replay/tampering and storage failures.
+
+Existing uncommitted native-provider, identity-pin lookup/cache, RTC cleanup and Windows build-cache changes were retained. They are not deployed through a new Git commit in this continuation.
+
+## Verification
+
+| Check | Observed result |
+|---|---|
+| TypeScript semantic typecheck | Passed |
+| Native-provider known-answer harness | Passed with Node WebCrypto; separate Android startup tests also passed |
+| E2EE security and upgrade regressions | Passed |
+| Low-latency queue/backpressure/media reassembly regression | Passed |
+| Duplicate-answer, timer, early ICE and serialized call-signal regressions | Passed |
+| Android assembleRelease, four ABIs plus universal | Passed |
+| Existing session, native APK versus old APK | Four bidirectional text messages received; screenshots show seen receipts |
+| Text UI observation bounds | 4.56–4.69 seconds, includes UI automation overhead; not a precise network-latency measurement |
+| Audio call, native APK versus old APK | 1m 5s caller / 1m 6s receiver; manually ended; no immediate auto-end |
+| Video call, final native APK on both | 1m 49s caller / 1m 50s receiver; manually ended; renderer logs approximately 24 FPS |
+| Video picture | Still gray in both local and remote views; successful real-picture quality NOT established |
+| Voice note, final APKs | 45-second recording received and displayed; audible quality not verified |
+| HD image, final APKs | Existing synthetic fixture received and displayed |
+
+Evidence screenshots: `docs/caller-video.png`, `docs/receiver-video.png`, `docs/voice-received.png`, `docs/image-received.png`.
+
+## Remaining work before a public release
+
+- Resolve gray video with a known camera source and validate actual audio/video content and latency on physical devices and mobile networks. Rendered FPS alone does not establish image quality.
+- Authenticate call negotiation/fingerprints against verified peer identity. Current call signaling is not authenticated using the chat E2EE identity.
+- Implement server-verified device registration/attestation, device lifecycle and replay controls as appropriate. The client replay regression above is not evidence of complete server replay protection.
+- Move the TURN provider API credential out of the client, issue short-lived authenticated credentials server-side and rotate exposed credentials.
+- Encrypt local message history/media at rest: current `messageStore.ts` uses AsyncStorage for decrypted messages.
+- Persist the outgoing encrypted queue across process death; validate background delivery/push, offline recovery and account isolation.
+- Address prekey lifecycle, identity verification/recovery and migration from legacy installations.
+- Configure production signing, monitoring and independent security review.
+
+No claim of production readiness or complete protection against interception, compromised devices or client automation is made. This continuation did not deploy a backend change; its changes are client-side. The live backend revision was not rechecked during this continuation.

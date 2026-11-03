@@ -25,7 +25,7 @@ export type CallDetails = {
   callType: 'audio' | 'video';
   durationSec: number;
   durationFormatted: string; // e.g. "2m 14s", "1h 5m 20s"
-  status: 'completed' | 'missed' | 'declined' | 'cancelled';
+  status: 'completed' | 'missed' | 'declined' | 'cancelled' | 'busy' | 'offline' | 'failed';
   isCaller: boolean;
 };
 

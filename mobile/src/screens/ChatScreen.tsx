@@ -390,7 +390,7 @@ export function ChatScreen({
                       ? ' · Seen'
                       : item.status === 'delivered'
                       ? ' · Delivered'
-                      : ' · Sent'}
+                      : item.status === 'saved' ? ' · Sent' : ' · Sending…'}
                   </Text>
                 ) : null}
               </View>

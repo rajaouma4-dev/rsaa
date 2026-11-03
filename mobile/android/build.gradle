@@ -19,3 +19,15 @@ buildscript {
 }
 
 apply plugin: "com.facebook.react.rootproject"
+
+// Native dependencies also need the short staging root on Windows. This keeps
+// their generated objects out of deeply nested node_modules paths.
+subprojects { nativeProject ->
+    nativeProject.plugins.withId("com.android.library") {
+        def shortRoot = rootProject.findProperty("nexaNativeBuildDir")
+        if (shortRoot && System.getProperty("os.name").toLowerCase().contains("windows")) {
+            nativeProject.extensions.getByName("android").externalNativeBuild.cmake.buildStagingDirectory =
+                new File(shortRoot.toString(), nativeProject.name)
+        }
+    }
+}

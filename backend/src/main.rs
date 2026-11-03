@@ -1,3 +1,5 @@
+mod proxy;
+mod calls;
 mod db;
 mod protocol;
 mod webrtc_peer;
@@ -271,7 +273,7 @@ where
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
-                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "REGISTER_FAILED", &safe_error(&err)).await?,
                 }
@@ -294,7 +296,7 @@ where
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
-                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "LOGIN_FAILED", &safe_error(&err)).await?,
                 }
@@ -313,7 +315,7 @@ where
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
-                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
                 }
@@ -437,44 +439,7 @@ where
                     send_error(&signal_tx, "AUTH_REQUIRED", "login required for call signaling").await?;
                     continue;
                 };
-                let from_uid = user.uid.clone();
-                let mut sent = false;
-                // 1. Send via TCP signaling socket (guaranteed delivery)
-                {
-                    let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
-                    if let Some(tx) = target_tx {
-                        let _ = tx.send(ServerFrame::CallSignal {
-                            from_uid: from_uid.clone(),
-                            payload: payload.clone(),
-                        }).await;
-                        sent = true;
-                    }
-                }
-                // 2. Also forward via DataChannel if active
-                {
-                    let target_dc = { channels.read().await.get(&to_uid).cloned() };
-                    if let Some(dc) = target_dc {
-                        let frame = DataChannelServerFrame::CallSignal {
-                            from_uid: from_uid.clone(),
-                            payload: payload.clone(),
-                        };
-                        if let Ok(json_str) = serde_json::to_string(&frame) {
-                            crate::webrtc_peer::send_safe_text(&dc, &json_str).await;
-                            sent = true;
-                        }
-                    }
-                }
-                tracing::info!(from = %from_uid, to = %to_uid, signal_type = ?payload.get("type"), sent = %sent, "call_signal dispatched");
-                if !sent && payload.get("type").and_then(|t| t.as_str()) == Some("call_invite") {
-                    let _ = signal_tx.send(ServerFrame::CallSignal {
-                        from_uid: to_uid,
-                        payload: serde_json::json!({
-                            "type": "call_busy",
-                            "callId": payload.get("callId"),
-                            "reason": "offline"
-                        }),
-                    }).await;
-                }
+                crate::webrtc_peer::route_call_signal(&user.uid, &to_uid, payload, &channels, &live_signaling).await;
             }
             ClientFrame::IceCandidate { candidate } => {
                 if let Some(peer) = current_peer.as_ref() {
@@ -534,6 +499,7 @@ where
                 }
             }
             ClientFrame::Ping => {
+                if let Some(user) = current_user.as_ref() { crate::calls::CALLS.lock().await.touch(&user.uid); }
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
             }
         }
@@ -614,8 +580,9 @@ async fn handle_ws_client(
     // Read initial data from stream (waiting up to 5 seconds for client probe or websocket headers)
     let mut initial_buf = Vec::new();
     let mut temp = [0u8; 1024];
+    let header_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let n = match timeout(Duration::from_secs(5), stream.read(&mut temp)).await {
+        let n = match tokio::time::timeout_at(header_deadline, stream.read(&mut temp)).await {
             Ok(Ok(n)) if n > 0 => n,
             _ => break,
         };
@@ -648,9 +615,15 @@ async fn handle_ws_client(
         return Ok(());
     }
 
+    let trusted_proxies: Vec<String> = env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
+    let client_ip = proxy::client_ip(client_ip, &req_str, &trusted_proxies);
     let prefixed = PrefixedStream::new(initial_buf, stream);
-    let ws_stream = tokio_tungstenite::accept_async(prefixed).await
-        .context("WebSocket handshake failed")?;
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(MAX_SIGNAL_FRAME_BYTES), max_frame_size: Some(MAX_SIGNAL_FRAME_BYTES),
+        ..Default::default()
+    };
+    let ws_stream = timeout(Duration::from_secs(5), tokio_tungstenite::accept_async_with_config(prefixed, Some(config))).await
+        .context("WebSocket handshake timed out")?.context("WebSocket handshake failed")?;
     let (mut ws_writer, mut ws_reader) = ws_stream.split();
 
     let (signal_tx, mut signal_rx) = mpsc::channel::<ServerFrame>(128);
@@ -728,7 +701,7 @@ async fn handle_ws_client(
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
-                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "REGISTER_FAILED", &safe_error(&err)).await?,
                 }
@@ -751,7 +724,7 @@ async fn handle_ws_client(
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
-                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "LOGIN_FAILED", &safe_error(&err)).await?,
                 }
@@ -770,7 +743,7 @@ async fn handle_ws_client(
                         send_auth_ok(&signal_tx, user.clone(), token).await?;
                         crate::webrtc_peer::deliver_all_pending_via_signal(&store, &signal_tx, &user.uid).await;
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
-                        crate::webrtc_peer::send_initial_presence_via_signal(&channels, &live_signaling, &signal_tx, &user.uid).await;
+                        crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
                     Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
                 }
@@ -894,44 +867,7 @@ async fn handle_ws_client(
                     send_error(&signal_tx, "AUTH_REQUIRED", "login required for call signaling").await?;
                     continue;
                 };
-                let from_uid = user.uid.clone();
-                let mut sent = false;
-                // 1. Send via WebSocket signaling socket (guaranteed delivery)
-                {
-                    let target_tx = { live_signaling.read().await.get(&to_uid).cloned() };
-                    if let Some(tx) = target_tx {
-                        let _ = tx.send(ServerFrame::CallSignal {
-                            from_uid: from_uid.clone(),
-                            payload: payload.clone(),
-                        }).await;
-                        sent = true;
-                    }
-                }
-                // 2. Also forward via DataChannel if active
-                {
-                    let target_dc = { channels.read().await.get(&to_uid).cloned() };
-                    if let Some(dc) = target_dc {
-                        let frame = DataChannelServerFrame::CallSignal {
-                            from_uid: from_uid.clone(),
-                            payload: payload.clone(),
-                        };
-                        if let Ok(json_str) = serde_json::to_string(&frame) {
-                            crate::webrtc_peer::send_safe_text(&dc, &json_str).await;
-                            sent = true;
-                        }
-                    }
-                }
-                tracing::info!(from = %from_uid, to = %to_uid, signal_type = ?payload.get("type"), sent = %sent, "call_signal dispatched");
-                if !sent && payload.get("type").and_then(|t| t.as_str()) == Some("call_invite") {
-                    let _ = signal_tx.send(ServerFrame::CallSignal {
-                        from_uid: to_uid,
-                        payload: serde_json::json!({
-                            "type": "call_busy",
-                            "callId": payload.get("callId"),
-                            "reason": "offline"
-                        }),
-                    }).await;
-                }
+                crate::webrtc_peer::route_call_signal(&user.uid, &to_uid, payload, &channels, &live_signaling).await;
             }
             ClientFrame::IceCandidate { candidate } => {
                 if let Some(peer) = current_peer.as_ref() {
@@ -987,6 +923,7 @@ async fn handle_ws_client(
                 }
             }
             ClientFrame::Ping => {
+                if let Some(user) = current_user.as_ref() { crate::calls::CALLS.lock().await.touch(&user.uid); }
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
             }
         }
@@ -1086,3 +1023,6 @@ mod tests {
         assert!(res.is_ok(), "Failed to deserialize camelCase candidate: {:?}", res.err());
     }
 }
+
+#[cfg(test)]
+mod load_test;

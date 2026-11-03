@@ -120,7 +120,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
             {callState.remoteUser?.name || 'Contact'}
           </Text>
           <Text style={styles.callStatusText}>
-            {isIncoming
+            {callState.status === 'ended' ? (callState.endReason || 'Call ended') : isIncoming
               ? callState.callType === 'video'
                 ? 'Incoming Video Call...'
                 : 'Incoming Audio Call...'
