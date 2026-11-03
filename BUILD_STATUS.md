@@ -1,3 +1,9 @@
+# Current call delivery fix — 4 November 2026
+
+Version 1.0.6 (code 7) fixes abandoned server busy reservations after app restart and reconnects signaling before dialing. Server fix `1d843f5` was confirmed live on Render. Three-emulator testing verified audio ringing/accept/connect, third-caller busy without disrupting an active call, force-stop/restart then successful redial, and video ringing/accept/connect. Gray emulator camera content and real audio/video quality remain unresolved. Install 1.0.6 on both calling devices. See [call recovery verification](docs/CALL_RECOVERY_VALIDATION.md) for evidence, checks and APK hash.
+
+---
+
 # Current call UI update — 4 November 2026
 
 Version 1.0.5 (code 6) adds the user's purple call design with draggable local-camera preview, retaining existing call controls. Chat UI is unchanged. Release APK build, signature and typecheck passed; all three existing test emulators were updated. Live audio-call UI and preview movement were observed. A fresh final-build video test was interrupted by MuMu graphics termination (error 901), so full video rendering/quality is not certified. See [call UI validation](docs/CALL_UI_VALIDATION.md) for exact evidence, APK hash and remaining checks.

@@ -603,6 +603,36 @@ mod ice_config_tests {
     }
 }
 
+#[cfg(test)]
+mod call_recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restarted_idle_client_releases_busy_and_notifies_the_peer() {
+        let channels = LiveChannels::default();
+        let signaling = LiveSignaling::default();
+        let (a, mut a_rx) = mpsc::channel(16);
+        let (b, mut b_rx) = mpsc::channel(16);
+        let (c, mut c_rx) = mpsc::channel(16);
+        for (uid, tx) in [("recovery-a", a), ("recovery-b", b), ("recovery-c", c)] {
+            signaling.write().await.insert(uid.into(), tx);
+        }
+        route_call_signal("recovery-a", "recovery-b", json!({"type":"call_invite","callId":"recovery-ab","sdp":"offer"}), &channels, &signaling).await;
+        assert!(matches!(b_rx.try_recv(), Ok(ServerFrame::CallSignal { payload, .. }) if payload["type"] == "call_invite"));
+        route_call_signal("recovery-b", "recovery-a", json!({"type":"call_answer","callId":"recovery-ab","sdp":"answer"}), &channels, &signaling).await;
+        assert!(matches!(a_rx.try_recv(), Ok(ServerFrame::CallSignal { payload, .. }) if payload["type"] == "call_answer"));
+        sync_call_state("recovery-a", Some("recovery-ab"), &channels, &signaling).await;
+        route_call_signal("recovery-c", "recovery-b", json!({"type":"call_invite","callId":"recovery-busy","sdp":"offer"}), &channels, &signaling).await;
+        assert!(matches!(c_rx.try_recv(), Ok(ServerFrame::DataFrame { payload }) if payload["payload"]["reason"] == "in_call"));
+        // Reconnecting app has no media call, even though its socket is alive.
+        sync_call_state("recovery-a", None, &channels, &signaling).await;
+        assert!(matches!(b_rx.try_recv(), Ok(ServerFrame::CallSignal { from_uid, payload }) if from_uid == "recovery-a" && payload["type"] == "call_end"));
+        route_call_signal("recovery-c", "recovery-b", json!({"type":"call_invite","callId":"recovery-new","sdp":"offer"}), &channels, &signaling).await;
+        assert!(matches!(b_rx.try_recv(), Ok(ServerFrame::CallSignal { payload, .. }) if payload["type"] == "call_invite" && payload["callId"] == "recovery-new"));
+        route_call_signal("recovery-c", "recovery-b", json!({"type":"call_end","callId":"recovery-new"}), &channels, &signaling).await;
+    }
+}
+
 pub async fn build_answerer(
     uid: String,
     db: Store,
