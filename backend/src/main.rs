@@ -513,6 +513,15 @@ where
                     ).await;
                 }
             }
+            ClientFrame::CallState { call_id } => {
+                if let Some(user) = current_user.as_ref() {
+                    let owns_connection = live_signaling.read().await.get(&user.uid)
+                        .is_some_and(|tx| tx.same_channel(&signal_tx));
+                    if owns_connection {
+                        crate::webrtc_peer::sync_call_state(&user.uid, call_id.as_deref(), &channels, &live_signaling).await;
+                    }
+                }
+            }
             ClientFrame::Ping => {
                 if let Some(user) = current_user.as_ref() { crate::calls::CALLS.lock().await.touch(&user.uid); }
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
@@ -955,6 +964,15 @@ async fn handle_ws_client(
                         &live_signaling,
                         &user.uid,
                     ).await;
+                }
+            }
+            ClientFrame::CallState { call_id } => {
+                if let Some(user) = current_user.as_ref() {
+                    let owns_connection = live_signaling.read().await.get(&user.uid)
+                        .is_some_and(|tx| tx.same_channel(&signal_tx));
+                    if owns_connection {
+                        crate::webrtc_peer::sync_call_state(&user.uid, call_id.as_deref(), &channels, &live_signaling).await;
+                    }
                 }
             }
             ClientFrame::Ping => {

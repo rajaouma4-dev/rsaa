@@ -5,7 +5,14 @@ const mediaDevices = {getUserMedia: () => new Promise(resolve => { provideMedia 
 const context = {exports: {}, console, Buffer, setTimeout(fn, ms) { timers.push({fn, ms}); return timers.length; }, clearTimeout() {}, setInterval() { return 1; }, clearInterval() {}, require(n) {
   if (n === 'react-native') return {Platform: {OS: 'android'}, PermissionsAndroid: {}};
   if (n.includes('config')) return {APP_CONFIG: {}};
-  return {mediaDevices};
+  return {mediaDevices,
+    RTCPeerConnection: class {
+      addTrack() {} addEventListener() {} close() {}
+      async createOffer() { return {sdp: 'v=0'}; }
+      async setLocalDescription() {}
+    },
+    RTCSessionDescription: class { constructor(value) { Object.assign(this, value); } },
+  };
 }};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/callService.ts', 'utf8') + '\nexport {CallService};', {compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020}}).outputText, context);
 const Call = context.exports.CallService;
@@ -39,5 +46,12 @@ function call(id = 'ab', peer = 'a', status = 'connected') {
   provideMedia({getTracks: () => [{stop() { stopped++; }}], release() {}});
   await opening;
   assert.equal(cancelled.currentCallId, 'new'); assert.equal(cancelled.status, 'connected'); assert.equal(stopped, 1);
+  const disconnected = new Call(); disconnected.requestPermissions = async () => true;
+  disconnected.setSignalSender(() => false);
+  const failedStart = disconnected.startCall({uid: 'peer', name: 'Peer'}, 'audio', 'Me');
+  await new Promise(resolve => setImmediate(resolve));
+  provideMedia({getTracks: () => [], release() {}});
+  await failedStart;
+  assert.equal(disconnected.status, 'idle', 'Dropped invite must not leave a phantom outgoing call');
   console.log('PASS: third caller gets busy without disrupting current call; sender binding; late invite rejection; correct busy/offline/missed/declined history; duplicate outgoing tap guarded; cancelled media result cannot overwrite a newer call.');
 })().catch(e => { console.error(e); process.exitCode = 1; });

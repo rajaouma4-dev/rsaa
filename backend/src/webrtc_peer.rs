@@ -198,6 +198,19 @@ async fn reply_error(
     reply_to_sender(channel, signal_tx, &frame).await;
 }
 
+pub async fn sync_call_state(uid: &str, active_id: Option<&str>, channels: &LiveChannels, live_signaling: &LiveSignaling) {
+    let abandoned = crate::calls::CALLS.lock().await.sync_state(uid, active_id);
+    if let Some((peer, id)) = abandoned {
+        let payload = json!({"type":"call_end", "callId":id, "reason":"Call ended after app restart"});
+        let target = live_signaling.read().await.get(&peer).cloned();
+        if let Some(tx) = target {
+            if tx.try_send(ServerFrame::CallSignal { from_uid: uid.to_owned(), payload: payload.clone() }).is_ok() { return; }
+        }
+        let frame = DataChannelServerFrame::CallSignal { from_uid: uid.to_owned(), payload };
+        let _ = tokio::time::timeout(Duration::from_secs(2), send_to_user(channels, live_signaling, &peer, &frame)).await;
+    }
+}
+
 pub async fn route_call_signal(from: &str, to: &str, payload: serde_json::Value, channels: &LiveChannels, live_signaling: &LiveSignaling) {
     use crate::calls::{CALLS, Decision};
     let decision = CALLS.lock().await.decide(from, to, &payload);

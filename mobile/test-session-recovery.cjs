@@ -1,6 +1,7 @@
 const fs = require('fs'), vm = require('vm'), ts = require('typescript'), assert = require('node:assert/strict');
+const intervals = [];
 function load(file, imports) {
-  const context = {exports: {}, Buffer, console, setTimeout, clearTimeout, setInterval: () => 1, clearInterval() {}, require: imports};
+  const context = {exports: {}, Buffer, console, setTimeout, clearTimeout, setInterval: fn => { intervals.push(fn); return intervals.length; }, clearInterval() {}, require: imports};
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(file, 'utf8'), {compilerOptions: {module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020}}).outputText, context);
   return context.exports;
 }
@@ -25,5 +26,20 @@ const {TlsSignalingClient} = load('src/services/signaling.ts', n => {
     for (const listener of [...client.listeners]) listener({type: 'error', code, message: 'server response'});
     await assert.rejects(response, error => error.code === code && savedSessionIsInvalid(error) === (code === 'SESSION_EXPIRED'));
   }
-  console.log('PASS: transport/DNS/temporary auth failures retain login; explicit expired sessions require login; signaling error codes survive request rejection.');
+  const reports = [], synced = new TlsSignalingClient();
+  synced.isConnected = true;
+  synced.ws = {send(raw) { reports.push(JSON.parse(raw)); }};
+  let activeCall = null;
+  synced.setCallStateProvider(() => activeCall);
+  synced.setAuthenticated(false);
+  assert.equal(reports.length, 0);
+  synced.setAuthenticated(true);
+  assert.equal(reports[0].type, 'call_state'); assert.equal(reports[0].call_id, null);
+  activeCall = 'active-call';
+  intervals.at(-1)();
+  assert.equal(reports.at(-2).call_id, activeCall); assert.equal(reports.at(-1).type, 'ping');
+  synced.awaitingPong = false; activeCall = null;
+  intervals.at(-1)();
+  assert.equal(reports.at(-2).call_id, null);
+  console.log('PASS: temporary failures retain login; expiry requires login; signaling preserves error codes; authenticated reconnect and heartbeats report actual call state.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

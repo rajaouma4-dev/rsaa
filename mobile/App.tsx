@@ -82,6 +82,10 @@ export default function App() {
   const ensureConnectedRef = useRef<() => Promise<boolean>>(() => Promise.resolve(false));
 
   const attachSignalHandlers = useCallback((client: TlsSignalingClient) => {
+    client.setCallStateProvider(() => {
+      const state = callService.getState();
+      return state.status === 'idle' || state.status === 'ended' ? null : state.callId;
+    });
     client.onFrame(frame => {
       if (frame.type === 'call_signal' && frame.from_uid && frame.payload) {
         void callService.handleSignal(String(frame.from_uid), frame.payload);
@@ -104,19 +108,20 @@ export default function App() {
   useEffect(() => {
     callService.setSignalSender((toUid, payload) => {
       const sig = signalRef.current;
-      if (sig && sig.connected) {
+      if (sig?.authenticated) {
         try {
           sig.send({type: 'call_signal', to_uid: toUid, payload});
-          return;
+          return true;
         } catch {}
       }
       const rtc = rtcRef.current;
       if (rtc && rtc.isOpen) {
         try {
           rtc.sendControlFrame({type: 'call_signal', to_uid: toUid, payload});
-          return;
+          return true;
         } catch {}
       }
+      return false;
     });
 
     const unsubscribe = callService.subscribe(state => {
@@ -1265,11 +1270,16 @@ export default function App() {
         onBack={() => { setSelected(null); selectedRef.current = null; }}
         onSend={sendMessage}
         onStartCall={(user, callType) => {
-          void callService.startCall(
-            {uid: user.id, name: user.name},
-            callType,
-            session.displayName || session.username || 'Me'
-          );
+          void (async () => {
+            if (!signalRef.current?.authenticated && !await ensureConnected()) {
+              Alert.alert('Cannot connect call', 'Server connection is unavailable. Please try again.');
+              return;
+            }
+            await callService.startCall(
+              {uid: user.id, name: user.name}, callType,
+              session.displayName || session.username || 'Me'
+            );
+          })();
         }}
       />
     ) : session ? (

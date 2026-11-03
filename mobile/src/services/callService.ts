@@ -64,7 +64,7 @@ export function formatCallDuration(sec: number): string {
   return `${s}s`;
 }
 
-export type CallSignalSender = (toUid: string, payload: any) => void;
+export type CallSignalSender = (toUid: string, payload: any) => boolean | void;
 
 const AUDIO_CONSTRAINTS = {
   echoCancellation: true,
@@ -336,13 +336,16 @@ class CallService {
       if (this.currentCallId !== callId) return;
 
       // 8. Send call_invite with offer SDP to peer
-      this.signalSender?.(remoteUser.uid, {
+      const inviteSent = this.signalSender?.(remoteUser.uid, {
         type: 'call_invite',
         callId,
         callType,
         callerName: myDisplayName,
         sdp: optimizedOfferSdp,
       });
+      if (!this.signalSender || inviteSent === false) {
+        throw new Error('No authenticated call signaling connection');
+      }
 
       // 9. 35s Ringing timeout
       this.ringingTimeoutTimer = setTimeout(() => {

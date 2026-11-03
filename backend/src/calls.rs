@@ -72,9 +72,22 @@ impl Registry {
         Decision::Forward
     }
     pub fn touch(&mut self, uid: &str) {
+        let expired = self.users.get(uid).filter(|id| self.calls.get(*id).is_some_and(|call| call.expires <= Instant::now())).cloned();
+        if let Some(id) = expired { self.finish(&id); return; }
         if let Some(call) = self.users.get(uid).and_then(|id| self.calls.get_mut(id)) {
             if call.answered { call.expires = Instant::now() + Duration::from_secs(90); }
         }
+    }
+    pub fn sync_state(&mut self, uid: &str, active_id: Option<&str>) -> Option<(String, String)> {
+        let id = self.users.get(uid)?.clone();
+        let call = self.calls.get(&id)?;
+        if active_id == Some(id.as_str()) { self.touch(uid); return None; }
+        // An idle callee may not have processed a new invite yet. Do not
+        // cancel that ringing reservation merely because its heartbeat raced it.
+        if !call.answered && call.caller != uid { return None; }
+        let peer = if call.caller == uid { call.callee.clone() } else { call.caller.clone() };
+        self.finish(&id);
+        Some((peer, id))
     }
     pub fn undelivered(&mut self, id: &str) { self.finish(id); }
 }
@@ -83,6 +96,40 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn idle_restart_releases_busy_reservation_but_active_sync_keeps_it() {
+        let mut r = Registry::default();
+        r.decide("a", "b", &json!({"type":"call_invite","callId":"ab","sdp":"offer"}));
+        r.decide("b", "a", &json!({"type":"call_answer","callId":"ab"}));
+        assert!(r.sync_state("a", Some("ab")).is_none());
+        assert!(matches!(r.decide("c", "b", &json!({"type":"call_invite","callId":"cb","sdp":"offer"})), Decision::Busy));
+        assert_eq!(r.sync_state("a", None), Some(("b".into(), "ab".into())));
+        // Continued connection pings cannot revive the abandoned call.
+        r.touch("a"); r.touch("b");
+        assert!(r.sync_state("b", None).is_none());
+        assert!(matches!(r.decide("c", "b", &json!({"type":"call_invite","callId":"new","sdp":"offer"})), Decision::Forward));
+    }
+
+    #[test]
+    fn idle_callee_sync_cannot_cancel_a_new_invite() {
+        let mut r = Registry::default();
+        r.decide("a", "b", &json!({"type":"call_invite","callId":"ab","sdp":"offer"}));
+        assert!(r.sync_state("b", None).is_none());
+        assert!(matches!(r.decide("b", "a", &json!({"type":"call_answer","callId":"ab"})), Decision::Forward));
+        assert!(r.sync_state("b", Some("ab")).is_none());
+    }
+
+    #[test]
+    fn heartbeat_cannot_resurrect_an_expired_call() {
+        let mut r = Registry::default();
+        r.decide("a", "b", &json!({"type":"call_invite","callId":"ab","sdp":"offer"}));
+        r.decide("b", "a", &json!({"type":"call_answer","callId":"ab"}));
+        r.calls.get_mut("ab").unwrap().expires = Instant::now() - Duration::from_secs(1);
+        r.touch("a");
+        assert!(!r.users.contains_key("a") && !r.users.contains_key("b"));
+        assert!(matches!(r.decide("c", "b", &json!({"type":"call_invite","callId":"new","sdp":"offer"})), Decision::Forward));
+    }
+
     #[test]
     fn third_caller_and_spoofed_end_cannot_replace_a_call() {
         let mut r = Registry::default();

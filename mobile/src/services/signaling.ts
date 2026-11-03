@@ -22,6 +22,7 @@ export class TlsSignalingClient {
   private connectPromise?: Promise<void>;
   private requestTail: Promise<void> = Promise.resolve();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private callStateProvider?: () => string | null;
 
   connect(): Promise<void> {
     if (this.connectPromise) return this.connectPromise;
@@ -244,7 +245,18 @@ export class TlsSignalingClient {
 
   get connected(): boolean { return this.isConnected && Boolean(this.socket || this.ws); }
   get authenticated(): boolean { return this.isAuth && this.connected; }
-  setAuthenticated(val: boolean): void { this.isAuth = val; }
+  setAuthenticated(val: boolean): void {
+    this.isAuth = val;
+    this.syncCallState();
+  }
+
+  setCallStateProvider(provider: () => string | null): void { this.callStateProvider = provider; }
+
+  private syncCallState(): void {
+    if (this.authenticated && this.callStateProvider) {
+      this.send({type: 'call_state', call_id: this.callStateProvider()});
+    }
+  }
 
   send(frame: Frame): void {
     if (!this.connected) throw new Error('Signaling socket is not connected');
@@ -274,6 +286,7 @@ export class TlsSignalingClient {
         }
         this.awaitingPong = true;
         try {
+          this.syncCallState();
           if (this.ws) {
             this.ws.send('{"type":"ping"}\n');
           } else if (this.socket) {

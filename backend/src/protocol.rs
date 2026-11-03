@@ -17,6 +17,7 @@ pub enum ClientFrame {
     PublishPrekeys { bundle: serde_json::Value },
     GetPrekeyBundle { uid: String },
     CallSignal { to_uid: String, payload: serde_json::Value },
+    CallState { call_id: Option<String> },
     DataFrame { payload: serde_json::Value },
     Ping,
 }

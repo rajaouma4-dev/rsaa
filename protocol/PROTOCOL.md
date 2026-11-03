@@ -53,3 +53,8 @@ The intended client order is decrypt → local durable save → `delivered_ack`;
 ## Important security limitation
 
 The backend cannot verify that `ciphertext_b64` contains genuine E2EE ciphertext. The mobile UI prevents live sending until a reviewed client-side encryption implementation and key/prekey relay are installed. A modified client could bypass UI checks; production backend must only be exposed after the E2EE/key enrollment release gate is complete.
+
+
+## Call state reconciliation (1.0.6)
+
+Authenticated signaling clients report `{"type":"call_state","call_id":null}` immediately after authentication and alongside their heartbeat when they have no live call. An active/ringing/connecting call reports its call ID. Only the currently registered connection for the authenticated UID may reconcile that UID's reservation. An answered reservation that disagrees with actual client state is released and its peer receives `call_end`. An idle callee cannot cancel a newly queued, unanswered invite with a racing heartbeat. Ordinary pings cannot revive an already expired reservation.
