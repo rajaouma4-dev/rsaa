@@ -295,7 +295,15 @@ pub async fn handle_client_frame(
                     reply_to_sender(channel, signal_tx, &DataChannelServerFrame::SavedAck {
                         message_id: message_id.clone(),
                     }).await;
-                    deliver_one(db, channels, &recipient_uid, &message_id).await;
+                    // The committed outbox provides retries. Forward the already
+                    // available envelope immediately instead of querying it back
+                    // from the remote database before the first delivery.
+                    let frame = DataChannelServerFrame::NewMessage { message: crate::protocol::MessageEnvelope {
+                        message_id: message_id.clone(), conversation_id: conversation_id.clone(),
+                        sender_uid: uid.to_owned(), ciphertext_b64: ciphertext_b64.clone(),
+                        msg_type, created_at: crate::db::now_epoch_string(), status: "SAVED".to_owned(),
+                    }};
+                    send_to_user(channels, live_signaling, &recipient_uid, &frame).await;
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "message persistence failed");

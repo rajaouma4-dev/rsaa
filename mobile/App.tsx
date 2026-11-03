@@ -259,7 +259,7 @@ export default function App() {
     flushingOutboxRef.current = true;
     try {
       for (const item of [...outboxRef.current]) {
-        if (item.lastAttempt && Date.now() - item.lastAttempt < 5000) continue;
+        if (item.lastAttempt && Date.now() - item.lastAttempt < 2000) continue;
         item.lastAttempt = Date.now();
         try {
           await rtc.sendEncryptedEnvelope(JSON.stringify({
@@ -272,6 +272,14 @@ export default function App() {
     } finally { flushingOutboxRef.current = false; }
 
   }, []);
+
+  useEffect(() => {
+    if (!session?.live) return;
+    const timer = setInterval(() => {
+      if (AppState.currentState === 'active') void flushOutbox();
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [session?.live, flushOutbox]);
 
   useEffect(() => {
     selectedRef.current = selected;

@@ -304,22 +304,17 @@ impl Store {
         validate_message_id(message_id)?;
         anyhow::ensure!(!ciphertext.is_empty() && ciphertext.len() <= 10 * 1024 * 1024, "invalid ciphertext size");
         let connection = self.connection().await?;
-        let conn = connection.transaction().await?;
+        let conn = connection.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await?;
         
         let recipient_uid = {
             let mut members = conn.query(
-                "SELECT uid FROM conversation_members WHERE conversation_id = ?1 AND uid <> ?2 LIMIT 2",
+                "SELECT other.uid FROM conversation_members other WHERE other.conversation_id = ?1 AND other.uid <> ?2 AND EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = ?1 AND mine.uid = ?2) LIMIT 2",
                 libsql::params![conversation_id.to_owned(), sender_uid.to_owned()],
             ).await?;
             let r: String = members.next().await?.ok_or_else(|| anyhow!("conversation not found or sender is not a member"))?.get(0)?;
             anyhow::ensure!(members.next().await?.is_none(), "group conversations are not enabled in this version");
             r
         };
-
-        {
-            let mut sender_member = conn.query("SELECT 1 FROM conversation_members WHERE conversation_id = ?1 AND uid = ?2", libsql::params![conversation_id.to_owned(), sender_uid.to_owned()]).await?;
-            anyhow::ensure!(sender_member.next().await?.is_some(), "sender is not a conversation member");
-        }
 
         let already_exists = {
             let mut existing = conn.query("SELECT sender_uid, conversation_id, ciphertext FROM messages WHERE message_id = ?1", libsql::params![message_id.to_owned()]).await?;
@@ -697,6 +692,9 @@ mod tests {
         let (recipient2, is_new2) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
         assert_eq!(recipient2, u2.uid);
         assert!(!is_new2, "Duplicate delivery attempt must NOT be marked as new");
+
+        let outsider = store.register("outsider_dup", "Outsider", "password123").await.unwrap().0;
+        assert!(store.save_ciphertext("msg_outsider_001", &conv_id, &outsider.uid, &ciphertext, Some(1)).await.is_err());
 
         let conflict_bytes = vec![0x33, 0x99, 0x88];
         let conflict_res = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &conflict_bytes, None).await;

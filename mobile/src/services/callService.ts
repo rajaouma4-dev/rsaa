@@ -15,6 +15,7 @@ export type CallStatus =
   | 'outgoing_calling'
   | 'outgoing_ringing'
   | 'incoming_ringing'
+  | 'connecting'
   | 'connected'
   | 'ended';
 
@@ -113,6 +114,7 @@ class CallService {
   private durationSec = 0;
   private durationTimer: any = null;
   private ringingTimeoutTimer: any = null;
+  private connectionGraceTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingCandidates: any[] = [];
   private remoteOfferSdp: string | null = null;
 
@@ -307,23 +309,12 @@ class CallService {
           });
         }
 
-        this.status = 'connected';
-        if (!this.durationTimer) {
-          this.startDurationTimer();
-        }
+        if (this.pc !== pc || this.currentCallId !== callId) return;
         this.notify();
       });
 
       // 6. Handle connection state changes
-      pc.addEventListener('connectionstatechange', () => {
-        if (pc.connectionState === 'connected') {
-          this.status = 'connected';
-          if (!this.durationTimer) {
-            this.startDurationTimer();
-          }
-          this.notify();
-        }
-      });
+      this.attachConnectionLifecycle(pc, callId);
 
       // 7. Create Offer & setLocalDescription with Opus low-latency optimization
       const offer = await pc.createOffer({
@@ -448,22 +439,11 @@ class CallService {
           });
         }
 
-        this.status = 'connected';
-        if (!this.durationTimer) {
-          this.startDurationTimer();
-        }
+        if (this.pc !== pc || this.currentCallId !== callId) return;
         this.notify();
       });
 
-      pc.addEventListener('connectionstatechange', () => {
-        if (pc.connectionState === 'connected') {
-          this.status = 'connected';
-          if (!this.durationTimer) {
-            this.startDurationTimer();
-          }
-          this.notify();
-        }
-      });
+      this.attachConnectionLifecycle(pc, callId);
 
       // 6. Set Remote Description from caller's offer
       await pc.setRemoteDescription(
@@ -493,8 +473,7 @@ class CallService {
         sdp: optimizedAnswerSdp,
       });
 
-      this.status = 'connected';
-      this.startDurationTimer();
+      if (pc.connectionState !== 'connected') this.status = 'connecting';
       this.notify();
     } catch (err) {
       console.warn('acceptCall failed:', err);
@@ -856,7 +835,31 @@ class CallService {
     }, 1000);
   }
 
+  private attachConnectionLifecycle(pc: RTCPeerConnection, callId: string): void {
+    pc.addEventListener('connectionstatechange', () => {
+      if (this.pc !== pc || this.currentCallId !== callId) return;
+      if (pc.connectionState === 'connected') {
+        if (this.connectionGraceTimer) clearTimeout(this.connectionGraceTimer);
+        this.connectionGraceTimer = null;
+        this.status = 'connected';
+        if (!this.durationTimer) this.startDurationTimer();
+        this.notify();
+      } else if (pc.connectionState === 'failed') {
+        this.endCall('Connection lost');
+      } else if (pc.connectionState === 'disconnected' && !this.connectionGraceTimer) {
+        this.connectionGraceTimer = setTimeout(() => {
+          this.connectionGraceTimer = null;
+          if (this.pc === pc && this.currentCallId === callId && pc.connectionState === 'disconnected') {
+            this.endCall('Connection lost');
+          }
+        }, 15000);
+      }
+    });
+  }
+
   private resetCall(reason?: string): void {
+    if (this.connectionGraceTimer) clearTimeout(this.connectionGraceTimer);
+    this.connectionGraceTimer = null;
     if (this.durationTimer) {
       clearInterval(this.durationTimer);
       this.durationTimer = null;
@@ -971,6 +974,7 @@ class CallService {
   private async processSignal(fromUid: string, payload: any): Promise<void> {
     if (!payload || typeof payload !== 'object') return;
 
+    if (this.status === 'ended' && this.currentCallId === payload.callId) return;
     const candidateKey = `${fromUid}:${payload.callId}`;
     for (const [key, entry] of this.earlyCandidates) {
       if (Date.now() - entry.at > 30000) this.earlyCandidates.delete(key);
@@ -1042,6 +1046,10 @@ class CallService {
       }
 
       case 'call_answer': {
+        // Signaling is delivered on WSS and DataChannel; an answer may arrive
+        // twice. Applying it again after reaching stable tears down a valid call.
+        if (this.pc?.signalingState !== 'have-local-offer' || !this.isCaller ||
+            this.remoteUser?.uid !== fromUid || typeof payload.sdp !== 'string') return;
         if (
           this.currentCallId === payload.callId &&
           this.pc &&
@@ -1066,8 +1074,7 @@ class CallService {
               } catch {}
             }
             this.pendingCandidates = [];
-            this.status = 'connected';
-            this.startDurationTimer();
+            if (this.pc.connectionState !== 'connected') this.status = 'connecting';
             this.notify();
           } catch (err) {
             console.warn('Failed to set remote answer description:', err);

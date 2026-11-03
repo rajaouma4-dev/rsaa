@@ -128,7 +128,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
               ? callState.status === 'outgoing_calling'
                 ? 'Calling...'
                 : 'Ringing...'
-              : formatDuration(callState.durationSec)}
+              : callState.status === 'connecting' ? 'Connecting media...' : formatDuration(callState.durationSec)}
           </Text>
 
           {/* Realtime Video Quality Toggle Pill */}
@@ -184,7 +184,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
                 ? '📱 Receiving Real-time Screen...'
                 : isCameraActive
                 ? '📷 Live Video Active'
-                : '📞 Encrypted Audio Call'}
+                : callState.callType === 'video' ? '📹 Encrypted Video Call' : '📞 Encrypted Audio Call'}
             </Text>
           </View>
         )}
