@@ -522,6 +522,13 @@ where
                     }
                 }
             }
+            ClientFrame::ChatThemes { id } => {
+                if current_user.is_none() { send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue; }
+                match store.chat_themes(id.as_deref()).await {
+                    Ok(themes) => signal_tx.send(ServerFrame::ChatThemes { themes }).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx, "THEMES_UNAVAILABLE", "Themes temporarily unavailable").await?,
+                }
+            }
             ClientFrame::Ping => {
                 if let Some(user) = current_user.as_ref() { crate::calls::CALLS.lock().await.touch(&user.uid); }
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
@@ -973,6 +980,13 @@ async fn handle_ws_client(
                     if owns_connection {
                         crate::webrtc_peer::sync_call_state(&user.uid, call_id.as_deref(), &channels, &live_signaling).await;
                     }
+                }
+            }
+            ClientFrame::ChatThemes { id } => {
+                if current_user.is_none() { send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue; }
+                match store.chat_themes(id.as_deref()).await {
+                    Ok(themes) => signal_tx.send(ServerFrame::ChatThemes { themes }).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx, "THEMES_UNAVAILABLE", "Themes temporarily unavailable").await?,
                 }
             }
             ClientFrame::Ping => {

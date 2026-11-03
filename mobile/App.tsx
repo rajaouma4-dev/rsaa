@@ -1268,6 +1268,11 @@ export default function App() {
         liveMode={session.live}
         rtcStatus={rtcStatus}
         onBack={() => { setSelected(null); selectedRef.current = null; }}
+        onLoadThemes={async id => {
+          if(!signalRef.current?.authenticated && !await ensureConnected()) throw Error('Offline');
+          const result=await signalRef.current!.request<{themes:any}>({type:'chat_themes',id:id||null},'chat_themes');
+          return result.themes;
+        }}
         onSend={sendMessage}
         onStartCall={(user, callType) => {
           void (async () => {

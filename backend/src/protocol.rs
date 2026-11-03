@@ -19,6 +19,7 @@ pub enum ClientFrame {
     CallSignal { to_uid: String, payload: serde_json::Value },
     CallState { call_id: Option<String> },
     DataFrame { payload: serde_json::Value },
+    ChatThemes { id: Option<String> },
     Ping,
 }
 
@@ -35,6 +36,7 @@ pub enum ServerFrame {
     PrekeysPublished,
     PrekeyBundle { uid: String, bundle: serde_json::Value },
     Error { code: String, message: String },
+    ChatThemes { themes: serde_json::Value },
     Pong,
     Answer { sdp: String },
     IceCandidate { candidate: serde_json::Value },

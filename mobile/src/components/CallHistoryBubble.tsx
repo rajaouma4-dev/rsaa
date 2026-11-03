@@ -1,5 +1,6 @@
 import React from 'react';
 import {View, Text, StyleSheet, Pressable} from 'react-native';
+import {ChatIcon} from './ChatIcon';
 import {CallDetails} from '../types';
 
 interface CallHistoryBubbleProps {
@@ -24,7 +25,7 @@ export function CallHistoryBubble({
     callDetails?.status === 'missed' && callDetails.isCaller;
   const isDeclined = callDetails?.status === 'declined';
   const isCompleted =
-    callDetails?.status === 'completed' || (!isMissed && !isNoAnswer && !isDeclined);
+    callDetails ? callDetails.status === 'completed' : (!isMissed && !isNoAnswer && !isDeclined);
 
   const durationText = callDetails?.durationFormatted || '0s';
   const callType = callDetails?.callType || 'audio';
@@ -74,9 +75,7 @@ export function CallHistoryBubble({
             isMissed && styles.iconCircleMissed,
             isCompleted && styles.iconCircleCompleted,
           ]}>
-          <Text style={styles.callIcon}>
-            {isVideo ? (isMissed ? '📹' : '📹') : (isMissed ? '📞' : '📞')}
-          </Text>
+          <ChatIcon name={isVideo?'camera':'phone'}/>
           {isMissed ? (
             <View style={styles.missedArrowBadge}>
               <Text style={styles.missedArrowText}>↙</Text>
@@ -126,7 +125,7 @@ export function CallHistoryBubble({
             styles.callBackBtnText,
             isMissed ? styles.callBackBtnTextMissed : styles.callBackBtnTextStandard,
           ]}>
-          {isVideo ? '📹 Call Back' : '📞 Call Back'}
+          {isMissed ? 'Call back' : 'Call again'}
         </Text>
       </Pressable>
     </View>
@@ -137,10 +136,10 @@ const styles = StyleSheet.create({
   cardContainer: {
     minWidth: 230,
     maxWidth: 290,
-    backgroundColor: '#18191a',
-    borderRadius: 18,
+    backgroundColor: '#1A2437',
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: '#3a3b3c',
+    borderColor: '#31415C',
     padding: 12,
     marginVertical: 4,
     shadowColor: '#000',
@@ -154,8 +153,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#1f1315',
   },
   cardCompleted: {
-    borderColor: 'rgba(59, 130, 246, 0.35)',
-    backgroundColor: '#131b26',
+    borderColor: 'rgba(167,139,250,0.22)',
+    backgroundColor: '#1A2437',
   },
   contentRow: {
     flexDirection: 'row',
@@ -261,9 +260,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   callBackBtnStandard: {
-    backgroundColor: 'rgba(59, 130, 246, 0.18)',
+    backgroundColor: 'rgba(167,139,250,0.14)',
     borderWidth: 1,
-    borderColor: 'rgba(59, 130, 246, 0.35)',
+    borderColor: 'rgba(167,139,250,0.22)',
   },
   callBackBtnMissed: {
     backgroundColor: 'rgba(239, 68, 68, 0.22)',
@@ -278,7 +277,7 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   callBackBtnTextStandard: {
-    color: '#60a5fa',
+    color: '#C5B5FF',
   },
   callBackBtnTextMissed: {
     color: '#fca5a5',

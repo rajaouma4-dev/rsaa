@@ -1,9 +1,11 @@
 import React, {useState, useEffect} from 'react';
 import {View, Text, Pressable, StyleSheet} from 'react-native';
+import {bubbleTextColor} from '../services/chatAppearance';
 import {VoiceNoteItem} from '../types';
 import {playVoiceNote, stopVoiceNote} from '../services/mediaBridge';
 
 interface VoiceBubbleProps {
+  bubbleColor?: string;
   voice: VoiceNoteItem;
   isMe: boolean;
   messageId: string;
@@ -13,6 +15,7 @@ interface VoiceBubbleProps {
 
 function VoiceBubbleComponent({
   voice,
+  bubbleColor,
   isMe,
   messageId,
   activePlayingId,
@@ -64,10 +67,10 @@ function VoiceBubbleComponent({
   const bars = [12, 18, 26, 14, 20, 28, 16, 22, 12, 18, 24, 15, 20, 10];
 
   return (
-    <View style={[styles.container, isMe ? styles.containerMe : styles.containerThem]}>
+    <View style={[styles.container, isMe ? [styles.containerMe,{backgroundColor:bubbleColor || '#7957E8'}] : styles.containerThem]}>
       {/* Play/Pause Button */}
       <Pressable onPress={togglePlay} style={styles.playBtn} hitSlop={10}>
-        <Text style={styles.playIcon}>{isPlaying ? '❚❚' : '▶'}</Text>
+        <Text style={[styles.playIcon,isMe&&bubbleColor?{color:bubbleTextColor(bubbleColor)}:null]}>{isPlaying ? '❚❚' : '▶'}</Text>
       </Pressable>
 
       {/* Waveform graphic */}
@@ -89,7 +92,7 @@ function VoiceBubbleComponent({
 
       {/* Duration / Timer */}
       <View style={styles.infoCol}>
-        <Text style={styles.timerText}>
+        <Text style={[styles.timerText,isMe&&bubbleColor?{color:bubbleTextColor(bubbleColor)}:null]}>
           {isPlaying ? formatSec(playbackSeconds) : formatSec(voice.durationSec || 0)}
         </Text>
         <Text style={styles.micBadge}>🎙</Text>

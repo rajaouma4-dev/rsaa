@@ -57,11 +57,25 @@ impl Store {
         Ok(conn)
     }
 
+    pub async fn chat_themes(&self, id: Option<&str>) -> Result<serde_json::Value> {
+        let conn = self.connection().await?;
+        if let Some(id) = id {
+            let mut rows = conn.query("SELECT id,name,version,data_uri FROM chat_theme_assets WHERE id=?1 AND enabled=1", [id]).await?;
+            let row = rows.next().await?.ok_or_else(|| anyhow!("Theme unavailable"))?;
+            return Ok(serde_json::json!({"id":row.get::<String>(0)?,"name":row.get::<String>(1)?,"version":row.get::<String>(2)?,"data_uri":row.get::<String>(3)?}));
+        }
+        let mut rows = conn.query("SELECT id,name,version FROM chat_theme_assets WHERE enabled=1 ORDER BY id", ()).await?;
+        let mut themes = Vec::new();
+        while let Some(row) = rows.next().await? { themes.push(serde_json::json!({"id":row.get::<String>(0)?,"name":row.get::<String>(1)?,"version":row.get::<String>(2)?})); }
+        Ok(serde_json::json!(themes))
+    }
+
     pub async fn migrate(&self) -> Result<()> {
         let conn = self.connection().await?;
         let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
         let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
         let statements = [
+            "CREATE TABLE IF NOT EXISTS chat_theme_assets (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, data_uri TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)",
             "CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL COLLATE NOCASE UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS user_profiles (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, display_name TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', avatar_url TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS devices (device_id TEXT PRIMARY KEY NOT NULL, uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, device_name TEXT NOT NULL DEFAULT 'Android Client', push_token TEXT, registered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",

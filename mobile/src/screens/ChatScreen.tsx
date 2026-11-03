@@ -11,7 +11,12 @@ import {
   ToastAndroid,
   ActivityIndicator,
   StatusBar,
+  Image,
+  Alert,
 } from 'react-native';
+import {ChatIcon} from '../components/ChatIcon';
+import {ChatAppearanceSheet} from '../components/ChatAppearanceSheet';
+import {Appearance,Wallpaper,DEFAULT_APPEARANCE,readAppearance,saveAppearance,loadWallpapers,cachedWallpapers,bubbleTextColor,bubbleEffect} from '../services/chatAppearance';
 import {Avatar} from '../components/Avatar';
 import {Chat, User, ChatMessage, MediaImageItem, VoiceNoteItem} from '../types';
 import {formatPresence, getMessageTimestamp} from '../utils/time';
@@ -53,6 +58,7 @@ export function ChatScreen({
   onBack,
   onSend,
   onStartCall,
+  onLoadThemes,
 }: {
   chat: Chat;
   liveMode: boolean;
@@ -60,8 +66,22 @@ export function ChatScreen({
   onBack: () => void;
   onSend: (content: any) => void;
   onStartCall?: (user: User, callType: 'audio' | 'video') => void;
+  onLoadThemes: (id?: string) => Promise<any>;
 }) {
   const [text, setText] = useState('');
+  const [appearance,setAppearance]=useState<Appearance>(DEFAULT_APPEARANCE);
+  const [wallpapers,setWallpapers]=useState<Wallpaper[]>([]);
+  const [appearanceOpen,setAppearanceOpen]=useState(false);
+  const [themesLoading,setThemesLoading]=useState(false);
+  const [themesError,setThemesError]=useState('');
+  useEffect(()=>{let active=true;setAppearance(DEFAULT_APPEARANCE);
+    void Promise.all([readAppearance(chat.id),cachedWallpapers()]).then(([value,assets])=>{if(active){setAppearance(value);setWallpapers(assets);}});
+    void loadWallpapers(onLoadThemes).then(assets=>{if(active)setWallpapers(assets);}).catch(()=>{});
+    return ()=>{active=false;};
+  },[chat.id]);
+  const refreshThemes=async()=>{setThemesLoading(true);setThemesError('');try{setWallpapers(await loadWallpapers(onLoadThemes));}catch{setThemesError('Offline — saved backgrounds are available');}finally{setThemesLoading(false);}};
+  const wallpaper=wallpapers.find(w=>w.id===appearance.wallpaper)?.data_uri;
+
   const [, setTick] = useState(0);
   const list = useRef<FlatList<ChatMessage>>(null);
 
@@ -342,14 +362,15 @@ export function ChatScreen({
                   isDownloading={downloadingAlbumId === item.id}
                 />
                 {item.text && !item.text.startsWith('📷') ? (
-                  <View style={[styles.captionBubble, isMe ? styles.bubbleMe : styles.bubbleThem]}>
-                    <Text style={styles.messageText}>{item.text}</Text>
+                  <View style={[styles.captionBubble, isMe ? [styles.bubbleMe,{backgroundColor:appearance.color,...bubbleEffect(appearance)}] : styles.bubbleThem]}>
+                    <Text style={[styles.messageText,isMe&&{color:bubbleTextColor(appearance.color)}]}>{item.text}</Text>
                   </View>
                 ) : null}
               </View>
             ) : hasVoice ? (
               // Voice Note Bubble with waveform & playback
               <VoiceBubble
+                bubbleColor={appearance.color}
                 voice={item.voice!}
                 isMe={isMe}
                 messageId={item.id}
@@ -361,7 +382,8 @@ export function ChatScreen({
               <View
                 style={[
                   styles.bubble,
-                  isMe ? styles.bubbleMe : styles.bubbleThem,
+                  isMe && {backgroundColor:appearance.color,...bubbleEffect(appearance)},
+                  isMe ? [styles.bubbleMe,{backgroundColor:appearance.color,...bubbleEffect(appearance)}] : styles.bubbleThem,
                   isMe
                     ? {
                         borderTopRightRadius: isFirstInGroup ? 18 : 6,
@@ -372,7 +394,7 @@ export function ChatScreen({
                         borderBottomLeftRadius: isLastInGroup ? 4 : 6,
                       },
                 ]}>
-                <Text style={styles.messageText}>{item.text}</Text>
+                <Text style={[styles.messageText,isMe&&{color:bubbleTextColor(appearance.color)}]}>{item.text}</Text>
               </View>
             )}
 
@@ -406,7 +428,8 @@ export function ChatScreen({
       style={styles.screen}
       behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}>
-      {/* Facebook Messenger Style Header */}
+      {wallpaper?<Image pointerEvents="none" source={{uri:wallpaper}} resizeMode="cover" style={[StyleSheet.absoluteFill,{opacity:0.18}]}/>:null}
+      {/* Conversation header */}
       <View style={styles.header}>
         <Pressable onPress={onBack} hitSlop={10} style={styles.backBtn}>
           <Text style={styles.backArrow}>‹</Text>
@@ -424,26 +447,25 @@ export function ChatScreen({
             {formatPresence(chat.user.online, chat.user.lastActive)}
           </Text>
         </View>
-        <View style={styles.headerBadge}>
-          <Text style={styles.badgeText}>
-            {liveMode ? `E2EE · ${rtcStatus.toUpperCase()}` : 'DEMO'}
-          </Text>
-        </View>
         <View style={styles.headerActions}>
           <Pressable
             onPress={() => onStartCall?.(chat.user, 'audio')}
+            accessibilityLabel="Start call"
             hitSlop={8}
             style={styles.headerCallBtn}>
-            <Text style={styles.headerCallIcon}>📞</Text>
+            <ChatIcon name="phone"/>
           </Pressable>
           <Pressable
             onPress={() => onStartCall?.(chat.user, 'video')}
+            accessibilityLabel="Start call"
             hitSlop={8}
             style={styles.headerCallBtn}>
-            <Text style={styles.headerCallIcon}>📹</Text>
+            <ChatIcon name="camera"/>
           </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Chat appearance" onPress={()=>{setAppearanceOpen(true);void refreshThemes();}} style={styles.headerCallBtn}><Text style={[styles.headerCallIcon,{color:'#BDA8FF',fontWeight:'800'}]}>⋯</Text></Pressable>
         </View>
       </View>
+      <View style={{alignItems:'center',paddingVertical:7}}><Text style={{color:'#96A6BF',fontSize:10,letterSpacing:.4}}>{liveMode ? (rtcStatus==='connected'?'Private conversation · Connected':'Connecting securely…'):'Preview conversation'}</Text></View>
 
       {/* Facebook Messenger Style Inverted Message List - naturally anchored to bottom at 0ms */}
       <FlatList
@@ -521,18 +543,20 @@ export function ChatScreen({
         <View style={styles.composerContainer}>
           {/* Gallery Pick Button */}
           <Pressable
+            accessibilityLabel="Send photos"
             onPress={handlePickPhotos}
             hitSlop={8}
             style={styles.composerActionBtn}>
-            <Text style={styles.actionIcon}>🖼️</Text>
+            <ChatIcon name="image"/>
           </Pressable>
 
           {/* Microphone Record Button */}
           <Pressable
+            accessibilityLabel="Record voice message"
             onPress={handleStartVoiceRecord}
             hitSlop={8}
             style={styles.composerActionBtn}>
-            <Text style={styles.actionIcon}>🎙️</Text>
+            <ChatIcon name="mic"/>
           </Pressable>
 
           {/* Text Input Pill */}
@@ -541,7 +565,7 @@ export function ChatScreen({
               editable={!isProcessingPhotos}
               value={text}
               onChangeText={setText}
-              placeholder={selectedPhotoUris.length > 0 ? 'Add a caption...' : 'Aa'}
+              placeholder={selectedPhotoUris.length > 0 ? 'Add a caption…' : 'Message…'}
               placeholderTextColor="#8A8D91"
               style={styles.input}
               multiline
@@ -554,6 +578,7 @@ export function ChatScreen({
             disabled={isProcessingPhotos || (selectedPhotoUris.length === 0 && !text.trim())}
             style={[
               styles.sendBtn,
+              {backgroundColor:appearance.color,...bubbleEffect(appearance)},
               (isProcessingPhotos || (selectedPhotoUris.length === 0 && !text.trim())) && styles.sendBtnDisabled,
             ]}>
             {isProcessingPhotos ? (
@@ -566,6 +591,7 @@ export function ChatScreen({
       )}
 
       {/* Fullscreen HD Image Viewer */}
+      {appearanceOpen?<ChatAppearanceSheet value={appearance} wallpapers={wallpapers} loading={themesLoading} error={themesError} onRetry={()=>{void refreshThemes();}} onClose={()=>setAppearanceOpen(false)} onSave={async value=>{await saveAppearance(chat.id,value);setAppearance(value);setAppearanceOpen(false);}}/>:null}
       <FullScreenViewer
         visible={viewerVisible}
         images={viewerImages}
@@ -583,7 +609,7 @@ const BOTTOM_INSET = Platform.OS === 'android' ? 16 : 10;
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#18191A',
+    backgroundColor: '#0C1220',
   },
   header: {
     paddingTop: TOP_INSET,
@@ -591,17 +617,17 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#242526',
+    backgroundColor: '#151E30',
     borderBottomWidth: 1,
-    borderBottomColor: '#393A3B',
-    gap: 10,
+    borderBottomColor: '#243149',
+    gap: 8,
   },
   backBtn: {
     paddingRight: 6,
     paddingVertical: 8,
   },
   backArrow: {
-    color: '#0084FF',
+    color: '#9D83FF',
     fontSize: 34,
     lineHeight: 34,
     fontWeight: '300',
@@ -611,7 +637,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   headerName: {
-    color: '#E4E6EB',
+    color: '#F2F5FC',
     fontSize: 16,
     fontWeight: '700',
   },
@@ -629,11 +655,11 @@ const styles = StyleSheet.create({
   headerBadge: {
     paddingHorizontal: 8,
     paddingVertical: 4,
-    backgroundColor: '#3A3B3C',
+    backgroundColor: '#243149',
     borderRadius: 12,
   },
   badgeText: {
-    color: '#E4E6EB',
+    color: '#F2F5FC',
     fontSize: 10,
     fontWeight: '700',
     letterSpacing: 0.5,
@@ -648,7 +674,7 @@ const styles = StyleSheet.create({
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: '#3A3B3C',
+    backgroundColor: '#243149',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -670,7 +696,7 @@ const styles = StyleSheet.create({
     color: '#8A8D91',
     fontSize: 11,
     fontWeight: '600',
-    backgroundColor: '#242526',
+    backgroundColor: '#151E30',
     paddingHorizontal: 10,
     paddingVertical: 3,
     borderRadius: 10,
@@ -707,12 +733,12 @@ const styles = StyleSheet.create({
     height: 28,
   },
   bubbleContainer: {
-    maxWidth: '75%',
+    maxWidth: '80%',
   },
   bubble: {
     paddingHorizontal: 14,
     paddingVertical: 10,
-    borderRadius: 18,
+    borderRadius: 22,
   },
   captionBubble: {
     paddingHorizontal: 12,
@@ -722,15 +748,15 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   bubbleMe: {
-    backgroundColor: '#0084FF',
+    backgroundColor: '#9D83FF',
   },
   bubbleThem: {
-    backgroundColor: '#303030',
+    backgroundColor: '#26344B',
   },
   messageText: {
     color: '#FFFFFF',
-    fontSize: 15,
-    lineHeight: 20,
+    fontSize: 16,
+    lineHeight: 23,
   },
   metaRow: {
     flexDirection: 'row',
@@ -767,7 +793,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   emptyTitle: {
-    color: '#E4E6EB',
+    color: '#F2F5FC',
     fontSize: 18,
     fontWeight: '700',
     marginTop: 8,
@@ -782,7 +808,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: '#242526',
+    backgroundColor: '#151E30',
     borderTopWidth: 1,
     borderTopColor: '#333333',
     paddingTop: 10,
@@ -820,25 +846,25 @@ const styles = StyleSheet.create({
   recordingActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: 8,
   },
   previewRecordBtn: {
     width: 34,
     height: 34,
     borderRadius: 17,
-    backgroundColor: '#3A3B3C',
+    backgroundColor: '#243149',
     alignItems: 'center',
     justifyContent: 'center',
   },
   previewRecordIcon: {
-    color: '#E4E6EB',
+    color: '#F2F5FC',
     fontSize: 14,
   },
   instantSendBtn: {
     width: 36,
     height: 36,
     borderRadius: 18,
-    backgroundColor: '#0084FF',
+    backgroundColor: '#9D83FF',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -854,9 +880,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingTop: 8,
     paddingBottom: 8 + BOTTOM_INSET,
-    backgroundColor: '#242526',
+    backgroundColor: '#151E30',
     borderTopWidth: 1,
-    borderTopColor: '#393A3B',
+    borderTopColor: '#243149',
     gap: 6,
   },
   composerActionBtn: {
@@ -874,7 +900,7 @@ const styles = StyleSheet.create({
   },
   inputPill: {
     flex: 1,
-    backgroundColor: '#3A3B3C',
+    backgroundColor: '#243149',
     borderRadius: 20,
     paddingHorizontal: 14,
     paddingVertical: Platform.OS === 'ios' ? 8 : 4,
@@ -883,7 +909,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   input: {
-    color: '#E4E6EB',
+    color: '#F2F5FC',
     fontSize: 15,
     padding: 0,
     maxHeight: 90,
@@ -892,7 +918,7 @@ const styles = StyleSheet.create({
     width: 38,
     height: 38,
     borderRadius: 19,
-    backgroundColor: '#0084FF',
+    backgroundColor: '#9D83FF',
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 1,

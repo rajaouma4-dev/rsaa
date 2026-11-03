@@ -1,0 +1,11 @@
+const fs=require('fs'),vm=require('vm'),ts=require('typescript'),assert=require('node:assert/strict');
+const data=new Map();const store={async getItem(k){return data.get(k)||null},async setItem(k,v){data.set(k,v)}};
+const ctx={exports:{},Date,require(){return {default:store}}};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync('src/services/chatAppearance.ts','utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,ctx);
+(async()=>{const api=ctx.exports;let calls=0;const fetch=async id=>{calls++;return id?{id,name:'Botanical',version:'1',data_uri:'data:image/jpeg;base64,/9j/'}:[{id:'botanical',name:'Botanical',version:'1'}]};
+await Promise.all([api.loadWallpapers(fetch),api.loadWallpapers(fetch)]);assert.equal(calls,2);
+await api.loadWallpapers(()=>{throw Error('Should use disk cache')});assert.equal(calls,2);
+await api.saveAppearance('a',{wallpaper:'botanical',color:'#1669D8',effect:'glow'});assert.equal((await api.readAppearance('a')).color,'#1669D8');assert.equal((await api.readAppearance('b')).color,'#7957E8');
+assert.equal(api.bubbleTextColor('#FFFFFF'),'#101828');assert.equal(api.bubbleTextColor('#000000'),'#FFFFFF');
+const catalog=JSON.parse(data.get('chat.wallpaper.catalog'));catalog.at=0;data.set('chat.wallpaper.catalog',JSON.stringify(catalog));await api.loadWallpapers(async()=>{throw Error('Offline')});assert.equal((await api.cachedWallpapers()).length,1);
+console.log('PASS: single-flight downloads, persistent offline wallpaper cache, per-chat preferences and readable bubble contrast');})().catch(e=>{console.error(e);process.exitCode=1});
