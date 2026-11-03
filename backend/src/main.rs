@@ -634,13 +634,16 @@ async fn handle_ws_client(
 
     // If Render port scanner, health check probe, or web browser sends a plain HTTP request
     if !is_ws_upgrade {
-        let body = b"{\"status\":\"ok\",\"service\":\"nexa-messenger-server\"}";
+        let body = serde_json::json!({
+            "status": "ok", "service": "nexa-messenger-server",
+            "build_revision": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "local".to_owned()),
+        }).to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.write_all(body).await;
+        let _ = stream.write_all(body.as_bytes()).await;
         let _ = stream.flush().await;
         return Ok(());
     }

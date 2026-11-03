@@ -164,9 +164,11 @@ export function ChatScreen({
     setIsProcessingPhotos(true);
     try {
       const processedList: MediaImageItem[] = [];
-      for (const uri of selectedPhotoUris) {
-        const item = await processImageAttachment(uri, isHd);
-        if (item) processedList.push(item);
+      // Two native decode jobs at a time reduces batch waiting while bounding memory.
+      for (let offset = 0; offset < selectedPhotoUris.length; offset += 2) {
+        const batch = await Promise.all(selectedPhotoUris.slice(offset, offset + 2)
+          .map(uri => processImageAttachment(uri, isHd)));
+        for (const item of batch) if (item) processedList.push(item);
       }
 
       if (processedList.length > 0) {

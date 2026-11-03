@@ -72,26 +72,27 @@ const AUDIO_CONSTRAINTS = {
 };
 
 function optimizeSdp(sdp: string): string {
-  let optimized = sdp;
-  if (optimized.includes('opus/48000')) {
-    const match = optimized.match(/a=rtpmap:(\d+)\s+opus\/48000/i);
-    if (match) {
-      const pt = match[1];
-      const fmtpRegex = new RegExp(`a=fmtp:${pt}\\s+([^\r\n]+)`, 'i');
-      if (fmtpRegex.test(optimized)) {
-        optimized = optimized.replace(
-          fmtpRegex,
-          `a=fmtp:${pt} $1;ptime=10;minptime=10;maxptime=20;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
-        );
-      } else {
-        optimized = optimized.replace(
-          `a=rtpmap:${pt} opus/48000/2`,
-          `a=rtpmap:${pt} opus/48000/2\r\na=fmtp:${pt} ptime=10;minptime=10;maxptime=20;useinbandfec=1;stereo=0;sprop-stereo=0;cbr=1;maxaveragebitrate=32000`,
-        );
+  // Merge Opus preferences once; preserve video and transport negotiation.
+  return sdp.split(/(?=^m=)/m).map(section => {
+    if (!section.startsWith('m=audio')) return section;
+    const opus = section.match(/^a=rtpmap:(\d+)\s+opus\/48000/mi);
+    if (!opus) return section;
+    const prefix = `a=fmtp:${opus[1]} `;
+    const lines = section.split(/\r?\n/);
+    const params = new Map<string, string>();
+    for (const line of lines.filter(value => value.startsWith(prefix))) {
+      for (const part of line.slice(prefix.length).split(';')) {
+        const split = part.indexOf('=');
+        if (split > 0) params.set(part.slice(0, split).trim().toLowerCase(), part.slice(split + 1).trim());
       }
     }
-  }
-  return optimized;
+    params.delete('ptime'); params.delete('maxptime');
+    for (const [key, value] of Object.entries({minptime: '10', useinbandfec: '1', usedtx: '1', stereo: '0', 'sprop-stereo': '0', cbr: '0', maxaveragebitrate: '32000'})) params.set(key, value);
+    const kept = lines.filter(line => line && !line.startsWith(prefix) && !/^a=(ptime|maxptime):/.test(line));
+    kept.push(prefix + [...params].map(([key, value]) => `${key}=${value}`).join(';'));
+    kept.push('a=ptime:10', 'a=maxptime:20', '');
+    return kept.join('\r\n');
+  }).join('');
 }
 
 class CallService {
@@ -110,7 +111,7 @@ class CallService {
   private isPeerScreenSharing = false;
   private screenStream: MediaStream | null = null;
   private originalCameraTrack: any = null;
-  private quality: CallQuality = 'hd';
+  private quality: CallQuality = 'sd';
   private durationSec = 0;
   private durationTimer: any = null;
   private ringingTimeoutTimer: any = null;
@@ -233,7 +234,7 @@ class CallService {
     this.isMicMuted = false;
     this.isCameraOff = callType === 'audio'; // Camera starts completely OFF for audio calls
     this.isFrontCamera = true;
-    this.quality = 'hd';
+    this.quality = 'sd';
     this.durationSec = 0;
     this.pendingCandidates = [];
     this.notify();
@@ -248,7 +249,7 @@ class CallService {
             facingMode: 'user',
             width: {ideal: 640, max: 1280},
             height: {ideal: 480, max: 720},
-            frameRate: {ideal: 30, max: 30},
+            frameRate: {ideal: 24, max: 30},
           },
         })) as MediaStream;
         this.isCameraOff = false;
@@ -323,6 +324,7 @@ class CallService {
       });
       const optimizedOfferSdp = optimizeSdp(offer.sdp || '');
       await pc.setLocalDescription(new RTCSessionDescription({type: 'offer', sdp: optimizedOfferSdp}));
+      if (callType === 'video') await this.setQuality(this.quality);
 
       // 8. Send call_invite with offer SDP to peer
       this.signalSender?.(remoteUser.uid, {
@@ -378,7 +380,7 @@ class CallService {
             facingMode: 'user',
             width: {ideal: 640, max: 1280},
             height: {ideal: 480, max: 720},
-            frameRate: {ideal: 30, max: 30},
+            frameRate: {ideal: 24, max: 30},
           },
         })) as MediaStream;
         this.isCameraOff = false;
@@ -465,6 +467,7 @@ class CallService {
       const answer = await pc.createAnswer();
       const optimizedAnswerSdp = optimizeSdp(answer.sdp || '');
       await pc.setLocalDescription(new RTCSessionDescription({type: 'answer', sdp: optimizedAnswerSdp}));
+      if (this.callType === 'video') await this.setQuality(this.quality);
 
       // 9. Send call_answer back to caller
       this.signalSender?.(this.remoteUser.uid, {

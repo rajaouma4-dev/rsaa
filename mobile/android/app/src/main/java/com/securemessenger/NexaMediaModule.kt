@@ -131,7 +131,7 @@ class NexaMediaModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 // 2. Decode full image with appropriate downsampling
-                val maxFullDim = if (isHd) 1920 else 1024
+                val maxFullDim = if (isHd) 1920 else 960
                 var sampleSize = 1
                 var w = origWidth
                 var h = origHeight
@@ -175,14 +175,14 @@ class NexaMediaModule(private val reactContext: ReactApplicationContext) :
                 fullStream.close()
 
                 // 3. Generate crisp high-DPI thumbnail for zero-lag chat rendering & razor-sharp bubble view
-                val maxThumbDim = 480
+                val maxThumbDim = 256
                 val thumbScale = min(1.0f, maxThumbDim.toFloat() / max(fullBitmap.width, fullBitmap.height))
                 val thumbWidth = (fullBitmap.width * thumbScale).toInt().coerceAtLeast(1)
                 val thumbHeight = (fullBitmap.height * thumbScale).toInt().coerceAtLeast(1)
 
                 val thumbBitmap = Bitmap.createScaledBitmap(fullBitmap, thumbWidth, thumbHeight, true)
                 val thumbStream = ByteArrayOutputStream()
-                thumbBitmap.compress(Bitmap.CompressFormat.JPEG, 75, thumbStream)
+                thumbBitmap.compress(Bitmap.CompressFormat.JPEG, 65, thumbStream)
                 val thumbBytes = thumbStream.toByteArray()
                 val thumbBase64 = "data:image/jpeg;base64," + Base64.encodeToString(thumbBytes, Base64.NO_WRAP)
                 thumbStream.close()

@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use async_trait::async_trait;
 use serde_json::json;
-use std::{collections::HashMap, sync::{Arc, LazyLock}};
-use tokio::{sync::mpsc, time::{sleep, Duration}};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, LazyLock}};
+use tokio::{sync::{mpsc, Semaphore}, time::{sleep, Duration}};
 use webrtc::{
     data_channel::{DataChannel, DataChannelEvent},
     peer_connection::{
@@ -20,6 +20,11 @@ use webrtc::{
 
 pub type LiveChannels = Arc<tokio::sync::RwLock<HashMap<String, Arc<dyn DataChannel>>>>;
 pub type LiveSignaling = Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<ServerFrame>>>>;
+
+// Large forwards run outside the message/receipt polling loop, with a strict
+// process-wide bound. The durable outbox retries when all slots are occupied.
+static MEDIA_IN_FLIGHT: LazyLock<tokio::sync::Mutex<HashSet<String>>> = LazyLock::new(|| tokio::sync::Mutex::new(HashSet::new()));
+static MEDIA_SEND_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
 static MESSAGE_SENDERS: LazyLock<tokio::sync::Mutex<HashMap<String, String>>> =
     LazyLock::new(|| tokio::sync::Mutex::new(HashMap::with_capacity(8192)));
@@ -113,10 +118,15 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
                                 total,
                                 data,
                             } => {
+                                if total == 0 || total > 1024 || index >= total || data.len() > 12 * 1024 || transfer_id.len() > 128 {
+                                    send_dc_error(&channel, "BAD_CHUNK", "invalid chunk bounds").await;
+                                    continue;
+                                }
+                                let chunk_key = format!("{uid}:{transfer_id}");
                                 let assembled = {
                                     let mut lock = INCOMING_CHUNKS.lock().await;
                                     if lock.len() > 1000 { lock.clear(); }
-                                    let entry = lock.entry(transfer_id.clone()).or_insert_with(|| (total, HashMap::new()));
+                                    let entry = lock.entry(chunk_key.clone()).or_insert_with(|| (total, HashMap::new()));
                                     entry.1.insert(index, data);
                                     if entry.1.len() == entry.0 {
                                         let mut full_string = String::new();
@@ -125,7 +135,7 @@ impl PeerConnectionEventHandler for ServerPeerHandler {
                                                 full_string.push_str(c);
                                             }
                                         }
-                                        lock.remove(&transfer_id);
+                                        lock.remove(&chunk_key);
                                         Some(full_string)
                                     } else {
                                         None
@@ -375,6 +385,24 @@ pub async fn handle_client_frame(
     }
 }
 
+async fn dispatch_channel_text(channel: Arc<dyn DataChannel>, text: String, message_id: &str) {
+    if text.len() <= 12 * 1024 {
+        send_safe_text(&channel, &text).await;
+        return;
+    }
+    let mut active = MEDIA_IN_FLIGHT.lock().await;
+    if active.contains(message_id) { return; }
+    let Ok(permit) = MEDIA_SEND_SLOTS.clone().try_acquire_owned() else { return; };
+    let message_id = message_id.to_owned();
+    active.insert(message_id.clone());
+    drop(active);
+    tokio::spawn(async move {
+        let _permit = permit;
+        send_safe_text(&channel, &text).await;
+        MEDIA_IN_FLIGHT.lock().await.remove(&message_id);
+    });
+}
+
 pub async fn send_safe_text(channel: &Arc<dyn DataChannel>, text: &str) {
     const CHUNK_SIZE: usize = 12 * 1024;
     if text.len() <= CHUNK_SIZE {
@@ -394,7 +422,7 @@ pub async fn send_safe_text(channel: &Arc<dyn DataChannel>, text: &str) {
             };
             if let Ok(msg) = serde_json::to_string(&frame) {
                 if channel.send_text(&msg).await.is_err() { break; }
-                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -416,7 +444,7 @@ pub async fn deliver_all_pending(db: &Store, channel: &Arc<dyn DataChannel>, uid
         if !claimed { continue; }
         let frame = DataChannelServerFrame::NewMessage { message: item.message.clone() };
         let Ok(text) = serde_json::to_string(&frame) else { continue; };
-        send_safe_text(channel, &text).await;
+        dispatch_channel_text(channel.clone(), text, &item.message.message_id).await;
     }
 }
 
@@ -434,7 +462,7 @@ async fn deliver_one(db: &Store, channels: &LiveChannels, recipient_uid: &str, m
         if !claimed { continue; }
         let frame = DataChannelServerFrame::NewMessage { message: item.message.clone() };
         if let Ok(text) = serde_json::to_string(&frame) {
-            send_safe_text(&receiver, &text).await;
+            dispatch_channel_text(receiver.clone(), text, &item.message.message_id).await;
         }
     }
 }
@@ -533,7 +561,11 @@ pub async fn send_to_user(
     let dc = { channels.read().await.get(uid).cloned() };
     if let Some(channel) = dc {
         if let Ok(text) = serde_json::to_string(frame) {
-            send_safe_text(&channel, &text).await;
+            if let DataChannelServerFrame::NewMessage { message } = frame {
+                dispatch_channel_text(channel, text, &message.message_id).await;
+            } else {
+                send_safe_text(&channel, &text).await;
+            }
             return;
         }
     }

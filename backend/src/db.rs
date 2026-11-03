@@ -98,6 +98,10 @@ impl Store {
         }
         // Create this index only after upgrading older outbox tables.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(recipient_uid, delivered_at, next_attempt_at)", ()).await?;
+        // Message and durable delivery event commit together, in one SQL statement.
+        conn.execute("CREATE TRIGGER IF NOT EXISTS messages_enqueue_delivery AFTER INSERT ON messages BEGIN INSERT INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES ('deliver:' || NEW.message_id, NEW.message_id, NEW.recipient_uid, CAST(strftime('%s', 'now') AS INTEGER)); END", ()).await?;
+        conn.execute("CREATE TRIGGER IF NOT EXISTS messages_finish_delivery AFTER UPDATE OF status ON messages WHEN NEW.status IN ('DELIVERED', 'SEEN') BEGIN UPDATE outbox SET delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE message_id = NEW.message_id AND recipient_uid = NEW.recipient_uid; END", ()).await?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_saved ON messages(sender_uid, saved_at)", ()).await?;
         Ok(())
     }
 
@@ -303,70 +307,30 @@ impl Store {
     pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8], msg_type: Option<u8>) -> Result<(String, bool)> {
         validate_message_id(message_id)?;
         anyhow::ensure!(!ciphertext.is_empty() && ciphertext.len() <= 10 * 1024 * 1024, "invalid ciphertext size");
-        let connection = self.connection().await?;
-        let conn = connection.transaction_with_behavior(libsql::TransactionBehavior::Immediate).await?;
-        
-        let recipient_uid = {
-            let mut members = conn.query(
-                "SELECT other.uid FROM conversation_members other WHERE other.conversation_id = ?1 AND other.uid <> ?2 AND EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = ?1 AND mine.uid = ?2) LIMIT 2",
-                libsql::params![conversation_id.to_owned(), sender_uid.to_owned()],
-            ).await?;
-            let r: String = members.next().await?.ok_or_else(|| anyhow!("conversation not found or sender is not a member"))?.get(0)?;
-            anyhow::ensure!(members.next().await?.is_none(), "group conversations are not enabled in this version");
-            r
-        };
-
-        let already_exists = {
-            let mut existing = conn.query("SELECT sender_uid, conversation_id, ciphertext FROM messages WHERE message_id = ?1", libsql::params![message_id.to_owned()]).await?;
-            if let Some(row) = existing.next().await? {
-                let old_sender: String = row.get(0)?;
-                let old_conversation: String = row.get(1)?;
-                let old_ciphertext: Vec<u8> = row.get(2)?;
-                anyhow::ensure!(old_sender == sender_uid && old_conversation == conversation_id && old_ciphertext == ciphertext,
-                    "message_id was already used with different content");
-                true
-            } else { false }
-        };
-
-        let mut is_new = false;
-        if !already_exists {
-            let recent_count: i64 = {
-                let mut recent = conn.query(
-                    "SELECT COUNT(*) FROM messages WHERE sender_uid = ?1 AND saved_at >= datetime('now', '-1 minute')",
-                    libsql::params![sender_uid.to_owned()],
-                ).await?;
-                recent.next().await?.ok_or_else(|| anyhow!("message quota check failed"))?.get(0)?
-            };
-            anyhow::ensure!(recent_count < 60, "message rate limit exceeded; try again shortly");
-            let created_at = if let Some(ts_str) = message_id.strip_prefix("m_").and_then(|rest| rest.split('_').next()) {
-                if let Ok(ts_ms) = ts_str.parse::<u64>() {
-                    if ts_ms > 100_000_000_000 {
-                        format!("{}", ts_ms / 1000)
-                    } else {
-                        now_epoch_string()
-                    }
-                } else {
-                    now_epoch_string()
-                }
-            } else {
-                now_epoch_string()
-            };
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status, msg_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'SAVED', ?7)",
-                libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), recipient_uid.clone(), ciphertext.to_vec(), created_at, msg_type.unwrap_or(0) as i64],
-            ).await?;
-            if inserted == 1 {
-                let event_id = format!("deliver:{message_id}");
-                // Next attempt is immediately eligible (now_seconds()) so delivery to newly connected
-                // recipients is instant via OnOpen flush or background worker.
-                let next_attempt = now_seconds();
-                conn.execute("INSERT OR IGNORE INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES (?1, ?2, ?3, ?4)",
-                    libsql::params![event_id, message_id.to_owned(), recipient_uid.clone(), next_attempt]).await?;
-                is_new = true;
-            }
+        let conn = self.connection().await?;
+        // Atomic conditional insert: authorization, one-to-one membership, quota
+        // and outbox creation execute inside SQLite, without remote read/write gaps.
+        let mut rows = conn.query(
+            "INSERT INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status, msg_type) SELECT ?1, ?2, ?3, other.uid, ?4, ?5, 'SAVED', ?6 FROM conversation_members other WHERE other.conversation_id = ?2 AND other.uid <> ?3 AND EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = ?2 AND mine.uid = ?3) AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?2) = 2 AND (SELECT COUNT(*) FROM messages WHERE sender_uid = ?3 AND saved_at >= datetime('now', '-1 minute')) < 60 ON CONFLICT(message_id) DO NOTHING RETURNING recipient_uid",
+            libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), ciphertext.to_vec(), now_epoch_string(), msg_type.unwrap_or(0) as i64],
+        ).await?;
+        if let Some(row) = rows.next().await? {
+            let recipient: String = row.get(0)?;
+            anyhow::ensure!(rows.next().await?.is_none(), "ambiguous recipient");
+            return Ok((recipient, true));
         }
-        conn.commit().await?;
-        Ok((recipient_uid, is_new))
+        drop(rows);
+        // Lost-ACK retries are idempotent, but an ID cannot replace prior content,
+        // message type, sender or conversation. Revalidate current membership.
+        let mut existing = conn.query(
+            "SELECT m.recipient_uid, m.ciphertext, m.msg_type FROM messages m WHERE m.message_id = ?1 AND m.sender_uid = ?2 AND m.conversation_id = ?3 AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = ?3 AND uid = ?2)",
+            libsql::params![message_id.to_owned(), sender_uid.to_owned(), conversation_id.to_owned()],
+        ).await?;
+        let row = existing.next().await?.ok_or_else(|| anyhow!("message rejected: membership, quota or conflicting message id"))?;
+        let prior: Vec<u8> = row.get(1)?;
+        let prior_type: i64 = row.get(2)?;
+        anyhow::ensure!(prior == ciphertext && prior_type == msg_type.unwrap_or(0) as i64, "message_id was already used with different content");
+        Ok((row.get(0)?, false))
     }
 
     /// Fast path: lookup recipient UID for a 1-on-1 conversation
@@ -453,28 +417,24 @@ impl Store {
 
     pub async fn mark_delivered(&self, message_id: &str, recipient_uid: &str) -> Result<Option<String>> {
         let conn = self.connection().await?;
-        let sender_uid = {
-            let mut rows = conn.query("SELECT sender_uid FROM messages WHERE message_id = ?1 AND recipient_uid = ?2", libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await?;
-            match rows.next().await? { Some(row) => row.get::<String>(0)?, None => return Ok(None) }
-        };
-        let _ = conn.execute("UPDATE outbox SET delivered_at = CURRENT_TIMESTAMP WHERE message_id = ?1 AND recipient_uid = ?2 AND delivered_at IS NULL",
-            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
-        let _ = conn.execute("UPDATE messages SET status = 'DELIVERED' WHERE message_id = ?1 AND recipient_uid = ?2 AND status = 'SAVED'",
-            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
-        Ok(Some(sender_uid))
+        let mut rows = conn.query(
+            "UPDATE messages SET status = CASE WHEN status = 'SEEN' THEN 'SEEN' ELSE 'DELIVERED' END WHERE message_id = ?1 AND recipient_uid = ?2 RETURNING sender_uid",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned()],
+        ).await?;
+        let sender = match rows.next().await? { Some(row) => Some(row.get::<String>(0)?), None => None };
+        let _ = rows.next().await?;
+        Ok(sender)
     }
 
     pub async fn mark_seen(&self, message_id: &str, recipient_uid: &str) -> Result<Option<String>> {
         let conn = self.connection().await?;
-        let sender_uid = {
-            let mut rows = conn.query("SELECT sender_uid FROM messages WHERE message_id = ?1 AND recipient_uid = ?2", libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await?;
-            match rows.next().await? { Some(row) => row.get::<String>(0)?, None => return Ok(None) }
-        };
-        let _ = conn.execute("UPDATE outbox SET delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE message_id = ?1 AND recipient_uid = ?2",
-            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
-        let _ = conn.execute("UPDATE messages SET status = 'SEEN' WHERE message_id = ?1 AND recipient_uid = ?2",
-            libsql::params![message_id.to_owned(), recipient_uid.to_owned()]).await;
-        Ok(Some(sender_uid))
+        let mut rows = conn.query(
+            "UPDATE messages SET status = 'SEEN' WHERE message_id = ?1 AND recipient_uid = ?2 RETURNING sender_uid",
+            libsql::params![message_id.to_owned(), recipient_uid.to_owned()],
+        ).await?;
+        let sender = match rows.next().await? { Some(row) => Some(row.get::<String>(0)?), None => None };
+        let _ = rows.next().await?;
+        Ok(sender)
     }
 
     pub async fn save_prekey_bundle(&self, uid: &str, bundle_json: &str) -> Result<()> {
@@ -705,6 +665,40 @@ mod tests {
         assert_eq!(pending[0].message.message_id, msg_id);
 
         let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[tokio::test]
+    async fn atomic_message_pipeline_and_receipts() {
+        let path = format!("target/test_pipeline_{}.db", Uuid::new_v4().simple());
+        let db = Builder::new_local(&path).build().await.unwrap();
+        let store = Store { db: Arc::new(db) };
+        store.migrate().await.unwrap();
+        let conn = store.connection().await.unwrap();
+        conn.execute_batch("INSERT INTO users(uid,username,display_name,password_hash) VALUES ('a','alice','Alice','test'),('b','bob','Bob','test'),('c','carol','Carol','test'); INSERT INTO conversations(conversation_id,pair_key,created_by) VALUES ('cv_atomic','a:b','a'); INSERT INTO conversation_members(conversation_id,uid) VALUES ('cv_atomic','a'),('cv_atomic','b');").await.unwrap();
+        let bytes = vec![0x33, 1, 2, 3];
+        assert!(store.save_ciphertext("atomic_msg_001", "cv_atomic", "a", &bytes, Some(1)).await.unwrap().1);
+        assert!(!store.save_ciphertext("atomic_msg_001", "cv_atomic", "a", &bytes, Some(1)).await.unwrap().1);
+        assert!(store.save_ciphertext("atomic_msg_001", "cv_atomic", "a", &bytes, Some(3)).await.is_err());
+        assert!(store.save_ciphertext("atomic_forged", "cv_atomic", "c", &bytes, Some(1)).await.is_err());
+        assert!(store.mark_seen("atomic_msg_001", "c").await.unwrap().is_none());
+        assert_eq!(store.mark_seen("atomic_msg_001", "b").await.unwrap(), Some("a".to_owned()));
+        store.mark_delivered("atomic_msg_001", "b").await.unwrap();
+        let mut rows = conn.query("SELECT m.status, o.delivered_at IS NOT NULL FROM messages m JOIN outbox o USING(message_id) WHERE message_id = 'atomic_msg_001'", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "SEEN");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        drop(row);
+        let _ = rows.next().await.unwrap();
+        drop(rows);
+        conn.execute("CREATE TRIGGER fail_test_outbox BEFORE INSERT ON outbox WHEN NEW.message_id = 'fail_atomic_001' BEGIN SELECT RAISE(ABORT, 'test outbox unavailable'); END", ()).await.unwrap();
+        assert!(store.save_ciphertext("fail_atomic_001", "cv_atomic", "a", &bytes, Some(1)).await.is_err());
+        let mut rows = conn.query("SELECT COUNT(*) FROM messages WHERE message_id = 'fail_atomic_001'", ()).await.unwrap();
+        assert_eq!(rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 0);
+        drop(rows);
+        conn.execute_batch("WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<59) INSERT INTO messages(message_id,conversation_id,sender_uid,recipient_uid,ciphertext,created_at,msg_type) SELECT 'quota_' || x,'cv_atomic','a','b',X'33010203','1',1 FROM seq;").await.unwrap();
+        let quota_error = store.save_ciphertext("quota_blocked_001", "cv_atomic", "a", &bytes, Some(1)).await.unwrap_err();
+        assert!(quota_error.to_string().contains("quota"), "unexpected error: {quota_error}");
+        assert!(!store.save_ciphertext("atomic_msg_001", "cv_atomic", "a", &bytes, Some(1)).await.unwrap().1);
     }
 
     #[test]

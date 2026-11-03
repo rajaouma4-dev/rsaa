@@ -9,6 +9,7 @@ import {clearDemoSession, clearLiveSession, readDemoSession, readLiveSession, sa
 import {APP_CONFIG, isLiveConfigReady, refreshTurnCredentials} from './src/config';
 import {TlsSignalingClient} from './src/services/signaling';
 import {ServerDataChannel, RtcStatus} from './src/services/rtc';
+import {advanceMessageStatus} from './src/services/messageStatus';
 import {e2eeService, RemotePreKeyBundle} from './src/services/e2ee';
 import {
   getLocalMessages,
@@ -249,27 +250,31 @@ export default function App() {
     ciphertextB64: string;
     msgType?: number;
     lastAttempt?: number;
+    sending?: boolean;
   }[]>([]);
-  const flushingOutboxRef = useRef(false);
+
 
   const flushOutbox = useCallback(async () => {
     if (outboxRef.current.length === 0) return;
     const rtc = rtcRef.current;
-    if (!rtc?.isOpen || flushingOutboxRef.current) return;
-    flushingOutboxRef.current = true;
-    try {
-      for (const item of [...outboxRef.current]) {
-        if (item.lastAttempt && Date.now() - item.lastAttempt < 2000) continue;
-        item.lastAttempt = Date.now();
+    if (!rtc?.isOpen) return;
+    const pending: Promise<void>[] = [];
+    for (const item of [...outboxRef.current]) {
+      if (item.sending || (item.lastAttempt && Date.now() - item.lastAttempt < 2000)) continue;
+      item.sending = true;
+      pending.push((async () => {
         try {
           await rtc.sendEncryptedEnvelope(JSON.stringify({
             type: 'send_message', message_id: item.messageId,
             conversation_id: item.conversationId, recipient_uid: item.recipientUid,
             ciphertext_b64: item.ciphertextB64, msg_type: item.msgType,
           }));
-        } catch { item.lastAttempt = undefined; break; }
-      }
-    } finally { flushingOutboxRef.current = false; }
+          item.lastAttempt = Date.now();
+        } catch { item.lastAttempt = undefined; }
+        finally { item.sending = false; }
+      })());
+    }
+    await Promise.all(pending);
 
   }, []);
 
@@ -305,11 +310,11 @@ export default function App() {
         }
         setChats(current => current.map(item => ({
           ...item,
-          messages: item.messages.map(message => message.id === msgId ? {...message, status: nextStatus as 'saved' | 'delivered' | 'seen'} : message),
+          messages: item.messages.map(message => message.id === msgId ? {...message, status: advanceMessageStatus(message.status, nextStatus)} : message),
         })));
         setSelected(current => current ? ({
           ...current,
-          messages: current.messages.map(message => message.id === msgId ? {...message, status: nextStatus as 'saved' | 'delivered' | 'seen'} : message),
+          messages: current.messages.map(message => message.id === msgId ? {...message, status: advanceMessageStatus(message.status, nextStatus)} : message),
         }) : current);
       } else if (envelope.type === 'presence_update' && envelope.uid && typeof envelope.online === 'boolean') {
         const targetUid = envelope.uid;
@@ -568,6 +573,7 @@ export default function App() {
   }, []);
 
   const reconnectingRef = useRef(false);
+  const lastInboxPollRef = useRef(0);
 
   const ensureConnected = useCallback(async (): Promise<boolean> => {
     if (!session?.live) return false;
@@ -658,7 +664,11 @@ export default function App() {
         if (!sig || !sig.connected || !sig.authenticated || !rtcRef.current?.isOpen) {
           void ensureConnected();
         } else {
-          // Poll presence / conversation updates to keep online status live
+          // Presence and new conversations arrive via push; reconcile less often
+          // so list queries do not queue ahead of call setup on the same socket.
+          if (Date.now() - lastInboxPollRef.current < 30000) return;
+          lastInboxPollRef.current = Date.now();
+          // Periodic inbox reconciliation
           sig.request<{conversations?: InboxConversation[]}>({type: 'list_conversations'}, 'conversations', 3000)
             .then(async inbox => {
               if (inbox?.conversations) {

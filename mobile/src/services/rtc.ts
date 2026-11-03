@@ -5,6 +5,7 @@ import {
 } from 'react-native-webrtc';
 import {APP_CONFIG} from '../config';
 import {TlsSignalingClient} from './signaling';
+import {DataChannelWriter} from './dataChannelWriter';
 
 type RTCDataChannel = ReturnType<RTCPeerConnection['createDataChannel']>;
 
@@ -45,6 +46,7 @@ function parseCandidateType(candStr: string): CandidateType {
 export class ServerDataChannel {
   private pc: RTCPeerConnection;
   private channel?: RTCDataChannel;
+  private writer?: DataChannelWriter;
   private onPacket?: (packet: string) => void;
   private onStatus?: (status: RtcStatus) => void;
   private pendingRemoteCandidates: any[] = [];
@@ -134,8 +136,9 @@ export class ServerDataChannel {
       }
     }, 15000);
 
-    this.channel = this.pc.createDataChannel('nexa-control', {ordered: true});
+    this.channel = this.pc.createDataChannel('nexa-control', {ordered: false});
     this.channel.onopen = () => {
+      this.writer = new DataChannelWriter(this.channel!);
       if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
       this.onStatus?.('connected');
       void this.getSelectedCandidatePair();
@@ -346,30 +349,13 @@ export class ServerDataChannel {
       throw new Error('Only an E2EE ciphertext envelope can be sent');
     }
 
-    const CHUNK_SIZE = 12 * 1024;
-    if (envelope.length <= CHUNK_SIZE) {
-      this.channel.send(envelope);
-    } else {
-      const transferId = 'cli_' + Math.random().toString(36).substring(2, 9) + Date.now().toString(36);
-      const total = Math.ceil(envelope.length / CHUNK_SIZE);
-      for (let i = 0; i < total; i++) {
-        const chunkData = envelope.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
-        const chunkFrame = JSON.stringify({
-          type: 'chunk',
-          transfer_id: transferId,
-          index: i,
-          total,
-          data: chunkData,
-        });
-        this.channel.send(chunkFrame);
-        if (total > 4 && i % 3 === 0) {
-          await new Promise<void>(resolve => setTimeout(() => resolve(), 2));
-        }
-      }
-    }
+    if (!this.writer) throw new Error('DataChannel writer is unavailable');
+    await this.writer.send(envelope);
   }
 
   private cleanupPeer(): void {
+    this.writer?.close();
+    this.writer = undefined;
     if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
     if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     this.incomingChunks.forEach(item => clearTimeout(item.timer));

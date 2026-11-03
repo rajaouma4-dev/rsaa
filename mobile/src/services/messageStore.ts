@@ -1,5 +1,6 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {ChatMessage} from '../types';
+import {advanceMessageStatus} from './messageStatus';
 import {getMessageTimestamp} from '../utils/time';
 
 const MSG_PREFIX = 'nexa.chat.messages.v2.';
@@ -78,7 +79,7 @@ export async function updateLocalMessageStatus(
     const updated = current.map(m => {
       if (m.id === messageId && m.status !== status) {
         changed = true;
-        return {...m, status};
+        return {...m, status: advanceMessageStatus(m.status, status)};
       }
       return m;
     });
