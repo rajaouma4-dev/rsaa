@@ -43,6 +43,7 @@ async fn connect(uid: String, store: Store, channels: webrtc_peer::LiveChannels,
     let dc = pc.create_data_channel("nexa", None).await?;
     let offer = pc.create_offer(None).await?;
     pc.set_local_description(offer).await?;
+    if let Ok(path) = env::var("NEXA_SDP_PROBE") { std::fs::write(path, &pc.local_description().await.unwrap().sdp)?; }
     let (signal_tx, mut signal_rx) = mpsc::channel(256);
     let (server, answer) = webrtc_peer::build_answerer(uid, store, channels, signals, signal_tx,
         pc.local_description().await.unwrap().sdp, Vec::new()).await?;

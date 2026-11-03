@@ -431,7 +431,18 @@ where
                         current_peer = Some(peer);
                         signal_tx.send(ServerFrame::Answer { sdp: answer_sdp }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                     }
-                    Err(err) => send_error(&signal_tx, "WEBRTC_NEGOTIATION_FAILED", &safe_error(&err)).await?,
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "WebRTC negotiation failed");
+                        let stage = match err.to_string().as_str() {
+                            "build WebRTC peer" => "peer configuration",
+                            "parse client SDP" => "offer parsing",
+                            "apply client SDP" => "remote description",
+                            "create WebRTC answer" => "answer generation",
+                            "apply local SDP" => "local description",
+                            _ => "negotiation",
+                        };
+                        send_error(&signal_tx, "WEBRTC_NEGOTIATION_FAILED", &format!("WebRTC failed at {stage}")).await?;
+                    },
                 }
             }
             ClientFrame::CallSignal { to_uid, payload } => {
@@ -603,6 +614,11 @@ async fn handle_ws_client(
     if !is_ws_upgrade {
         let body = serde_json::json!({
             "status": "ok", "service": "nexa-messenger-server",
+            "ice_urls": {
+                "count": ice_urls.len(),
+                "stun": ice_urls.iter().filter(|url| url.starts_with("stun:") || url.starts_with("stuns:")).count(),
+                "turn": ice_urls.iter().filter(|url| url.starts_with("turn:") || url.starts_with("turns:")).count()
+            },
             "build_revision": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "local".to_owned()),
         }).to_string();
         let response = format!(
@@ -859,7 +875,18 @@ async fn handle_ws_client(
                         current_peer = Some(peer);
                         signal_tx.send(ServerFrame::Answer { sdp: answer_sdp }).await.map_err(|_| anyhow!("signaling writer closed"))?;
                     }
-                    Err(err) => send_error(&signal_tx, "WEBRTC_NEGOTIATION_FAILED", &safe_error(&err)).await?,
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "WebRTC negotiation failed");
+                        let stage = match err.to_string().as_str() {
+                            "build WebRTC peer" => "peer configuration",
+                            "parse client SDP" => "offer parsing",
+                            "apply client SDP" => "remote description",
+                            "create WebRTC answer" => "answer generation",
+                            "apply local SDP" => "local description",
+                            _ => "negotiation",
+                        };
+                        send_error(&signal_tx, "WEBRTC_NEGOTIATION_FAILED", &format!("WebRTC failed at {stage}")).await?;
+                    },
                 }
             }
             ClientFrame::CallSignal { to_uid, payload } => {

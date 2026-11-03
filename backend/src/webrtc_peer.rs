@@ -573,10 +573,10 @@ pub async fn build_answerer(
         .with_udp_addrs(vec!["0.0.0.0:0"])
         .with_data_channel_send_buffer_limit(256 * 1024)
         .build().await.context("build WebRTC peer")?;
-    let offer = RTCSessionDescription::offer(offer_sdp)?;
-    peer.set_remote_description(offer).await?;
-    let answer = peer.create_answer(None).await?;
-    peer.set_local_description(answer).await?;
+    let offer = RTCSessionDescription::offer(offer_sdp).context("parse client SDP")?;
+    peer.set_remote_description(offer).await.context("apply client SDP")?;
+    let answer = peer.create_answer(None).await.context("create WebRTC answer")?;
+    peer.set_local_description(answer).await.context("apply local SDP")?;
     let local = peer.local_description().await.context("local SDP unavailable")?;
     Ok((Arc::new(peer), local.sdp))
 }
