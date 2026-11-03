@@ -339,6 +339,7 @@ export function ChatScreen({
           <View style={styles.bubbleContainer}>
             {hasCall ? (
               <CallHistoryBubble
+                uid={chat.user.id} name={chat.user.name}
                 callDetails={item.callDetails}
                 fallbackText={item.text}
                 time={messageTime}

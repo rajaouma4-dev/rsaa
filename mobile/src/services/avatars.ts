@@ -36,5 +36,5 @@ export async function loadAvatar(uid:string):Promise<void>{
    installAvatar({...result,data_uri:uri});
   }catch{/* Cached photo/initials remain available; a reconnect or remount retries. */}
  })();pending.set(uid,job);
- try{await job;}finally{pending.delete(uid);if(stale&&listeners.get(uid)?.size){checked.delete(uid);void loadAvatar(uid);}}
+ try{await job;}finally{pending.delete(uid);if(stale&&records.get(uid)?.version!==desired.get(uid)&&listeners.get(uid)?.size){checked.delete(uid);void loadAvatar(uid);}}
 }

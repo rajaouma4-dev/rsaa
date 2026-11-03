@@ -1,3 +1,9 @@
+# Current profile-photo update — 4 November 2026
+
+Version 1.0.8 (code 9) adds compact persistent profile photos and realtime version notifications. Photo change/remove, cache, restart persistence, remote chat/message/call-history avatars, People and incoming-call photo were verified. A 501 KB test artwork uploaded as a 7,102-byte thumbnail. Server feature `accea37` was verified live. See [profile-photo validation](docs/PROFILE_PHOTO_VALIDATION.md) for exact evidence, limits and APK hash. New APK is required on each client to display photos.
+
+---
+
 # Current chat design — 4 November 2026
 
 Version 1.0.7 (code 8) adds the redesigned conversation/composer/call cards and database-backed wallpapers with persistent caching. Overflow menu offers Background and Bubble color, live preview, hex presets and solid/gradient/glow effects. Four supplied images are stored in Turso. Theme loading, saved appearance after restart and text delivery were verified on the updated app. See [chat appearance validation](docs/CHAT_APPEARANCE_VALIDATION.md) for exact tests, screenshots and APK hash. Preferences apply to this chat on this device.

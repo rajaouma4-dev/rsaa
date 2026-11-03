@@ -1,9 +1,11 @@
 import React from 'react';
 import {View, Text, StyleSheet, Pressable} from 'react-native';
+import {Avatar} from './Avatar';
 import {ChatIcon} from './ChatIcon';
 import {CallDetails} from '../types';
 
 interface CallHistoryBubbleProps {
+  uid?:string; name?:string;
   callDetails?: CallDetails;
   fallbackText?: string;
   time: string;
@@ -13,6 +15,7 @@ interface CallHistoryBubbleProps {
 
 export function CallHistoryBubble({
   callDetails,
+  uid, name,
   fallbackText,
   time,
   isMe,
@@ -75,7 +78,7 @@ export function CallHistoryBubble({
             isMissed && styles.iconCircleMissed,
             isCompleted && styles.iconCircleCompleted,
           ]}>
-          <ChatIcon name={isVideo?'camera':'phone'}/>
+          {uid?<Avatar uid={uid} name={name||'Contact'} size={44}/>:<ChatIcon name={isVideo?'camera':'phone'}/>}
           {isMissed ? (
             <View style={styles.missedArrowBadge}>
               <Text style={styles.missedArrowText}>↙</Text>

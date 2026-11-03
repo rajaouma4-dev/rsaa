@@ -58,3 +58,8 @@ The backend cannot verify that `ciphertext_b64` contains genuine E2EE ciphertext
 ## Call state reconciliation (1.0.6)
 
 Authenticated signaling clients report `{"type":"call_state","call_id":null}` immediately after authentication and alongside their heartbeat when they have no live call. An active/ringing/connecting call reports its call ID. Only the currently registered connection for the authenticated UID may reconcile that UID's reservation. An answered reservation that disagrees with actual client state is released and its peer receives `call_end`. An idle callee cannot cancel a newly queued, unanswered invite with a racing heartbeat. Ordinary pings cannot revive an already expired reservation.
+
+
+## Profile photo frames (1.0.8)
+
+Authenticated client: `get_avatar` with `uid` and optional cached `version`; response `avatar` has uid, version and nullable data_uri. Unchanged versions omit image bytes. `set_avatar` accepts a JPEG data URI capped at 16,000 decoded bytes and 256 pixels per edge, or null to remove. The authenticated UID alone determines the account written. Response is `avatar_saved` with uid/version; connected clients receive lightweight `avatar_changed` with uid/version and fetch only if needed. Photos are public profile metadata, not chat message content.
