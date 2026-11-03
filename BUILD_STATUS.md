@@ -1,3 +1,9 @@
+# Current call UI update — 4 November 2026
+
+Version 1.0.5 (code 6) adds the user's purple call design with draggable local-camera preview, retaining existing call controls. Chat UI is unchanged. Release APK build, signature and typecheck passed; all three existing test emulators were updated. Live audio-call UI and preview movement were observed. A fresh final-build video test was interrupted by MuMu graphics termination (error 901), so full video rendering/quality is not certified. See [call UI validation](docs/CALL_UI_VALIDATION.md) for exact evidence, APK hash and remaining checks.
+
+---
+
 # Continuation verification — 4 November 2026
 
 - Re-read the interrupted chat and retained the unfinished account-scoping changes. Version 1.0.4 (code 5) is being validated locally.

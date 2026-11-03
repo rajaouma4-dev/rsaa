@@ -64,6 +64,7 @@ jobs:
           node test-low-latency.cjs
           node test-realtime-reliability.cjs
           node test-call-multi-user.cjs
+          node test-call-preview.cjs
       - name: Build release APK
         working-directory: mobile/android
         run: |
