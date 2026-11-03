@@ -102,7 +102,7 @@ export function CallHistoryBubble({
                 <Text style={styles.durationPillText}>{durationText}</Text>
               </View>
             ) : (
-              <Text style={[styles.subText, isMissed && styles.subTextMissed]}>
+              <Text numberOfLines={2} style={[styles.subText, isMissed && styles.subTextMissed]}>
                 {subtitle}
               </Text>
             )}
@@ -200,6 +200,7 @@ const styles = StyleSheet.create({
   },
   infoCol: {
     flex: 1,
+    minWidth: 0,
     justifyContent: 'center',
   },
   callTitle: {
@@ -216,6 +217,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   subText: {
+    flexShrink: 1,
     color: '#b0b3b8',
     fontSize: 12,
     fontWeight: '500',
@@ -246,6 +248,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   timeText: {
+    flexShrink: 0,
     color: '#8a8d91',
     fontSize: 11,
     fontWeight: '500',
