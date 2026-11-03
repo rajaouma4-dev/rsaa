@@ -27,6 +27,8 @@ if "attempts" not in cols:
 if "next_attempt_at" not in cols:
     con.execute("ALTER TABLE outbox ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0")
 con.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(recipient_uid, delivered_at, next_attempt_at)")
+if "msg_type" not in {row[1] for row in con.execute("PRAGMA table_info(messages)")}:
+    con.execute("ALTER TABLE messages ADD COLUMN msg_type INTEGER NOT NULL DEFAULT 0")
 
 # Seed two accounts and create their conversation using the same SQL constraints.
 con.execute("INSERT INTO users(uid, username, display_name, password_hash) VALUES ('u_a','alice','Alice','x')")
@@ -85,7 +87,7 @@ con.execute("INSERT INTO messages(message_id,conversation_id,sender_uid,recipien
             ("msg_0002", "cv_1", "u_a", "u_b", b"cipher2", "1790000001"))
 con.execute("INSERT INTO messages(message_id,conversation_id,sender_uid,recipient_uid,ciphertext,created_at) VALUES (?,?,?,?,?,?)",
             ("msg_0003", "cv_1", "u_a", "u_b", b"cipher3", "1790000001"))
-history_sql = re.search(r'"(SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status FROM messages WHERE conversation_id = \?1.*?LIMIT \?2)"', DB_RS).group(1)
+history_sql = re.search(r'"(SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status, msg_type FROM messages WHERE conversation_id = \?1.*?LIMIT \?2)"', DB_RS).group(1)
 history_rows = con.execute(history_sql, ("cv_1", 10, "msg_0003")).fetchall()
 assert [row[0] for row in reversed(history_rows)] == ["msg_0001", "msg_0002"]
 

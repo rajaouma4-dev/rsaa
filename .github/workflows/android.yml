@@ -20,7 +20,6 @@ jobs:
       - name: Compile and test Rust backend
         working-directory: backend
         run: |
-          cargo generate-lockfile
           cargo check --locked
           cargo test --locked
   android:
@@ -34,16 +33,19 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Install Android SDK packages
         run: |
           yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platform-tools" "platforms;android-37" "build-tools;37.0.0"
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;27.0.12077973"
       - name: Generate native Android shell
         run: bash scripts/bootstrap-native.sh
       - name: Install mobile dependencies
         working-directory: mobile
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: Validate project SQL and TypeScript syntax
         run: |
           node scripts/validate-typescript.cjs
@@ -53,7 +55,9 @@ jobs:
         run: npm run typecheck
       - name: Build release APK
         working-directory: mobile/android
-        run: ./gradlew --no-daemon clean assembleRelease
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --max-workers=2 assembleRelease
       - uses: actions/upload-artifact@v4
         with:
           name: nexa-chat-release-apk
