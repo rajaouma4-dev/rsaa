@@ -529,6 +529,7 @@ export default function App() {
         if (cancelled) { bootSignal.close(); return; }
         outboxRef.current = await DurableOutbox.open(result.uid);
         signalRef.current = bootSignal;
+        await e2eeService.setAccount(result.uid, true);
         await publishPrekeys(bootSignal);
         bootRtc = createRealtime(bootSignal);
         rtcRef.current = bootRtc;
@@ -548,6 +549,7 @@ export default function App() {
           try { outboxRef.current = await DurableOutbox.open(saved.uid); } catch (queueError) { console.warn('Outgoing queue restore failed:', queueError); }
           signalRef.current = null;
           rtcRef.current = null;
+          await e2eeService.setAccount(saved.uid, true);
           setSession({...saved, live: true});
           setRtcStatus('disconnected');
         } else {
@@ -1172,6 +1174,7 @@ export default function App() {
 
       outboxRef.current = await DurableOutbox.open(result.uid);
       signalRef.current = pendingSignal;
+      await e2eeService.setAccount(result.uid);
       await publishPrekeys(pendingSignal);
       const rtc = createRealtime(pendingSignal);
       rtcRef.current = rtc;

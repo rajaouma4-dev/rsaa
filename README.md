@@ -1,5 +1,7 @@
 # Nexa Chat — React Native + Rust + WebRTC + Turso
 
+> Status note (4 November 2026): the setup/implementation overview below is historical and contains outdated claims about disabled relay, demo mode and unavailable build tools. Read [BUILD_STATUS.md](BUILD_STATUS.md) and [docs/LIVE_DEPLOYMENT_TEST.md](docs/LIVE_DEPLOYMENT_TEST.md) for current tested behavior and remaining limitations.
+
 বাংলা setup: [`START_HERE_BN.md`](START_HERE_BN.md) · বাস্তব build/test status: [`BUILD_STATUS.md`](BUILD_STATUS.md)
 
 This is a development source project, **not yet a production secure messenger and not an installable APK**. The repository contains a React Native Android-first UI, a Rust TLS/WebRTC backend, Turso schema/connection code, DataChannel/outbox logic, validation scripts and a CI workflow.

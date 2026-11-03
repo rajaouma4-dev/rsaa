@@ -54,12 +54,13 @@ export interface EncryptedMessagePayload {
 }
 
 class SignalProtocolStore implements libsignal.StorageType {
+  constructor(private readonly prefix = STORAGE_PREFIX, private readonly identityService = KEYCHAIN_SERVICE) {}
   private inMemorySessions = new Map<string, string>();
   private trustedIdentities = new Map<string, string | null>();
 
   async getIdentityKeyPair(): Promise<libsignal.KeyPairType | undefined> {
     try {
-      const credentials = await Keychain.getGenericPassword({service: KEYCHAIN_SERVICE});
+      const credentials = await Keychain.getGenericPassword({service: this.identityService});
       if (!credentials) return undefined;
       const parsed = JSON.parse(credentials.password);
       return {
@@ -77,19 +78,19 @@ class SignalProtocolStore implements libsignal.StorageType {
       privKey: arrayBufferToBase64(keyPair.privKey),
     });
     const result = await Keychain.setGenericPassword('identity', payload, {
-      service: KEYCHAIN_SERVICE,
+      service: this.identityService,
       accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
     });
     if (!result) throw new Error('Cannot persist Signal identity securely');
   }
 
   async getLocalRegistrationId(): Promise<number | undefined> {
-    const raw = await secureStore.getItem(STORAGE_PREFIX + 'registration_id');
+    const raw = await secureStore.getItem(this.prefix + 'registration_id');
     return raw ? parseInt(raw, 10) : undefined;
   }
 
   async saveLocalRegistrationId(regId: number): Promise<void> {
-    await secureStore.setItem(STORAGE_PREFIX + 'registration_id', regId.toString());
+    await secureStore.setItem(this.prefix + 'registration_id', regId.toString());
   }
 
   private async trustedIdentity(identifier: string): Promise<string | null> {
@@ -97,8 +98,8 @@ class SignalProtocolStore implements libsignal.StorageType {
     // identity in this single-device implementation; retain legacy UID.1 pins.
     const uid = identifier.replace(/\.[0-9]+$/, '');
     if (this.trustedIdentities.has(uid)) return this.trustedIdentities.get(uid)!;
-    const saved = await secureStore.getItem(STORAGE_PREFIX + 'identity_' + uid)
-      ?? await secureStore.getItem(STORAGE_PREFIX + 'identity_' + uid + '.1');
+    const saved = await secureStore.getItem(this.prefix + 'identity_' + uid)
+      ?? await secureStore.getItem(this.prefix + 'identity_' + uid + '.1');
     this.trustedIdentities.set(uid, saved);
     return saved;
   }
@@ -117,13 +118,13 @@ class SignalProtocolStore implements libsignal.StorageType {
     }
     // Signal calls this for every message. Persist only a newly accepted pin.
     if (previous === value) return false;
-    await secureStore.setItem(STORAGE_PREFIX + 'identity_' + uid, value);
+    await secureStore.setItem(this.prefix + 'identity_' + uid, value);
     this.trustedIdentities.set(uid, value);
     return false;
   }
 
   async loadPreKey(keyId: string | number): Promise<libsignal.KeyPairType | undefined> {
-    const raw = await secureStore.getItem(STORAGE_PREFIX + 'prekey_' + keyId);
+    const raw = await secureStore.getItem(this.prefix + 'prekey_' + keyId);
     if (!raw) return undefined;
     const parsed = JSON.parse(raw);
     return {
@@ -137,7 +138,7 @@ class SignalProtocolStore implements libsignal.StorageType {
       pubKey: arrayBufferToBase64(keyPair.pubKey),
       privKey: arrayBufferToBase64(keyPair.privKey),
     });
-    await secureStore.setItem(STORAGE_PREFIX + 'prekey_' + keyId, payload);
+    await secureStore.setItem(this.prefix + 'prekey_' + keyId, payload);
   }
 
   async removePreKey(_keyId: number | string): Promise<void> {
@@ -145,7 +146,7 @@ class SignalProtocolStore implements libsignal.StorageType {
   }
 
   async loadSignedPreKey(keyId: number | string): Promise<libsignal.KeyPairType | undefined> {
-    const raw = await secureStore.getItem(STORAGE_PREFIX + 'signed_prekey_' + keyId);
+    const raw = await secureStore.getItem(this.prefix + 'signed_prekey_' + keyId);
     if (!raw) return undefined;
     const parsed = JSON.parse(raw);
     return {
@@ -159,18 +160,18 @@ class SignalProtocolStore implements libsignal.StorageType {
       pubKey: arrayBufferToBase64(keyPair.pubKey),
       privKey: arrayBufferToBase64(keyPair.privKey),
     });
-    await secureStore.setItem(STORAGE_PREFIX + 'signed_prekey_' + keyId, payload);
+    await secureStore.setItem(this.prefix + 'signed_prekey_' + keyId, payload);
   }
 
   async removeSignedPreKey(keyId: number | string): Promise<void> {
-    await secureStore.removeItem(STORAGE_PREFIX + 'signed_prekey_' + keyId);
+    await secureStore.removeItem(this.prefix + 'signed_prekey_' + keyId);
   }
 
   async loadSession(encodedAddress: string): Promise<libsignal.SessionRecordType | undefined> {
     if (this.inMemorySessions.has(encodedAddress)) {
       return this.inMemorySessions.get(encodedAddress);
     }
-    const val = await secureStore.getItem(STORAGE_PREFIX + 'session_' + encodedAddress);
+    const val = await secureStore.getItem(this.prefix + 'session_' + encodedAddress);
     if (val) {
       this.inMemorySessions.set(encodedAddress, val);
     }
@@ -178,21 +179,57 @@ class SignalProtocolStore implements libsignal.StorageType {
   }
 
   async storeSession(encodedAddress: string, record: libsignal.SessionRecordType): Promise<void> {
-    await secureStore.setItem(STORAGE_PREFIX + 'session_' + encodedAddress, record);
+    await secureStore.setItem(this.prefix + 'session_' + encodedAddress, record);
     this.inMemorySessions.set(encodedAddress, record);
   }
 
   async clearSession(encodedAddress: string): Promise<void> {
     this.inMemorySessions.delete(encodedAddress);
-    await secureStore.removeItem(STORAGE_PREFIX + 'session_' + encodedAddress);
+    await secureStore.removeItem(this.prefix + 'session_' + encodedAddress);
   }
 }
 
 export class SignalE2EEService {
   private store = new SignalProtocolStore();
+  private storagePrefix = STORAGE_PREFIX;
+  private accountUid?: string;
   private initialized = false;
   private initialization?: Promise<void>;
   private peerLocks = new Map<string, Promise<any>>();
+
+  async setAccount(uid: string, restoreLegacy = false): Promise<void> {
+    if (!uid) throw new Error('Account required for encryption');
+    if (this.accountUid === uid) return;
+    // Finish any prior account's ratchet operation before replacing its store.
+    await Promise.allSettled([...this.peerLocks.values()]);
+    if (this.initialization) await this.initialization.catch(() => {});
+    const scopedPrefix = `${STORAGE_PREFIX}account.${uid}.`;
+    const scopedIdentityService = `${KEYCHAIN_SERVICE}.${uid}`;
+    const scoped = await secureStore.getItem(scopedPrefix + 'owner') !== null
+      || Boolean(await Keychain.getGenericPassword({service: scopedIdentityService}));
+    let owner = await secureStore.getItem('nexa.e2ee.legacy_owner');
+    if (owner === null && restoreLegacy && !scoped
+      && await this.legacyIdentityExists()) {
+      // Only a restored saved session may claim the original unscoped keys.
+      // A newly signed-in account never adopts another account's ratchets.
+      await secureStore.setItem('nexa.e2ee.legacy_owner', uid);
+      owner = uid;
+    }
+    const legacy = !scoped && owner === uid;
+    // Record the namespace before provisioning, including interrupted first
+    // logins. A restored scoped account must never adopt legacy keys.
+    if (!legacy) await secureStore.setItem(scopedPrefix + 'owner', uid);
+    this.storagePrefix = legacy ? STORAGE_PREFIX : scopedPrefix;
+    this.store = new SignalProtocolStore(this.storagePrefix, legacy ? KEYCHAIN_SERVICE : scopedIdentityService);
+    this.accountUid = uid;
+    this.initialized = false;
+    this.initialization = undefined;
+    this.peerLocks.clear();
+  }
+
+  private async legacyIdentityExists(): Promise<boolean> {
+    return Boolean(await Keychain.getGenericPassword({service: KEYCHAIN_SERVICE}));
+  }
 
   private async runForPeer<T>(remoteUid: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.peerLocks.get(remoteUid) || Promise.resolve();
@@ -257,12 +294,12 @@ export class SignalE2EEService {
     // Resume interrupted first-time provisioning without replacing the identity.
     // The bundle is published only after every component is persisted.
     const signedKey = await this.store.loadSignedPreKey(1);
-    const signature = await secureStore.getItem(STORAGE_PREFIX + 'signed_prekey_sig_1');
+    const signature = await secureStore.getItem(this.storagePrefix + 'signed_prekey_sig_1');
     if (!signedKey || !signature) {
       const signedPreKey = await libsignal.KeyHelper.generateSignedPreKey(identity, 1);
       await this.store.storeSignedPreKey(1, signedPreKey.keyPair);
       await secureStore.setItem(
-        STORAGE_PREFIX + 'signed_prekey_sig_1',
+        this.storagePrefix + 'signed_prekey_sig_1',
         arrayBufferToBase64(signedPreKey.signature),
       );
     }
@@ -280,7 +317,7 @@ export class SignalE2EEService {
     const regId = await this.store.getLocalRegistrationId();
     const preKey = await this.store.loadPreKey(1);
     const signedPreKey = await this.store.loadSignedPreKey(1);
-    const signatureRaw = await secureStore.getItem(STORAGE_PREFIX + 'signed_prekey_sig_1');
+    const signatureRaw = await secureStore.getItem(this.storagePrefix + 'signed_prekey_sig_1');
 
     if (!identity || !regId || !preKey || !signedPreKey || !signatureRaw) {
       throw new Error('E2EE service not fully provisioned with prekeys');

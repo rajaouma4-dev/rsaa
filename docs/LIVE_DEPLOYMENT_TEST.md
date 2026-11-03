@@ -1,3 +1,15 @@
+# Continuation — 4 November 2026
+
+GitHub main and Render health matched `93e9fb560e7267f7fde65b4c74e30213d52b7684` during this continuation. Render returned `status: ok`. The unfinished 1.0.4 client account-isolation fix is local and is not part of that revision.
+
+New 1.0.4 APK built successfully (four ABI splits plus universal) after using short native staging to avoid the Windows dependency prefab path failure. APK v2 signature verified. All three existing MuMu instances were updated with data retained and restored saved login.
+
+Live updated-APK observations: C sent `QA104_C_to_B_20261104`; B displayed the decrypted text. B replied `QA104_B_reply_20261104`; C displayed it. B was force-stopped; C submitted `QA104_offline_B_20261104`; B and C were relaunched. Opening the C/B conversations showed all three exact texts and E2EE CONNECTED on both. These are synthetic QA strings. No audible-media or precise latency claim is made. Foreground relaunch recovery is not background notification delivery. A's prior mixed-account ratchet and live calls were not retested.
+
+Separately, local 4-client real WebRTC integration passed 13/13 encrypted messages with offline recovery; this is not a Render or emulator UI result.
+
+---
+
 # Live push and three-emulator test
 
 3 November 2026. Repository: https://github.com/rajaouma4-dev/rsaa . Live endpoint: https://rsaa.onrender.com/ .

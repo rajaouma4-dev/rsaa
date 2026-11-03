@@ -53,6 +53,17 @@ jobs:
       - name: TypeScript semantic check
         working-directory: mobile
         run: npm run typecheck
+      - name: Encryption, session and call regressions
+        working-directory: mobile
+        run: |
+          node test-native-crypto.cjs
+          node test-e2ee-security.cjs
+          node test-e2ee-upgrade.cjs
+          node test-session-recovery.cjs
+          node test-storage-concurrency.cjs
+          node test-low-latency.cjs
+          node test-realtime-reliability.cjs
+          node test-call-multi-user.cjs
       - name: Build release APK
         working-directory: mobile/android
         run: |

@@ -28,3 +28,10 @@ The public health response includes build_revision from RENDER_GIT_COMMIT. Confi
 Native AES/HMAC self-tests passed in both Android emulators. The production E2EE service now serializes initialization, resumes partial provisioning without replacing identity, rejects failed identity writes, and caches a session only after its durable write succeeds. `mobile/test-e2ee-upgrade.cjs` exercises compatibility with the previous JavaScript provider, restart with persisted ratchet state, tampering/replay, and injected storage interruption.
 
 Four mixed-version text tests arrived, with UI observation bounds of 4.56–4.69 seconds. A mixed-version audio call lasted 65 seconds; a final-build video call lasted 109 seconds with approximately 24 FPS renderer logs. Both were manually ended. Video remains gray in local and remote previews, so real-picture quality is unresolved. A 45-second voice note and HD image fixture arrived on the final APKs. Audio quality was not verified by listening. These observations do not establish a speedup factor or one-way media latency. See `BUILD_STATUS.md` for exact checks and production gaps.
+
+
+## 4 November 2026 continuation
+
+The default long dependency cache path caused QuickCrypto/Nitro prefab CMake regeneration to loop (`build.ninja still dirty after 100 tries`). `scripts/build_release.bat` now supplies the existing `nexaNativeBuildDir` setting using the ignored workspace `.nb` directory for the app and native dependency staging. No system path-length setting is changed.
+
+CI now runs the production-service crypto/account migration, session recovery, storage, queue and call regressions before APK assembly. The deployed 93e9fb5 workflow completed successfully: https://github.com/rajaouma4-dev/rsaa/actions/runs/41669690731 . This is the previous revision, not proof that the new local changes passed remote CI.

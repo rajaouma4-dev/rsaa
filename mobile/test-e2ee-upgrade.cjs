@@ -73,5 +73,42 @@ function client(data = new Map()) {
   interrupted.keychain.setGenericPassword = persist;
   await interrupted.service.exportPreKeyBundle();
   assert.equal(interrupted.data.get('com.nexa.chat.e2ee.identity'), originalIdentity);
-  console.log('PASS: concurrent/interrupted initialization; legacy/WebCrypto bidirectional compatibility; persistent session upgrade; replay/tamper rejection; storage failure preserves durable state.');
+  // A fresh login uses scoped keys. Restarting with a saved login must not
+  // switch that account back to the old, unscoped identity.
+  const scoped = client();
+  await scoped.service.setAccount('account-a');
+  const scopedBundle = await scoped.service.exportPreKeyBundle();
+  const scopedRestart = client(scoped.data);
+  await scopedRestart.service.setAccount('account-a', true);
+  assert.equal((await scopedRestart.service.exportPreKeyBundle()).identityKey, scopedBundle.identityKey);
+  assert.equal(scoped.data.has('nexa.e2ee.legacy_owner'), false);
+  const interruptedScoped = client(new Map(alice.data));
+  await interruptedScoped.service.setAccount('new-login');
+  const interruptedRestart = client(interruptedScoped.data);
+  await interruptedRestart.service.setAccount('new-login', true);
+  assert.notEqual((await interruptedRestart.service.exportPreKeyBundle()).identityKey,
+    JSON.parse(identity).pubKey);
+  assert.equal(interruptedScoped.data.has('nexa.e2ee.legacy_owner'), false);
+
+  // Saved pre-upgrade sessions retain their identity and ratchet; signing in
+  // as another account creates separate keys and peer trust pins.
+  const migrated = client(alice.data);
+  await migrated.service.setAccount('alice', true);
+  assert.equal((await migrated.service.exportPreKeyBundle()).identityKey,
+    JSON.parse(identity).pubKey);
+  const migratedMessage = await migrated.service.encrypt('bob', 'legacy ratchet restored');
+  assert.equal(await bob.service.decrypt('alice', migratedMessage.type, migratedMessage.body_b64), 'legacy ratchet restored');
+  await migrated.service.setAccount('other');
+  const otherBundle = await migrated.service.exportPreKeyBundle();
+  assert.notEqual(otherBundle.identityKey, JSON.parse(identity).pubKey);
+  assert.equal(await migrated.service.hasSession('bob'), false);
+  const otherBob = client();
+  await migrated.service.establishSessionWithPeer('bob', await otherBob.service.exportPreKeyBundle());
+  const otherMessage = await migrated.service.encrypt('bob', 'separate account');
+  assert.equal(await otherBob.service.decrypt('other', otherMessage.type, otherMessage.body_b64), 'separate account');
+  await migrated.service.setAccount('alice');
+  const returnedMessage = await migrated.service.encrypt('bob', 'original account returns');
+  assert.equal(await bob.service.decrypt('alice', returnedMessage.type, returnedMessage.body_b64), 'original account returns');
+  await assert.rejects(() => migrated.service.establishSessionWithPeer('bob', otherBundle), /identity/i);
+  console.log('PASS: concurrent/interrupted initialization; provider compatibility; persistent upgrade; replay/tamper and storage failure; scoped restart; legacy migration; account and peer-trust isolation.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

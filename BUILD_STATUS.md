@@ -1,3 +1,23 @@
+# Continuation verification — 4 November 2026
+
+- Re-read the interrupted chat and retained the unfinished account-scoping changes. Version 1.0.4 (code 5) is being validated locally.
+- Public GitHub main and Render health both reported `93e9fb560e7267f7fde65b4c74e30213d52b7684`; health status was `ok`. The new client fix is not included in that deployed revision.
+- Fixed a restart bug in the unfinished account-scoping implementation: a saved scoped login could claim the unscoped legacy namespace and replace its identity. Scoped identity/ownership now wins; namespace selection is persisted before provisioning. Legacy restoration is limited to an unclaimed saved account with actual legacy keys.
+- Production-service regression tests cover account A/B isolation, returning to the original ratchet, peer trust isolation, scoped restart and interrupted fresh-login restart in the presence of legacy keys. These tests passed, together with typecheck, native-provider harness, E2EE security/upgrade, queue/latency, session recovery, storage concurrency and call regressions.
+- Rust unit suite: 15 passed, 2 opt-in tests skipped. Local real DTLS/SCTP integration: 4 clients, 13/13 messages persisted, delivered and decrypted, including offline/reconnect recovery. The initial sandboxed run timed out opening the DataChannel; the same test passed with loopback networking available outside the sandbox.
+- SQL migration regression and split-UTF-8 framing tests passed. `scripts/test-source-invariants.py` still fails on a pre-existing contact-presence assertion; it also contains obsolete assumptions about demo mode and disabled E2EE relay. It is not counted as passed.
+- Exactly the three existing MuMu emulators are available (16384, 16416, 16448); their initial app screens showed ONLINE. This alone does not establish message or media delivery.
+- The deployed revision's GitHub workflow completed successfully: https://github.com/rajaouma4-dev/rsaa/actions/runs/41669690731 . New local regression commands were added to CI; they have not run remotely yet.
+- Default Android build hit a pre-existing Windows QuickCrypto/Nitro prefab cache path failure. Rebuild using the existing short native-staging option succeeded (all four ABI APKs plus universal); the Windows release script now supplies this setting automatically.
+- Current universal test APK: `mobile/android/app/build/outputs/apk/release/app-universal-release.apk`, 143,574,018 bytes; SHA-256 `939fede09c63088cc2673687a54f13ff74f8aa58e5c77d8759581c95cab4812d`. APK v2 signature verification passed. Existing test signing remains in use.
+- 1.0.4 installed successfully on all three existing emulators with data retained; all restored their logins and displayed ONLINE. C to B synthetic text and B to C reply appeared as plaintext on both devices. B was then force-stopped; C submitted another synthetic message; after both apps restarted, B displayed that message in the conversation with E2EE CONNECTED. This tests foreground recovery after explicit relaunch, not background push.
+- A's historical mixed-account ratchet and live calls/video were not revalidated in this continuation. Do not extrapolate the C/B result to all historical sessions.
+- No saved GitHub credential is available (`push --dry-run` could not authenticate). The chat-exposed PAT was not used. New changes have not been pushed.
+
+Remaining release limitations include gray emulator video, audible media quality, call identity authentication, server-side device lifecycle, embedded TURN credentials, encrypted local history, production signing and background delivery. Existing mixed-account legacy ratchets cannot be safely repaired by silently clearing peer trust; local regression success does not certify those historical live sessions.
+
+---
+
 # Current status: GitHub push and three-emulator validation
 
 Updated 3 November 2026. Current app source version: 1.0.3 (code 4).
