@@ -69,3 +69,9 @@ export async function clearLiveSession(): Promise<void> {
     await AsyncStorage.removeItem(DEMO_KEY);
   } catch {}
 }
+
+// Only explicit session revocation/expiry should erase a restored login.
+export function savedSessionIsInvalid(error: unknown): boolean {
+  const failure = error as {code?: string; message?: string} | undefined;
+  return failure?.code === 'SESSION_EXPIRED' || /invalid (or expired )?session|session expired or revoked/i.test(failure?.message || '');
+}

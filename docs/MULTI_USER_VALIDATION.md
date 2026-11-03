@@ -1,3 +1,5 @@
+> Historical local-load validation. GitHub push and subsequent live deployment findings are recorded in [LIVE_DEPLOYMENT_TEST.md](LIVE_DEPLOYMENT_TEST.md).
+
 # Multi-user implementation and validation
 
 3 November 2026. Target for this iteration: 100 lightweight clients without Android emulators. Source and builds are local; backend has not been deployed by this continuation.

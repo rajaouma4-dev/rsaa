@@ -1,10 +1,12 @@
-# Current continuation: multi-user changes
+# Current status: GitHub push and three-emulator validation
 
-Updated 3 November 2026. App source version 1.0.1 (code 2).
+Updated 3 November 2026. Current app source version: 1.0.3 (code 4).
 
-100 emulator-free real WebRTC clients exchanged 301/301 encrypted messages successfully, including an offline/reconnect delivery. Rust local tests: 14 passed, 2 opt-in integrations; the local DataChannel integration passed separately. Mobile semantic typecheck and storage/call/E2EE regressions passed. Rust optimized Windows build passed. See [full multi-user validation](docs/MULTI_USER_VALIDATION.md) for measured results, test scope and remaining release gaps.
+Application changes are pushed to `rajaouma4-dev/rsaa`. Render deployment is verified through its public `build_revision` health response. The live test found credential-less TURN entries breaking server peer configuration; the server now uses TURN credentials when present and otherwise retains valid STUN configuration. Startup also distinguishes temporary network/auth-service failure from explicit session expiry so deployment reconnects do not erase a valid saved login.
 
-The source and new builds are local. The updated Rust backend has not been pushed/deployed. Universal APK 1.0.1 (code 2): `mobile/android/app/build/outputs/apk/release/app-universal-release.apk`, 143,569,018 bytes. APK signature verification passed (v2, existing test signing key). SHA-256: `c21412b4848389b185c60ed12ad6c9601e06035292e4d374d6957d9ebc50304b`. Four ABI-specific APKs also built. As requested, this new build was not installed on or run in an emulator. Earlier two-emulator observations below describe the previous build, not this continuation's runtime Android verification.
+Three existing MuMu emulators are used, with no additional instances. A–B audio call remained connected for at least 2m 41s while C called B and received the busy outcome. Chat/reconnect verification after the TURN fix and final 1.0.3 install is being completed; see `docs/LIVE_DEPLOYMENT_TEST.md` for the live test record. Backend local suite: 15 passed, 2 opt-in integrations. Session-recovery, call and storage-concurrency tests pass.
+
+The 100-client local result remains 301/301 encrypted messages including offline delivery. It is not a public capacity guarantee. Prior APK hashes and observations below are historical. Production signing, background notifications, real audio/video quality and release security gaps remain open.
 
 ---
 

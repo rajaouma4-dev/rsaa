@@ -317,7 +317,11 @@ where
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                         crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
-                    Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
+                    Err(err) => {
+                        let expired = matches!(err.to_string().as_str(), "invalid or expired session" | "invalid session token");
+                        if expired { send_error(&signal_tx, "SESSION_EXPIRED", "session expired or revoked; sign in again").await?; }
+                        else { send_error(&signal_tx, "AUTH_UNAVAILABLE", "session verification temporarily unavailable; retry shortly").await?; }
+                    },
                 }
             }
             ClientFrame::Logout => {
@@ -761,7 +765,11 @@ async fn handle_ws_client(
                         crate::webrtc_peer::broadcast_presence(&store, &channels, &live_signaling, &user.uid, true).await;
                         crate::webrtc_peer::send_initial_presence_via_signal(&store, &channels, &live_signaling, &signal_tx, &user.uid).await;
                     }
-                    Err(err) => send_error(&signal_tx, "AUTH_FAILED", &safe_error(&err)).await?,
+                    Err(err) => {
+                        let expired = matches!(err.to_string().as_str(), "invalid or expired session" | "invalid session token");
+                        if expired { send_error(&signal_tx, "SESSION_EXPIRED", "session expired or revoked; sign in again").await?; }
+                        else { send_error(&signal_tx, "AUTH_UNAVAILABLE", "session verification temporarily unavailable; retry shortly").await?; }
+                    },
                 }
             }
             ClientFrame::Logout => {

@@ -5,7 +5,7 @@ import {HomeScreen, formatSnippet} from './src/screens/HomeScreen';
 import {ChatScreen} from './src/screens/ChatScreen';
 import {Chat, User, ChatMessage, MediaImageItem, VoiceNoteItem} from './src/types';
 import {demoChats, demoUsers} from './src/state/demoData';
-import {clearDemoSession, clearLiveSession, readDemoSession, readLiveSession, saveDemoSession, saveLiveSession} from './src/services/session';
+import {savedSessionIsInvalid, clearDemoSession, clearLiveSession, readDemoSession, readLiveSession, saveDemoSession, saveLiveSession} from './src/services/session';
 import {APP_CONFIG, isLiveConfigReady, refreshTurnCredentials} from './src/config';
 import {TlsSignalingClient} from './src/services/signaling';
 import {ServerDataChannel, RtcStatus} from './src/services/rtc';
@@ -501,11 +501,12 @@ export default function App() {
     let cancelled = false;
     let bootSignal: TlsSignalingClient | null = null;
     let bootRtc: ServerDataChannel | null = null;
+    let saved: Awaited<ReturnType<typeof readLiveSession>> = null;
 
     const boot = async () => {
       try {
         void refreshTurnCredentials();
-        const saved = await readLiveSession();
+        saved = await readLiveSession();
         if (!saved || cancelled) {
           setIsInitializing(false);
           return;
@@ -541,8 +542,18 @@ export default function App() {
       } catch (error) {
         bootRtc?.close();
         bootSignal?.close();
-        await clearLiveSession();
-        setSession(null);
+        if (cancelled) return;
+        if (saved && !savedSessionIsInvalid(error)) {
+          // A deploy, DNS error or temporary DB outage must not log the user out.
+          try { outboxRef.current = await DurableOutbox.open(saved.uid); } catch (queueError) { console.warn('Outgoing queue restore failed:', queueError); }
+          signalRef.current = null;
+          rtcRef.current = null;
+          setSession({...saved, live: true});
+          setRtcStatus('disconnected');
+        } else {
+          await clearLiveSession();
+          setSession(null);
+        }
       } finally {
         if (!cancelled) setIsInitializing(false);
       }
@@ -634,6 +645,7 @@ export default function App() {
       return true;
     } catch (err) {
       console.warn('Auto-reconnect error:', err);
+      if (savedSessionIsInvalid(err)) { await clearLiveSession(); setSession(null); }
       try { signalRef.current?.close(); } catch {}
       setRtcStatus('connecting');
       return false;

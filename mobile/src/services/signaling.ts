@@ -311,7 +311,7 @@ export class TlsSignalingClient {
       const timeout = setTimeout(() => finish(new Error(`Server response timed out (${expectedType})`)), timeoutMs);
       unsubscribe = this.onFrame(received => {
         if (received.type === 'error') {
-          finish(new Error(String(received.message || received.code || 'Server request failed')));
+          finish(Object.assign(new Error(String(received.message || received.code || 'Server request failed')), {code: String(received.code || '')}));
         } else if (received.type === expectedType) {
           finish(undefined, received);
         }
