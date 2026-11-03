@@ -555,6 +555,41 @@ async fn send_dc_error(channel: &Arc<dyn DataChannel>, code: &str, message: &str
     if let Ok(text) = serde_json::to_string(&frame) { let _ = channel.send_text(&text).await; }
 }
 
+fn configured_ice_servers(urls: Vec<String>, username: Option<String>, credential: Option<String>) -> Vec<RTCIceServer> {
+    let mut stun = Vec::new();
+    let mut turn = Vec::new();
+    for url in urls {
+        let url = url.trim().to_owned();
+        if url.starts_with("stun:") || url.starts_with("stuns:") { stun.push(url); }
+        else if url.starts_with("turn:") || url.starts_with("turns:") { turn.push(url); }
+        else { tracing::warn!("Ignoring unsupported ICE URL scheme"); }
+    }
+    let mut servers = Vec::new();
+    if !stun.is_empty() { servers.push(RTCIceServer { urls: stun, ..Default::default() }); }
+    if !turn.is_empty() {
+        if let (Some(username), Some(credential)) = (username.filter(|s| !s.is_empty()), credential.filter(|s| !s.is_empty())) {
+            servers.push(RTCIceServer { urls: turn, username, credential, ..Default::default() });
+        } else {
+            tracing::warn!("TURN URLs require TURN_USERNAME and TURN_CREDENTIAL; using configured STUN servers only");
+        }
+    }
+    servers
+}
+
+#[cfg(test)]
+mod ice_config_tests {
+    use super::*;
+    #[test]
+    fn turn_without_credentials_does_not_break_stun_negotiation() {
+        let urls = vec!["stun:stun.l.google.com:19302".into(), "turn:relay.example:3478".into(), "turns:relay.example:443".into()];
+        let without = configured_ice_servers(urls.clone(), None, None);
+        assert_eq!(without.len(), 1); assert_eq!(without[0].urls.len(), 1);
+        let with = configured_ice_servers(urls, Some("test-user".into()), Some("test-secret".into()));
+        assert_eq!(with.len(), 2); assert_eq!(with[1].urls.len(), 2); assert_eq!(with[1].username, "test-user");
+        assert!(configured_ice_servers(Vec::new(), None, None).is_empty());
+    }
+}
+
 pub async fn build_answerer(
     uid: String,
     db: Store,
@@ -565,7 +600,9 @@ pub async fn build_answerer(
     ice_urls: Vec<String>,
 ) -> Result<(Arc<dyn PeerConnection>, String)> {
     let handler = ServerPeerHandler { uid, db, channels, live_signaling, signal_tx };
-    let ice_servers = ice_urls.into_iter().map(|url| RTCIceServer { urls: vec![url], ..Default::default() }).collect();
+    let ice_servers = configured_ice_servers(ice_urls,
+        std::env::var("TURN_USERNAME").ok(),
+        std::env::var("TURN_CREDENTIAL").or_else(|_| std::env::var("TURN_PASSWORD")).ok());
     let config = RTCConfigurationBuilder::default().with_ice_servers(ice_servers).build();
     let peer = PeerConnectionBuilder::new()
         .with_configuration(config)
