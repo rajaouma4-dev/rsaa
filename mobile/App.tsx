@@ -24,6 +24,7 @@ import {
 import {C, S} from './src/theme';
 import {getMessageTimestamp} from './src/utils/time';
 import {CallModal} from './src/components/CallModal';
+import {configureAvatars,refreshVisibleAvatars,avatarChanged,installAvatar} from './src/services/avatars';
 import {callService, CallState} from './src/services/callService';
 
 async function publishPrekeys(signal: TlsSignalingClient) {
@@ -87,6 +88,8 @@ export default function App() {
       return state.status === 'idle' || state.status === 'ended' ? null : state.callId;
     });
     client.onFrame(frame => {
+      if(frame.type==='avatar_changed' && frame.uid && frame.version) avatarChanged(String(frame.uid),String(frame.version));
+      if(frame.type==='auth_ok') setTimeout(()=>refreshVisibleAvatars(),0);
       if (frame.type === 'call_signal' && frame.from_uid && frame.payload) {
         void callService.handleSignal(String(frame.from_uid), frame.payload);
       } else if (frame.type === 'data_frame' && (frame as any).payload) {
@@ -1220,6 +1223,20 @@ export default function App() {
     }
   };
 
+  useEffect(()=>{
+    configureAvatars(async(uid,version)=>{
+      const signal=signalRef.current;
+      if(!signal?.authenticated)throw Error('Offline');
+      return signal.request<any>({type:'get_avatar',uid,version:version||null},'avatar');
+    });
+  },[session?.uid]);
+  const setProfileAvatar=async(uri:string|null)=>{
+    if(!session?.uid||!session.live)throw Error('Sign in to update photo');
+    if(!signalRef.current?.authenticated && !await ensureConnected())throw Error('Connection unavailable');
+    const response=await signalRef.current!.request<any>({type:'set_avatar',data_uri:uri},'avatar_saved');
+    installAvatar({uid:response.uid,version:response.version,data_uri:uri});
+  };
+
   const updateProfile = async (displayName: string, about: string) => {
     if (!session?.live) throw new Error('Profile editing requires a live server account.');
     const signal = signalRef.current;
@@ -1301,6 +1318,7 @@ export default function App() {
         onOpenChat={openChat}
         onLogout={logout}
         onAddChat={user => { void addChat(user); }}
+        onSetAvatar={setProfileAvatar}
         onUpdateProfile={updateProfile}
       />
     ) : (

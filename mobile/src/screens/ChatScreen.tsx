@@ -329,7 +329,7 @@ export function ChatScreen({
           {!isMe ? (
             <View style={styles.themAvatarContainer}>
               {isLastInGroup ? (
-                <Avatar name={chat.user.name} online={chat.user.online} size={28} />
+                <Avatar uid={chat.user.id} name={chat.user.name} online={chat.user.online} size={28} />
               ) : (
                 <View style={styles.themAvatarSpacer} />
               )}
@@ -433,7 +433,7 @@ export function ChatScreen({
         <Pressable onPress={onBack} hitSlop={10} style={styles.backBtn}>
           <Text style={styles.backArrow}>‹</Text>
         </Pressable>
-        <Avatar name={chat.user.name} online={chat.user.online} size={42} />
+        <Avatar uid={chat.user.id} name={chat.user.name} online={chat.user.online} size={42} />
         <View style={styles.headerInfo}>
           <Text numberOfLines={1} style={styles.headerName}>
             {chat.user.name}
@@ -489,7 +489,7 @@ export function ChatScreen({
         removeClippedSubviews={Platform.OS === 'android'}
         ListEmptyComponent={
           <View style={[styles.emptyContainer, {transform: [{scaleY: -1}]}]}>
-            <Avatar name={chat.user.name} online={chat.user.online} size={70} />
+            <Avatar uid={chat.user.id} name={chat.user.name} online={chat.user.online} size={70} />
             <Text style={styles.emptyTitle}>{chat.user.name}</Text>
             <Text style={styles.emptySubtitle}>
               {liveMode

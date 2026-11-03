@@ -20,6 +20,8 @@ pub enum ClientFrame {
     CallState { call_id: Option<String> },
     DataFrame { payload: serde_json::Value },
     ChatThemes { id: Option<String> },
+    GetAvatar { uid: String, version: Option<String> },
+    SetAvatar { data_uri: Option<String> },
     Ping,
 }
 
@@ -37,6 +39,9 @@ pub enum ServerFrame {
     PrekeyBundle { uid: String, bundle: serde_json::Value },
     Error { code: String, message: String },
     ChatThemes { themes: serde_json::Value },
+    Avatar { uid: String, version: String, data_uri: Option<String> },
+    AvatarSaved { uid: String, version: String },
+    AvatarChanged { uid: String, version: String },
     Pong,
     Answer { sdp: String },
     IceCandidate { candidate: serde_json::Value },

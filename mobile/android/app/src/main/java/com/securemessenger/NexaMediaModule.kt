@@ -109,6 +109,44 @@ class NexaMediaModule(private val reactContext: ReactApplicationContext) :
     override fun onNewIntent(intent: Intent) {}
 
     @ReactMethod
+    fun processAvatar(uriString: String, promise: Promise) {
+        Thread {
+            val allocated = mutableListOf<Bitmap>()
+            try {
+                val uri=Uri.parse(uriString);val resolver=reactContext.contentResolver
+                val bounds=BitmapFactory.Options().apply { inJustDecodeBounds=true }
+                resolver.openInputStream(uri).use { BitmapFactory.decodeStream(it,null,bounds) }
+                require(bounds.outWidth>0 && bounds.outHeight>0) { "Cannot read photo" }
+                var sample=1
+                while (max(bounds.outWidth,bounds.outHeight)/sample>512) sample*=2
+                val options=BitmapFactory.Options().apply {inSampleSize=sample;inPreferredConfig=Bitmap.Config.ARGB_8888}
+                val decoded=resolver.openInputStream(uri).use { BitmapFactory.decodeStream(it,null,options) } ?: error("Cannot decode photo")
+                allocated.add(decoded)
+                val orientation=resolver.openInputStream(uri).use { input ->
+                    if(input==null) 1 else try {android.media.ExifInterface(input).getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION,1)} catch (_:Exception){1}
+                }
+                val matrix=android.graphics.Matrix()
+                when(orientation){3->matrix.postRotate(180f);6->matrix.postRotate(90f);8->matrix.postRotate(270f);2->matrix.postScale(-1f,1f);4->matrix.postScale(1f,-1f);5->{matrix.postRotate(90f);matrix.postScale(-1f,1f)};7->{matrix.postRotate(270f);matrix.postScale(-1f,1f)}}
+                val rotated=Bitmap.createBitmap(decoded,0,0,decoded.width,decoded.height,matrix,true);allocated.add(rotated)
+                val side=min(rotated.width,rotated.height)
+                val crop=Bitmap.createBitmap(rotated,(rotated.width-side)/2,(rotated.height-side)/2,side,side);allocated.add(crop)
+                var size=min(256,side);var photo=Bitmap.createScaledBitmap(crop,size,size,true);allocated.add(photo)
+                var bytes:ByteArray
+                while(true){
+                    val output=ByteArrayOutputStream();photo.compress(Bitmap.CompressFormat.JPEG,72,output);bytes=output.toByteArray()
+                    if(bytes.size<=16000)break
+                    size=(size*.8).toInt().coerceAtLeast(32)
+                    photo=Bitmap.createScaledBitmap(crop,size,size,true);allocated.add(photo)
+                    if(size==32){val tiny=ByteArrayOutputStream();photo.compress(Bitmap.CompressFormat.JPEG,50,tiny);bytes=tiny.toByteArray();break}
+                }
+                require(bytes.size<=16000){"Photo could not be compressed"}
+                promise.resolve("data:image/jpeg;base64,"+Base64.encodeToString(bytes,Base64.NO_WRAP))
+            } catch(e:Exception){promise.reject("E_AVATAR",e.message,e)}
+            finally{allocated.distinct().forEach{if(!it.isRecycled)it.recycle()}}
+        }.start()
+    }
+
+    @ReactMethod
     fun processImage(uriString: String, isHd: Boolean, promise: Promise) {
         Thread {
             try {

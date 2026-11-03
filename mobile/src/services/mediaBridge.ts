@@ -153,3 +153,10 @@ export async function saveBatchToPhoneGallery(
     return 0;
   }
 }
+
+export async function pickProfilePhoto(): Promise<string | null> {
+ const uris=await pickPhotosFromGallery();
+ if(!uris.length)return null;
+ if(!NexaMediaModule?.processAvatar)throw Error('Update the app to change profile photos.');
+ return NexaMediaModule.processAvatar(uris[0]);
+}

@@ -3,6 +3,7 @@ import {
   Animated, Modal, View, Text, StyleSheet, Pressable, SafeAreaView,
   StatusBar, Platform, PanResponder, useWindowDimensions,
 } from 'react-native';
+import {Avatar} from './Avatar';
 import {RTCView} from 'react-native-webrtc';
 import {CallState, callService, CallQuality} from '../services/callService';
 import {clampPreview, previewBounds, PreviewPoint} from './callPreviewLayout';
@@ -135,7 +136,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
         <View pointerEvents="none" style={styles.center}>
           {!remoteVideo ? <>
             <View style={[styles.avatar, isIncoming && styles.ringingAvatar]}>
-              <Text style={styles.initials}>{callState.remoteUser?.name?.split(' ').map(word => word[0]).slice(0, 2).join('').toUpperCase() || '?'}</Text>
+              <Avatar uid={callState.remoteUser?.uid} name={callState.remoteUser?.name||'Contact'} size={140}/>
             </View>
             <Text style={styles.callType}>{callState.callType === 'video' ? 'Video call' : 'Audio call'}</Text>
           </> : null}

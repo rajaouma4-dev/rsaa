@@ -529,6 +529,24 @@ where
                     Err(_) => send_error(&signal_tx, "THEMES_UNAVAILABLE", "Themes temporarily unavailable").await?,
                 }
             }
+            ClientFrame::GetAvatar { uid, version } => {
+                if current_user.is_none() { send_error(&signal_tx,"AUTH_REQUIRED","login required").await?;continue; }
+                match store.get_avatar(&uid,version.as_deref()).await {
+                    Ok((version,data_uri)) => signal_tx.send(ServerFrame::Avatar{uid,version,data_uri}).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx,"AVATAR_UNAVAILABLE","Photo temporarily unavailable").await?,
+                }
+            }
+            ClientFrame::SetAvatar { data_uri } => {
+                let Some(user)=current_user.as_ref() else {send_error(&signal_tx,"AUTH_REQUIRED","login required").await?;continue;};
+                match store.set_avatar(&user.uid,data_uri.as_deref()).await {
+                    Ok(version) => {
+                        signal_tx.send(ServerFrame::AvatarSaved{uid:user.uid.clone(),version:version.clone()}).await.map_err(|_| anyhow!("signaling writer closed"))?;
+                        let targets: Vec<_> = live_signaling.read().await.values().cloned().collect();
+                        for tx in targets {let _=tx.try_send(ServerFrame::AvatarChanged{uid:user.uid.clone(),version:version.clone()});}
+                    }
+                    Err(err) => send_error(&signal_tx,"AVATAR_SAVE_FAILED",&safe_error(&err)).await?,
+                }
+            }
             ClientFrame::Ping => {
                 if let Some(user) = current_user.as_ref() { crate::calls::CALLS.lock().await.touch(&user.uid); }
                 signal_tx.send(ServerFrame::Pong).await.map_err(|_| anyhow!("signaling writer closed"))?;
@@ -987,6 +1005,24 @@ async fn handle_ws_client(
                 match store.chat_themes(id.as_deref()).await {
                     Ok(themes) => signal_tx.send(ServerFrame::ChatThemes { themes }).await.map_err(|_| anyhow!("signaling writer closed"))?,
                     Err(_) => send_error(&signal_tx, "THEMES_UNAVAILABLE", "Themes temporarily unavailable").await?,
+                }
+            }
+            ClientFrame::GetAvatar { uid, version } => {
+                if current_user.is_none() { send_error(&signal_tx,"AUTH_REQUIRED","login required").await?;continue; }
+                match store.get_avatar(&uid,version.as_deref()).await {
+                    Ok((version,data_uri)) => signal_tx.send(ServerFrame::Avatar{uid,version,data_uri}).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx,"AVATAR_UNAVAILABLE","Photo temporarily unavailable").await?,
+                }
+            }
+            ClientFrame::SetAvatar { data_uri } => {
+                let Some(user)=current_user.as_ref() else {send_error(&signal_tx,"AUTH_REQUIRED","login required").await?;continue;};
+                match store.set_avatar(&user.uid,data_uri.as_deref()).await {
+                    Ok(version) => {
+                        signal_tx.send(ServerFrame::AvatarSaved{uid:user.uid.clone(),version:version.clone()}).await.map_err(|_| anyhow!("signaling writer closed"))?;
+                        let targets: Vec<_> = live_signaling.read().await.values().cloned().collect();
+                        for tx in targets {let _=tx.try_send(ServerFrame::AvatarChanged{uid:user.uid.clone(),version:version.clone()});}
+                    }
+                    Err(err) => send_error(&signal_tx,"AVATAR_SAVE_FAILED",&safe_error(&err)).await?,
                 }
             }
             ClientFrame::Ping => {

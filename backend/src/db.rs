@@ -57,6 +57,29 @@ impl Store {
         Ok(conn)
     }
 
+    pub async fn set_avatar(&self, uid: &str, data_uri: Option<&str>) -> Result<String> {
+        let uri = data_uri.unwrap_or("");
+        if !uri.is_empty() {
+            let encoded = uri.strip_prefix("data:image/jpeg;base64,").ok_or_else(|| anyhow!("JPEG avatar required"))?;
+            anyhow::ensure!(encoded.len() <= 21336, "Avatar must be at most 16 KB");
+            let bytes = STANDARD.decode(encoded).context("invalid avatar encoding")?;
+            validate_avatar(&bytes)?;
+        }
+        let version = hex_digest(uri.as_bytes());
+        self.connection().await?.execute("INSERT INTO profile_avatars(uid,version,data_uri) VALUES(?1,?2,?3) ON CONFLICT(uid) DO UPDATE SET version=excluded.version,data_uri=excluded.data_uri", libsql::params![uid, version.clone(), uri]).await?;
+        Ok(version)
+    }
+    pub async fn get_avatar(&self, uid: &str, version: Option<&str>) -> Result<(String, Option<String>)> {
+        anyhow::ensure!(uid.len() <= 80, "invalid user");
+        let mut rows = self.connection().await?.query("SELECT version,data_uri FROM profile_avatars WHERE uid=?1", [uid]).await?;
+        if let Some(row) = rows.next().await? {
+            let current: String = row.get(0)?;
+            let uri: String = row.get(1)?;
+            let data = if version == Some(current.as_str()) || uri.is_empty() { None } else { Some(uri) };
+            Ok((current, data))
+        } else { Ok((String::new(), None)) }
+    }
+
     pub async fn chat_themes(&self, id: Option<&str>) -> Result<serde_json::Value> {
         let conn = self.connection().await?;
         if let Some(id) = id {
@@ -75,6 +98,7 @@ impl Store {
         let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
         let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
         let statements = [
+            "CREATE TABLE IF NOT EXISTS profile_avatars (uid TEXT PRIMARY KEY REFERENCES users(uid) ON DELETE CASCADE, version TEXT NOT NULL, data_uri TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS chat_theme_assets (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, data_uri TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)",
             "CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL COLLATE NOCASE UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
             "CREATE TABLE IF NOT EXISTS user_profiles (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, display_name TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', avatar_url TEXT, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
@@ -560,6 +584,26 @@ pub fn now_epoch_string() -> String { format!("{}", now_seconds()) }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn avatar_roundtrip_version_cache_removal_and_bounds() {
+        let path = format!("target/avatar-{}.db", uuid::Uuid::new_v4());
+        let store = super::Store::load_test_store(&path, &["avatar-a".into(),"avatar-b".into()]).await.unwrap();
+        let bytes=include_bytes!("../testdata/avatar.jpg");
+        let uri=format!("data:image/jpeg;base64,{}",base64::Engine::encode(&base64::engine::general_purpose::STANDARD,bytes));
+        let version=store.set_avatar("avatar-a",Some(&uri)).await.unwrap();
+        assert_eq!(store.get_avatar("avatar-a",None).await.unwrap(),(version.clone(),Some(uri.clone())));
+        assert_eq!(store.get_avatar("avatar-a",Some(&version)).await.unwrap(),(version.clone(),None));
+        assert_eq!(store.set_avatar("avatar-a",Some(&uri)).await.unwrap(),version);
+        assert_eq!(store.get_avatar("avatar-b",None).await.unwrap(),(String::new(),None));
+        assert!(store.set_avatar("avatar-a",Some("data:image/svg+xml;base64,AA==")).await.is_err());
+        assert!(super::validate_avatar(&vec![0;16001]).is_err());
+        let mut large=bytes.to_vec();
+        for p in 0..large.len()-8 {if large[p]==255 && large[p+1]==192 {large[p+5]=2;large[p+6]=0;break;}}
+        assert!(super::validate_avatar(&large).is_err());
+        store.set_avatar("avatar-a",None).await.unwrap();
+        assert!(store.get_avatar("avatar-a",Some(&version)).await.unwrap().1.is_none());
+        drop(store);let _=std::fs::remove_file(path);
+    }
     use super::*;
 
     #[tokio::test]
@@ -792,4 +836,24 @@ mod tests {
         assert!(validate_message_id("bad id 123").is_err());
         assert!(validate_message_id("短いmessage").is_err());
     }
+}
+
+fn validate_avatar(bytes: &[u8]) -> Result<()> {
+    anyhow::ensure!(bytes.len() <= 16000 && bytes.starts_with(&[255,216]) && bytes.ends_with(&[255,217]), "Invalid JPEG avatar");
+    let mut p=2;
+    while p+4 <= bytes.len() {
+        anyhow::ensure!(bytes[p]==255, "Invalid JPEG marker");
+        let marker=bytes[p+1];p+=2;
+        if marker==255 {p-=1;continue;}
+        let len=u16::from_be_bytes([bytes[p],bytes[p+1]]) as usize;
+        anyhow::ensure!(len>=2 && p+len<=bytes.len(), "Invalid JPEG segment");
+        if matches!(marker,192|193|194) {
+            anyhow::ensure!(len>=8, "Invalid JPEG dimensions");
+            let h=u16::from_be_bytes([bytes[p+3],bytes[p+4]]);let w=u16::from_be_bytes([bytes[p+5],bytes[p+6]]);
+            anyhow::ensure!(w>0 && h>0 && w<=256 && h<=256, "Avatar dimensions must be at most 256 pixels");
+            return Ok(());
+        }
+        anyhow::ensure!(marker!=218 && marker!=217, "Missing JPEG dimensions");p+=len;
+    }
+    Err(anyhow!("Missing JPEG dimensions"))
 }
