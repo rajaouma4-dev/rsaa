@@ -19,8 +19,18 @@ class NexaNotificationsModule(private val context: ReactApplicationContext) : Re
                     .emit("NexaPushTokenChanged", null)
             }
         }
+        NexaNotifications.onNotificationOpened = {
+            runCatching {
+                if (context.hasActiveReactInstance()) context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                    .emit("NexaNotificationOpened", null)
+            }
+        }
     }
-    override fun invalidate() { NexaNotifications.onTokenChanged = null; super.invalidate() }
+    override fun invalidate() {
+        NexaNotifications.onTokenChanged = null
+        NexaNotifications.onNotificationOpened = null
+        super.invalidate()
+    }
     @ReactMethod fun addListener(event: String) {}
     @ReactMethod fun removeListeners(count: Int) {}
     @ReactMethod fun setAccount(uid: String?, promise: Promise) { NexaNotifications.setAccount(context,uid); promise.resolve(null) }

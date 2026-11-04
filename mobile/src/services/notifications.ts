@@ -37,6 +37,22 @@ export function startNotifications(uid: string, getSignal: () => TlsSignalingCli
   let registrationKey = '';
   let registeredSignal: TlsSignalingClient | null = null;
   let installationId = '';
+  let opening = false;
+  let openAgain = false;
+  const drainOpen = async () => {
+    if (disposed) return;
+    openAgain = true;
+    if (opening) return;
+    opening = true;
+    try {
+      while (openAgain && !disposed) {
+        openAgain = false;
+        const conversation = await native.consumeOpen(uid);
+        if (!disposed && conversation) onOpen(conversation);
+      }
+    } catch { /* A pending native intent can be retried on resume or heartbeat. */ }
+    finally { opening = false; }
+  };
   const sync = async () => {
     if (disposed || busy) return;
     busy = true;
@@ -45,8 +61,7 @@ export function startNotifications(uid: string, getSignal: () => TlsSignalingCli
       if (disposed || !info) return;
       installationId = info.installationId;
       if (AppState.currentState === 'active') {
-        const conversation = await native.consumeOpen(uid);
-        if (!disposed && conversation) onOpen(conversation);
+        void drainOpen();
       }
       const signal = getSignal();
       if (!signal?.authenticated || !info.token) return;
@@ -66,10 +81,12 @@ export function startNotifications(uid: string, getSignal: () => TlsSignalingCli
   void (async () => {
     await native.setAccount(uid);
     if (disposed) return;
+    void drainOpen();
     await requestPermissionOnce();
     if (!disposed) await sync();
   })().catch(() => {});
   const appState = AppState.addEventListener('change', next => {
+    if (next === 'active') void drainOpen();
     // Do not wait for an in-flight registration: Android may suspend JS as soon
     // as Home is pressed. Clear the foreground lease while the socket is alive.
     const signal = getSignal();
@@ -78,7 +95,9 @@ export function startNotifications(uid: string, getSignal: () => TlsSignalingCli
     }
     void sync();
   });
-  const tokenChange = new NativeEventEmitter(native).addListener('NexaPushTokenChanged', () => { void sync(); });
+  const emitter = new NativeEventEmitter(native);
+  const tokenChange = emitter.addListener('NexaPushTokenChanged', () => { void sync(); });
+  const notificationOpen = emitter.addListener('NexaNotificationOpened', () => { void drainOpen(); });
   const timer = setInterval(() => { void sync(); }, 15000);
-  return () => { disposed = true; clearInterval(timer); appState.remove(); tokenChange.remove(); };
+  return () => { disposed = true; clearInterval(timer); appState.remove(); tokenChange.remove(); notificationOpen.remove(); };
 }

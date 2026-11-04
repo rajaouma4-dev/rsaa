@@ -22,7 +22,7 @@ OUT.mkdir(parents=True, exist_ok=True)
 FIXTURE = OUT / 'registration-private.json'
 RUST_TEST = max((ROOT / 'backend/target/debug/deps').glob('nexa_messenger_server-*.exe'), key=lambda p: p.stat().st_mtime)
 RUN = str(int(time.time()))
-results = json.loads((OUT / 'results.json').read_text()) if (OUT / 'results.json').exists() else {}
+results = {'run_id': RUN}
 manager = ADB.parent / 'MuMuManager.exe'
 mumu_index = None
 if manager.exists() and ':' in SERIAL:
@@ -116,16 +116,20 @@ network_changed = False
 try:
     registration()
     if '--offline-only' not in sys.argv[3:]:
+        results['foreground_received_without_notification'] = False
         foreground()
         foreground_id = f'push_foreground_{RUN}'
         send(foreground_id, 'push-test-foreground')
-        time.sleep(18)
+        # Provider acceptance is not immediate delivery; allow a bounded window
+        # before exporting the native receipt evidence (which restarts the app).
+        time.sleep(60)
         assert not notifications(), 'A visible app posted a message notification'
         info = registration()
         assert foreground_id in info.get('recent', []), 'No proof the foreground push reached native code'
         results['foreground_received_without_notification'] = True
         print('PASS foreground received with no notification', flush=True)
 
+        results['notification_after_process_kill'] = False
         foreground()
         shell('input', 'keyevent', '3')
         time.sleep(2)
@@ -138,6 +142,7 @@ try:
         evidence('process-killed')
         results['notification_after_process_kill'] = True
         print('PASS notification after app process kill', flush=True)
+        results['duplicate_kept_existing_notification'] = False
         before = notifications()
         send(killed_id, 'push-test-killed')
         time.sleep(15)
@@ -145,32 +150,34 @@ try:
         results['duplicate_kept_existing_notification'] = True
         print('PASS duplicate kept the existing notification record', flush=True)
 
-    foreground()
-    shell('input', 'keyevent', '3')
-    network_changed = True
-    network_command('cmd', 'connectivity', 'airplane-mode', 'enable')
-    network_command('svc', 'wifi', 'disable')
-    time.sleep(4)
-    if mumu_index is not None:
-        host_command('dumpsys connectivity > /data/local/tmp/nexa-offline-connectivity.txt')
-    elif not network_none():
-        raise RuntimeError('Device still has a default network; refusing to claim an offline pass')
-    send(f'push_offline_{RUN}', 'push-test-offline')
-    time.sleep(10)
-    if mumu_index is None:
-        assert not notifications(), 'Offline test did not isolate device delivery'
-    network_command('cmd', 'connectivity', 'airplane-mode', 'disable')
-    network_command('svc', 'wifi', 'enable')
-    time.sleep(4)
-    if mumu_index is not None:
-        snapshot = shell('cat','/data/local/tmp/nexa-offline-connectivity.txt')
-        match = re.search(r'Active default network:\s*(\S+)', snapshot)
-        assert match and match[1].lower() in ('none','null','-1'), 'No proof that the emulator had no default network'
-    print('Verified no default network during the queued push', flush=True)
-    wait_alert('push-test-offline')
-    evidence('offline-reconnect')
-    results['offline_notification_after_reconnect'] = True
-    print('PASS offline notification delivered after reconnect', flush=True)
+    if '--skip-offline' not in sys.argv[3:]:
+        results['offline_notification_after_reconnect'] = False
+        foreground()
+        shell('input', 'keyevent', '3')
+        network_changed = True
+        network_command('cmd', 'connectivity', 'airplane-mode', 'enable')
+        network_command('svc', 'wifi', 'disable')
+        time.sleep(4)
+        if mumu_index is not None:
+            host_command('dumpsys connectivity > /data/local/tmp/nexa-offline-connectivity.txt')
+        elif not network_none():
+            raise RuntimeError('Device still has a default network; refusing to claim an offline pass')
+        send(f'push_offline_{RUN}', 'push-test-offline')
+        time.sleep(10)
+        if mumu_index is None:
+            assert not notifications(), 'Offline test did not isolate device delivery'
+        network_command('cmd', 'connectivity', 'airplane-mode', 'disable')
+        network_command('svc', 'wifi', 'enable')
+        time.sleep(4)
+        if mumu_index is not None:
+            snapshot = shell('cat','/data/local/tmp/nexa-offline-connectivity.txt')
+            match = re.search(r'Active default network:\s*(\S+)', snapshot)
+            assert match and match[1].lower() in ('none','null','-1'), 'No proof that the emulator had no default network'
+        print('Verified no default network during the queued push', flush=True)
+        wait_alert('push-test-offline')
+        evidence('offline-reconnect')
+        results['offline_notification_after_reconnect'] = True
+        print('PASS offline notification delivered after reconnect', flush=True)
 finally:
     errors = []
     if network_changed:

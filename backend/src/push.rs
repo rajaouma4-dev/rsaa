@@ -123,7 +123,7 @@ impl Store {
         Ok(jobs)
     }
     async fn claim_push(&self, job: &Job) -> Result<bool> {
-        let changed=self.connection().await?.execute("UPDATE push_jobs SET attempts=attempts+1,next_attempt_at=?4+CASE WHEN attempts<3 THEN 15 WHEN attempts<6 THEN 120 ELSE 3600 END WHERE message_id=?1 AND installation_id=?2 AND recipient_uid=?3 AND finished=0 AND next_attempt_at<=?4 AND EXISTS(SELECT 1 FROM push_devices d JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid JOIN messages m ON m.message_id=?1 WHERE d.installation_id=?2 AND d.uid=?3 AND d.token=?5 AND d.enabled=1 AND d.foreground_until<=?4 AND s.expires_at>?4 AND m.status<>'SEEN')",libsql::params![job.message_id.clone(),job.installation_id.clone(),job.uid.clone(),now(),job.token.clone()]).await?;
+        let changed=self.connection().await?.execute("UPDATE push_jobs SET attempts=attempts+1,next_attempt_at=?4+CASE WHEN attempts<3 THEN 15 WHEN attempts<6 THEN 120 ELSE 3600 END WHERE message_id=?1 AND installation_id=?2 AND recipient_uid=?3 AND finished=0 AND next_attempt_at<=?4 AND EXISTS(SELECT 1 FROM push_devices d JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid JOIN messages m ON m.message_id=?1 LEFT JOIN user_settings settings ON settings.uid=d.uid WHERE d.installation_id=?2 AND d.uid=?3 AND d.token=?5 AND d.enabled=1 AND d.foreground_until<=?4 AND s.expires_at>?4 AND m.status<>'SEEN' AND COALESCE(settings.notifications_enabled,1)=1)",libsql::params![job.message_id.clone(),job.installation_id.clone(),job.uid.clone(),now(),job.token.clone()]).await?;
         Ok(changed==1)
     }
     async fn finish_push(&self, job: &Job, invalid: bool) -> Result<()> {
@@ -134,7 +134,7 @@ impl Store {
     }
 
     async fn defer_push(&self, job: &Job, seconds: i64) -> Result<()> {
-        self.connection().await?.execute("UPDATE push_jobs SET next_attempt_at=MAX(next_attempt_at,?3) WHERE message_id=?1 AND installation_id=?2 AND recipient_uid=?4 AND finished=0", libsql::params![job.message_id.clone(),job.installation_id.clone(),now()+seconds,job.uid.clone()]).await?;
+        self.connection().await?.execute("UPDATE push_jobs SET next_attempt_at=MAX(next_attempt_at,?3) WHERE message_id=?1 AND installation_id=?2 AND recipient_uid=?4 AND finished=0 AND EXISTS(SELECT 1 FROM push_devices WHERE installation_id=?2 AND uid=?4 AND token=?5)", libsql::params![job.message_id.clone(),job.installation_id.clone(),now()+seconds,job.uid.clone(),job.token.clone()]).await?;
         Ok(())
     }
 
@@ -244,9 +244,14 @@ mod tests {
         assert!(store.due_push().await.unwrap().is_empty(),"unregistered token is disabled");
         store.register_push("b","b-session-abcdefghijklmnopqrstuvwxyz123456",installation,"rotated-push-token-at-least-20-characters",true,false).await.unwrap();
         assert_eq!(store.due_push().await.unwrap().len(),2,"rotation recovers invalid-token job and unread accepted job");
+        store.defer_push(&stale_job,3600).await.unwrap();
+        assert_eq!(store.due_push().await.unwrap().len(),2,"old-token retry cannot delay the new token's job");
         assert!(!store.claim_push(&stale_job).await.unwrap(),"stale token snapshot cannot claim a rotated installation");
         store.finish_push(&stale_job,false).await.unwrap();
         assert_eq!(store.due_push().await.unwrap().len(),2,"late old-token success cannot finish a new-token job");
+        let current_job=store.due_push().await.unwrap().remove(0);
+        conn.execute("INSERT INTO user_settings(uid,notifications_enabled) VALUES('b',0)",()).await.unwrap();
+        assert!(!store.claim_push(&current_job).await.unwrap(),"notification preference changed after query must be respected at claim time");
         store.revoke_session("b-session-abcdefghijklmnopqrstuvwxyz123456").await.unwrap();
         assert!(store.due_push().await.unwrap().is_empty(),"revoked sessions cannot receive pushes");
         // Account switch on the same installation removes old-account queued jobs.

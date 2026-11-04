@@ -22,6 +22,7 @@ object NexaNotifications {
     @Volatile var foreground = false
         private set
     var onTokenChanged: (() -> Unit)? = null
+    var onNotificationOpened: (() -> Unit)? = null
     private fun prefs(context: Context) = context.getSharedPreferences("nexa_notifications", Context.MODE_PRIVATE)
 
     fun initialize(application: Application) {
@@ -121,6 +122,7 @@ object NexaNotifications {
         prefs(context).edit().putString("open_uid",uid).putString("open_conversation",conversation).commit()
         intent.removeExtra("notification_uid")
         intent.removeExtra("notification_conversation")
+        onNotificationOpened?.invoke()
     }
     @Synchronized fun consumeOpen(context: Context, uid: String): String? {
         val p = prefs(context)
