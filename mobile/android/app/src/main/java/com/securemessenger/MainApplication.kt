@@ -23,6 +23,7 @@ class MainApplication : Application(), ReactApplication {
 
   override fun onCreate() {
     super.onCreate()
+    NexaNotifications.initialize(this)
     val rtcOptions = WebRTCModuleOptions.getInstance()
     rtcOptions.enableMediaProjectionService = true
     // Some x86 Android virtual clocks regress by sub-millisecond intervals.

@@ -6,7 +6,9 @@ import {
   Pressable,
   StyleSheet,
   ActivityIndicator,
+  useWindowDimensions,
 } from 'react-native';
+import {mediaWidth} from '../utils/layout';
 import {MediaImageItem} from '../types';
 
 interface MediaGridBubbleProps {
@@ -26,6 +28,8 @@ function MediaGridBubbleComponent({
   onDownloadAll,
   isDownloading,
 }: MediaGridBubbleProps) {
+  const {width}=useWindowDimensions();
+  const gridWidth=mediaWidth(width);
   if (!images || images.length === 0) return null;
 
   const total = images.length;
@@ -56,6 +60,7 @@ function MediaGridBubbleComponent({
     }
   }
 
+  const scale=Math.min(1,gridWidth/singleWidth);singleWidth*=scale;singleHeight*=scale;
   return (
     <View style={[styles.container, isMe ? styles.containerMe : styles.containerThem]}>
       {total === 1 ? (
@@ -130,7 +135,7 @@ function MediaGridBubbleComponent({
 
           {total === 2 ? (
             // 2 Photos: Side-by-side
-            <View style={styles.twoGridRow}>
+            <View style={[styles.twoGridRow,{width:gridWidth,height:gridWidth*.56}]}>
               {images.slice(0, 2).map((img, idx) => (
                 <Pressable
                   key={img.id || idx}
@@ -146,7 +151,7 @@ function MediaGridBubbleComponent({
             </View>
           ) : total === 3 ? (
             // 3 Photos: 1 on left, 2 stacked on right
-            <View style={styles.threeGridRow}>
+            <View style={[styles.threeGridRow,{width:gridWidth,height:gridWidth*.72}]}>
               <Pressable
                 onPress={() => onOpenImage(0)}
                 style={styles.threeLargeWrapper}>
@@ -173,7 +178,7 @@ function MediaGridBubbleComponent({
             </View>
           ) : (
             // 4 or 4+ Photos: 2x2 Matrix with +N overlay on 4th photo
-            <View style={styles.fourGridContainer}>
+            <View style={[styles.fourGridContainer,{width:gridWidth,height:gridWidth}]}>
               <View style={styles.fourGridRow}>
                 <Pressable onPress={() => onOpenImage(0)} style={styles.quarterWrapper}>
                   <Image

@@ -49,6 +49,21 @@ class NexaMediaModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun getSafeInsets(promise: Promise) {
+        val activity=reactApplicationContext.currentActivity
+        if(activity==null){promise.resolve(null);return}
+        activity.runOnUiThread {
+            val insets=androidx.core.view.ViewCompat.getRootWindowInsets(activity.window.decorView)
+            val bars=insets?.getInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars() or androidx.core.view.WindowInsetsCompat.Type.displayCutout())
+            val scale=reactContext.resources.displayMetrics.density
+            promise.resolve(Arguments.createMap().apply {
+                putDouble("top",(bars?.top?:0)/scale.toDouble());putDouble("bottom",(bars?.bottom?:0)/scale.toDouble())
+                putDouble("left",(bars?.left?:0)/scale.toDouble());putDouble("right",(bars?.right?:0)/scale.toDouble())
+            })
+        }
+    }
+
+    @ReactMethod
     fun pickImages(promise: Promise) {
         val activity = reactApplicationContext.currentActivity
         if (activity == null) {

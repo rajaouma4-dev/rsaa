@@ -137,8 +137,9 @@ export function CallHistoryBubble({
 
 const styles = StyleSheet.create({
   cardContainer: {
-    minWidth: 230,
+    width: '100%',
     maxWidth: 290,
+    minWidth: 0,
     backgroundColor: '#1A2437',
     borderRadius: 22,
     borderWidth: 1,

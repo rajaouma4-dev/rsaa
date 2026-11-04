@@ -11,6 +11,7 @@ import {
   ToastAndroid,
   ActivityIndicator,
   StatusBar,
+  useWindowDimensions,
   Image,
   Alert,
 } from 'react-native';
@@ -68,6 +69,7 @@ export function ChatScreen({
   onStartCall?: (user: User, callType: 'audio' | 'video') => void;
   onLoadThemes: (id?: string) => Promise<any>;
 }) {
+  const {width:windowWidth}=useWindowDimensions();
   const [text, setText] = useState('');
   const [appearance,setAppearance]=useState<Appearance>(DEFAULT_APPEARANCE);
   const [wallpapers,setWallpapers]=useState<Wallpaper[]>([]);
@@ -336,7 +338,7 @@ export function ChatScreen({
             </View>
           ) : null}
 
-          <View style={styles.bubbleContainer}>
+          <View style={[styles.bubbleContainer,hasCall&&{width:Math.min(270,(windowWidth-32)*.8)}]}>
             {hasCall ? (
               <CallHistoryBubble
                 uid={chat.user.id} name={chat.user.name}
@@ -426,12 +428,12 @@ export function ChatScreen({
   return (
     <KeyboardAvoidingView
       style={styles.screen}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 0}>
       {wallpaper?<Image pointerEvents="none" source={{uri:wallpaper}} resizeMode="cover" style={[StyleSheet.absoluteFill,{opacity:0.18}]}/>:null}
       {/* Conversation header */}
       <View style={styles.header}>
-        <Pressable onPress={onBack} hitSlop={10} style={styles.backBtn}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Back to messages" onPress={onBack} hitSlop={4} style={styles.backBtn}>
           <Text style={styles.backArrow}>‹</Text>
         </Pressable>
         <Avatar uid={chat.user.id} name={chat.user.name} online={chat.user.online} size={42} />
@@ -440,6 +442,7 @@ export function ChatScreen({
             {chat.user.name}
           </Text>
           <Text
+            numberOfLines={1}
             style={[
               styles.headerPresence,
               chat.user.online ? styles.presenceOnline : styles.presenceOffline,
@@ -569,11 +572,14 @@ export function ChatScreen({
               placeholderTextColor="#8A8D91"
               style={styles.input}
               multiline
+              textAlignVertical="center"
             />
           </View>
 
           {/* Send / Action Button */}
           <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Send message"
             onPress={selectedPhotoUris.length > 0 ? handleSendSelectedPhotos : send}
             disabled={isProcessingPhotos || (selectedPhotoUris.length === 0 && !text.trim())}
             style={[
@@ -603,8 +609,8 @@ export function ChatScreen({
   );
 }
 
-const TOP_INSET = Platform.OS === 'android' ? Math.max(StatusBar.currentHeight || 0, 36) : 20;
-const BOTTOM_INSET = Platform.OS === 'android' ? 16 : 10;
+const TOP_INSET = Platform.OS === 'android' ? 8 : 20;
+const BOTTOM_INSET = Platform.OS === 'android' ? 0 : 10;
 
 const styles = StyleSheet.create({
   screen: {
@@ -612,18 +618,19 @@ const styles = StyleSheet.create({
     backgroundColor: '#0C1220',
   },
   header: {
-    paddingTop: TOP_INSET,
-    minHeight: 56 + TOP_INSET,
-    paddingHorizontal: 12,
+    paddingVertical: 6,
+    minHeight: 64,
+    paddingHorizontal: 8,
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: '#151E30',
     borderBottomWidth: 1,
     borderBottomColor: '#243149',
-    gap: 8,
+    gap: 4,
   },
   backBtn: {
-    paddingRight: 6,
+    width: 32,
+    alignItems: 'center',
     paddingVertical: 8,
   },
   backArrow: {
@@ -634,11 +641,13 @@ const styles = StyleSheet.create({
   },
   headerInfo: {
     flex: 1,
+    minWidth: 0,
     justifyContent: 'center',
   },
   headerName: {
     color: '#F2F5FC',
     fontSize: 16,
+    flexShrink: 1,
     fontWeight: '700',
   },
   headerPresence: {
@@ -667,12 +676,12 @@ const styles = StyleSheet.create({
   headerActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    marginLeft: 4,
+    gap: 2,
+    marginLeft: 0,
   },
   headerCallBtn: {
-    width: 36,
-    height: 36,
+    width: 40,
+    height: 44,
     borderRadius: 18,
     backgroundColor: '#243149',
     alignItems: 'center',
@@ -832,6 +841,9 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   recordingTip: {
+    flex:1,
+    textAlign:'center',
+    marginHorizontal:8,
     color: '#8A8D91',
     fontSize: 12,
   },
@@ -886,8 +898,8 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   composerActionBtn: {
-    width: 36,
-    height: 38,
+    width: 40,
+    height: 44,
     justifyContent: 'center',
     alignItems: 'center',
   },
@@ -900,6 +912,7 @@ const styles = StyleSheet.create({
   },
   inputPill: {
     flex: 1,
+    minWidth: 0,
     backgroundColor: '#243149',
     borderRadius: 20,
     paddingHorizontal: 14,
@@ -915,8 +928,8 @@ const styles = StyleSheet.create({
     maxHeight: 90,
   },
   sendBtn: {
-    width: 38,
-    height: 38,
+    width: 44,
+    height: 44,
     borderRadius: 19,
     backgroundColor: '#9D83FF',
     justifyContent: 'center',

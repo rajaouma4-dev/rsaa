@@ -1,10 +1,10 @@
-import React, {useState} from 'react';
-import {View, Text, TextInput, Pressable, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, ActivityIndicator, StatusBar} from 'react-native';
+import React, {useState,useRef,useEffect} from 'react';
+import {View, Text, TextInput, Pressable, KeyboardAvoidingView, Platform, ScrollView, StyleSheet, ActivityIndicator, Keyboard,useWindowDimensions} from 'react-native';
 import {Brand} from '../components/Brand';
 import {C, S} from '../theme';
 import {APP_CONFIG, updateSignalingHost} from '../config';
 
-const TOP_INSET = Platform.OS === 'android' ? Math.max(StatusBar.currentHeight || 0, 36) + 16 : 52;
+const TOP_INSET = Platform.OS === 'android' ? 12 : 52;
 const BOTTOM_INSET = Platform.OS === 'android' ? 20 : 12;
 
 export function AuthScreen({
@@ -20,6 +20,11 @@ export function AuthScreen({
   busy?: boolean;
   demoMode?: boolean;
 }) {
+  const scroll=useRef<React.ElementRef<typeof ScrollView>>(null);const focused=useRef<number|null>(null);
+  const {width,height}=useWindowDimensions();
+  const reveal=()=>{if(focused.current)scroll.current?.scrollResponderScrollNativeHandleToKeyboard(focused.current,20,true);};
+  const onFocus=(event:any)=>{focused.current=event.nativeEvent.target;requestAnimationFrame(reveal);};
+  useEffect(()=>{const sub=Keyboard.addListener('keyboardDidShow',()=>requestAnimationFrame(reveal));return()=>sub.remove();},[]);
   const [name, setName] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -73,19 +78,19 @@ export function AuthScreen({
   };
 
   return <KeyboardAvoidingView style={S.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-    <ScrollView contentContainerStyle={styles.wrap} keyboardShouldPersistTaps="handled">
+    <ScrollView ref={scroll} style={{flex:1}} contentContainerStyle={[styles.wrap,{paddingHorizontal:width<360?14:24}]} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" automaticallyAdjustKeyboardInsets={Platform.OS==='ios'}>
       <View style={styles.top}>
-        <Brand />
-        <Pressable onPress={() => setShowServerInput(prev => !prev)} style={styles.pill}>
+        <Brand small={width<380}/>
+        <View style={styles.pill}>
           <View style={styles.pulse}/>
-          <Text style={styles.pillText}>SERVER: {serverHost}</Text>
-        </Pressable>
+          <Text style={styles.pillText}>PRIVATE CHAT</Text>
+        </View>
       </View>
 
       {showServerInput ? (
         <View style={styles.serverBox}>
           <Text style={styles.serverLabel}>Backend Host / IP (default: {APP_CONFIG.SIGNALING_HOST}):</Text>
-          <TextInput
+          <TextInput onFocus={onFocus}
             value={serverHost}
             onChangeText={val => {
               setServerHost(val);
@@ -100,29 +105,30 @@ export function AuthScreen({
         </View>
       ) : null}
 
-      <View style={styles.hero}>
+      <View style={[styles.hero,height<650&&{marginTop:12,marginBottom:12}]}>
         <Text style={styles.eyebrow}>YOUR SPACE. YOUR PEOPLE.</Text>
-        <Text style={styles.title}>{isRegister ? 'Create your\nquiet corner.' : 'Good to see\nyou again.'}</Text>
+        <Text style={[styles.title,height<650&&{fontSize:28,lineHeight:33}]}>{isRegister ? 'Create your\nquiet corner.' : 'Good to see\nyou again.'}</Text>
         <Text style={styles.sub}>A simple place for conversations that matter.</Text>
       </View>
       <View style={styles.card}>
         <Text style={styles.cardTitle}>{isRegister ? 'Create account' : 'Welcome back'}</Text>
-        {isRegister ? <TextInput value={name} onChangeText={setName} placeholder="Your name" placeholderTextColor={C.muted} style={S.input} autoCapitalize="words" maxLength={60} editable={!submitting}/> : null}
-        <TextInput value={username} onChangeText={value => {setUsername(value); setError('');}} placeholder="Username" placeholderTextColor={C.muted} style={S.input} autoCapitalize="none" autoCorrect={false} maxLength={24} editable={!submitting}/>
+        {isRegister ? <TextInput onFocus={onFocus} value={name} onChangeText={setName} placeholder="Your name" placeholderTextColor={C.muted} style={S.input} autoCapitalize="words" maxLength={60} editable={!submitting}/> : null}
+        <TextInput onFocus={onFocus} value={username} onChangeText={value => {setUsername(value); setError('');}} placeholder="Username" placeholderTextColor={C.muted} style={S.input} autoCapitalize="none" autoCorrect={false} maxLength={24} editable={!submitting}/>
         
         <View style={styles.passwordContainer}>
-          <TextInput
+          <TextInput onFocus={onFocus}
             value={password}
             onChangeText={value => {setPassword(value); setError('');}}
-            placeholder="Password (min 6 characters)"
+            placeholder="Password"
+            accessibilityLabel="Password, at least 6 characters"
             placeholderTextColor={C.muted}
             style={[S.input, styles.passwordInput]}
             secureTextEntry={!showPassword}
             maxLength={128}
             editable={!submitting}
           />
-          <Pressable onPress={() => setShowPassword(p => !p)} style={styles.eyeBtn}>
-            <Text style={styles.eyeIcon}>{showPassword ? '🙈' : '👁️'}</Text>
+          <Pressable accessibilityRole="button" accessibilityLabel={showPassword ? 'Hide password' : 'Show password'} onPress={() => setShowPassword(p => !p)} style={styles.eyeBtn}>
+            <Text style={styles.eyeIcon}>{showPassword ? 'Hide' : 'Show'}</Text>
           </Pressable>
         </View>
 
@@ -132,43 +138,45 @@ export function AuthScreen({
 
         {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
         <Pressable disabled={!ready || submitting} onPress={() => { void submit(); }} style={[S.primaryButton, (!ready || submitting) && {opacity: 0.45}]}>
-          {submitting ? <ActivityIndicator color="#06251C"/> : <Text style={S.primaryText}>{isRegister ? 'Create account' : 'Sign in'}  →</Text>}
+          {submitting ? <ActivityIndicator color="#1C1038"/> : <Text style={S.primaryText}>{isRegister ? 'Create account' : 'Sign in'}  →</Text>}
         </Pressable>
         <View style={styles.switchRow}>
           <Text style={styles.switchText}>{isRegister ? 'Already have an account?' : 'New to Nexa?'}</Text>
           <Text onPress={() => switchMode(isRegister ? 'login' : 'register')} style={styles.switchLink}>{isRegister ? ' Sign in' : ' Create account'}</Text>
         </View>
       </View>
-      <View style={styles.footer}><Text style={styles.lock}>▣</Text><Text style={styles.footerText}>{demoMode ? 'Demo preview · No real account is created' : 'Account credentials are sent only over the configured TLS connection'}</Text></View>
+      <View style={styles.footer}><Text style={styles.lock}>▣</Text><Text style={styles.footerText}>{demoMode ? 'Demo preview · No real account is created' : 'A private space to stay close.'}</Text></View>
+      <Pressable accessibilityRole="button" onPress={() => {setShowServerInput(prev => !prev);scroll.current?.scrollTo({y:0,animated:true});}} style={styles.connection}><Text style={styles.footerText}>Connection settings</Text></Pressable>
     </ScrollView>
   </KeyboardAvoidingView>;
 }
 
 const styles = StyleSheet.create({
-  wrap: {flexGrow: 1, padding: 24, paddingTop: TOP_INSET, paddingBottom: BOTTOM_INSET, justifyContent: 'space-between'},
-  top: {flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center'},
-  pill: {flexDirection: 'row', alignItems: 'center', gap: 7, borderWidth: 1, borderColor: C.line, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 20},
+  wrap: {flexGrow: 1,width:'100%',maxWidth:560,alignSelf:'center', padding: 24, paddingTop: TOP_INSET, paddingBottom: BOTTOM_INSET, justifyContent: 'flex-start'},
+  top: {flexDirection: 'row', flexWrap:'wrap', gap:12, justifyContent: 'space-between', alignItems: 'center'},
+  pill: {maxWidth:'100%',flexShrink:1,flexDirection: 'row', alignItems: 'center', gap: 7, borderWidth: 1, borderColor: C.line, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 20},
   pulse: {width: 6, height: 6, borderRadius: 6, backgroundColor: C.green},
   pillText: {fontSize: 9, color: C.muted, letterSpacing: 1.1, fontWeight: '800'},
   serverBox: {marginTop: 14, padding: 12, backgroundColor: C.panel, borderColor: C.line, borderWidth: 1, borderRadius: 14, gap: 6},
   serverLabel: {color: C.muted, fontSize: 11, fontWeight: '600'},
-  serverInput: {height: 42, fontSize: 13},
-  hero: {marginTop: 28, marginBottom: 20},
+  serverInput: {minHeight: 44, fontSize: 13},
+  hero: {marginTop: 32, marginBottom: 24},
   eyebrow: {color: C.green, letterSpacing: 2, fontSize: 10, fontWeight: '800', marginBottom: 11},
   title: {color: C.text, fontSize: 36, lineHeight: 40, fontWeight: '900', letterSpacing: -1.2},
   sub: {color: C.muted, fontSize: 13, marginTop: 12, lineHeight: 19, maxWidth: 270},
-  card: {backgroundColor: C.panel, borderColor: C.line, borderWidth: 1, borderRadius: 24, padding: 20, gap: 13},
+  card: {backgroundColor: C.panel, borderColor: C.line, borderWidth: 1, borderRadius: 24, padding: 16, gap: 13},
   cardTitle: {color: C.text, fontSize: 19, fontWeight: '800', marginBottom: 4},
   passwordContainer: {position: 'relative', justifyContent: 'center'},
   passwordInput: {paddingRight: 48},
   eyeBtn: {position: 'absolute', right: 12, height: 40, width: 40, alignItems: 'center', justifyContent: 'center'},
-  eyeIcon: {fontSize: 18},
+  eyeIcon: {fontSize: 11, color:C.green,fontWeight:'700'},
   hint: {color: C.muted, fontSize: 11, marginTop: -6, marginLeft: 4},
-  switchRow: {flexDirection: 'row', justifyContent: 'center', marginTop: 2},
+  switchRow: {flexDirection: 'row',flexWrap:'wrap', justifyContent: 'center', marginTop: 2},
   switchText: {color: C.muted, fontSize: 12},
   switchLink: {color: C.green, fontWeight: '800', fontSize: 12},
   footer: {flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginTop: 20},
   lock: {color: C.green},
-  footerText: {color: C.muted, fontSize: 10},
+  footerText: {flex:1,flexShrink:1,textAlign:'center',color: C.muted, fontSize: 10},
+  connection: {minHeight:44,justifyContent:'center',alignItems:'center',marginTop:4},
   error: {color: C.red, fontSize: 12, lineHeight: 18},
 });

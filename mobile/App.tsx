@@ -1,5 +1,6 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {StatusBar, View, Alert, Text, ActivityIndicator, AppState, AppStateStatus, Platform} from 'react-native';
+import {StatusBar, View, Alert, Text, ActivityIndicator, AppState, AppStateStatus, Platform,BackHandler} from 'react-native';
+import {startNotifications, recordIncomingNotification, clearNotificationAccount} from './src/services/notifications';
 import {AuthScreen} from './src/screens/AuthScreen';
 import {HomeScreen, formatSnippet} from './src/screens/HomeScreen';
 import {ChatScreen} from './src/screens/ChatScreen';
@@ -60,12 +61,14 @@ async function mapInbox(conversations: InboxConversation[], onlineUsers?: Set<st
 }
 
 export default function App() {
+  const [notificationConversation, setNotificationConversation] = useState<string | null>(null);
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [session, setSession] = useState<Session | null>(null);
   const [isInitializing, setIsInitializing] = useState(true);
   const [chats, setChats] = useState<Chat[]>([]);
   const [selected, setSelected] = useState<Chat | null>(null);
   const selectedRef = useRef<Chat | null>(null);
+  const notificationUidRef = useRef<string | null>(null);
   const onlineUsersRef = useRef<Set<string>>(new Set<string>());
   const [authBusy, setAuthBusy] = useState(false);
   const [rtcStatus, setRtcStatus] = useState<RtcStatus>('disconnected');
@@ -73,12 +76,13 @@ export default function App() {
   const signalRef = useRef<TlsSignalingClient | null>(null);
   const rtcRef = useRef<ServerDataChannel | null>(null);
 
-  useEffect(() => {
-    if (Platform.OS === 'android') {
-      (StatusBar as any).setBackgroundColor?.('#242526');
-      (StatusBar as any).setTranslucent?.(false);
-    }
-  }, []);
+  useEffect(()=>{
+    const subscription=BackHandler.addEventListener('hardwareBackPress',()=>{
+      if(selectedRef.current){selectedRef.current=null;setSelected(null);return true;}
+      if(!session&&mode==='register'){setMode('login');return true;}
+      return false;
+    });return()=>subscription.remove();
+  },[session,mode]);
 
   const ensureConnectedRef = useRef<() => Promise<boolean>>(() => Promise.resolve(false));
 
@@ -359,11 +363,13 @@ export default function App() {
         setChats(current => current.some(item => item.id === newChat.id) ? current : [newChat, ...current]);
       } else if (envelope.type === 'new_message' && envelope.message) {
         const incoming = envelope.message;
+        const notificationUid = notificationUidRef.current;
         const handleIncoming = async () => {
           const isCurrentChat = selectedRef.current?.id === incoming.conversation_id && AppState.currentState === 'active' && callService.getState().status === 'idle';
           // A retry after a lost ACK must not decrypt the same ratchet message twice.
           const known = (await getLocalMessages(incoming.conversation_id)).find(m => m.id === incoming.message_id);
           if (known) {
+            if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id);
             try { rtcRef.current?.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id}); } catch {}
             return;
           }
@@ -417,6 +423,7 @@ export default function App() {
           };
 
           await appendLocalMessage(incoming.conversation_id, incomingMsg);
+          if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id);
           // Acknowledge only after the local message write succeeds.
           try {
             if (rtcRef.current?.isOpen) {
@@ -515,6 +522,7 @@ export default function App() {
       try {
         void refreshTurnCredentials();
         saved = await readLiveSession();
+        notificationUidRef.current = saved?.uid || null;
         if (!saved || cancelled) {
           setIsInitializing(false);
           return;
@@ -712,6 +720,18 @@ export default function App() {
       sub.remove();
     };
   }, [session, ensureConnected]);
+
+  useEffect(() => {
+    if (isInitializing) return;
+    if (!session?.uid) { void clearNotificationAccount(); return; }
+    return startNotifications(session.uid, () => signalRef.current, setNotificationConversation);
+  }, [session?.uid, isInitializing]);
+
+  useEffect(() => {
+    if (!notificationConversation || !session) return;
+    const chat = chats.find(item => item.id === notificationConversation);
+    if (chat) { setNotificationConversation(null); void openChat(chat); }
+  }, [notificationConversation, chats, session?.uid]);
 
   const searchPeople = useCallback(async (query: string): Promise<User[]> => {
     if (APP_CONFIG.DEMO_MODE) {
@@ -1167,6 +1187,7 @@ export default function App() {
       if (!result?.token || !result?.uid) {
         throw new Error('Invalid username or password.');
       }
+      notificationUidRef.current = result.uid;
       pendingSignal.setAuthenticated(true);
 
       const inbox = await pendingSignal.request<{conversations?: Array<{conversation_id: string; user: {uid: string; username: string; display_name: string; about: string; online: boolean}; unread_count: number; has_messages: boolean; updated_at: string}>}>(
@@ -1251,6 +1272,9 @@ export default function App() {
   };
 
   const logout = async () => {
+    notificationUidRef.current = null;
+    await clearNotificationAccount();
+    setNotificationConversation(null);
     callService.endCall('Signed out');
     outboxRef.current = null;
     onlineUsersRef.current.clear();

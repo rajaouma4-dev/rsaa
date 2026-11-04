@@ -1,4 +1,5 @@
 mod proxy;
+mod push;
 mod calls;
 mod db;
 mod protocol;
@@ -56,6 +57,9 @@ async fn main() -> Result<()> {
     let token = env::var("TURSO_AUTH_TOKEN").context("TURSO_AUTH_TOKEN missing")?;
     let store = Store::connect(&url, &token).await?;
     store.migrate().await?;
+    if let Some(sender) = push::PushSender::from_env()? {
+        tokio::spawn(push::run_worker(store.clone(), sender));
+    } else { tracing::warn!("FCM push disabled: FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_FILE is not configured"); }
 
     let channels: LiveChannels = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let live_signaling: LiveSignaling = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -322,6 +326,29 @@ where
                         if expired { send_error(&signal_tx, "SESSION_EXPIRED", "session expired or revoked; sign in again").await?; }
                         else { send_error(&signal_tx, "AUTH_UNAVAILABLE", "session verification temporarily unavailable; retry shortly").await?; }
                     },
+                }
+            }
+            ClientFrame::RegisterPush { installation_id, token, enabled, foreground } => {
+                let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
+                    send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
+                };
+                match store.register_push(&user.uid, session, &installation_id, &token, enabled, foreground).await {
+                    Ok(()) => signal_tx.send(ServerFrame::PushRegistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx, "PUSH_REGISTER_FAILED", "could not register notifications").await?,
+                }
+            }
+            ClientFrame::PushState { installation_id, foreground } => {
+                if let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) {
+                    let _ = store.push_state(&user.uid, session, &installation_id, foreground).await;
+                }
+            }
+            ClientFrame::UnregisterPush { installation_id } => {
+                let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
+                    send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
+                };
+                match store.unregister_push(&user.uid, session, &installation_id).await {
+                    Ok(()) => signal_tx.send(ServerFrame::PushUnregistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx, "PUSH_UNREGISTER_FAILED", "could not unregister notifications").await?,
                 }
             }
             ClientFrame::Logout => {
@@ -658,6 +685,8 @@ async fn handle_ws_client(
                 "turn": ice_urls.iter().filter(|url| url.starts_with("turn:") || url.starts_with("turns:")).count()
             },
             "build_revision": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "local".to_owned()),
+            "push_configured": (["FIREBASE_SERVICE_ACCOUNT_JSON", "FIREBASE_SERVICE_ACCOUNT_FILE"].iter()
+                .any(|key| env::var(key).is_ok_and(|value| !value.trim().is_empty()))),
         }).to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -804,6 +833,29 @@ async fn handle_ws_client(
                         if expired { send_error(&signal_tx, "SESSION_EXPIRED", "session expired or revoked; sign in again").await?; }
                         else { send_error(&signal_tx, "AUTH_UNAVAILABLE", "session verification temporarily unavailable; retry shortly").await?; }
                     },
+                }
+            }
+            ClientFrame::RegisterPush { installation_id, token, enabled, foreground } => {
+                let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
+                    send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
+                };
+                match store.register_push(&user.uid, session, &installation_id, &token, enabled, foreground).await {
+                    Ok(()) => signal_tx.send(ServerFrame::PushRegistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx, "PUSH_REGISTER_FAILED", "could not register notifications").await?,
+                }
+            }
+            ClientFrame::PushState { installation_id, foreground } => {
+                if let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) {
+                    let _ = store.push_state(&user.uid, session, &installation_id, foreground).await;
+                }
+            }
+            ClientFrame::UnregisterPush { installation_id } => {
+                let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
+                    send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
+                };
+                match store.unregister_push(&user.uid, session, &installation_id).await {
+                    Ok(()) => signal_tx.send(ServerFrame::PushUnregistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
+                    Err(_) => send_error(&signal_tx, "PUSH_UNREGISTER_FAILED", "could not unregister notifications").await?,
                 }
             }
             ClientFrame::Logout => {

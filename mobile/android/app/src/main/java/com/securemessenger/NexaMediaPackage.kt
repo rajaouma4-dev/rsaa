@@ -9,7 +9,7 @@ import com.facebook.react.uimanager.ViewManager
 
 class NexaMediaPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
-        return listOf(NexaMediaModule(reactContext))
+        return listOf(NexaMediaModule(reactContext), NexaNotificationsModule(reactContext))
     }
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<View, ReactShadowNode<*>>> {

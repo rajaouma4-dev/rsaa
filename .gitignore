@@ -14,3 +14,8 @@ mobile/android/app/build/
 mobile/android/app/.cxx/
 /.nb/
 mobile/ios/Pods/
+
+mobile/android/app/google-services.json
+**/firebase-service-account*.json
+**/*firebase-adminsdk*.json
+__pycache__/

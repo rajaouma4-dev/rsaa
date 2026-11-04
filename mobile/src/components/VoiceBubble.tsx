@@ -108,8 +108,9 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     paddingHorizontal: 12,
     borderRadius: 20,
-    minWidth: 190,
-    maxWidth: 240,
+    width: 230,
+    maxWidth: '100%',
+
   },
   containerMe: {
     backgroundColor: '#0084FF',
@@ -138,10 +139,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     height: 30,
+    minWidth:0,
+    overflow: 'hidden',
     marginRight: 10,
   },
   waveBar: {
     width: 3,
+    flexShrink:1,
     borderRadius: 2,
   },
   waveBarActive: {

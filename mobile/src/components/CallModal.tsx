@@ -1,9 +1,10 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {
-  Animated, Modal, View, Text, StyleSheet, Pressable, SafeAreaView,
+  Animated, Modal, View, Text, StyleSheet, Pressable,
   StatusBar, Platform, PanResponder, useWindowDimensions,
 } from 'react-native';
 import {Avatar} from './Avatar';
+import {useModalInsets} from '../utils/layout';
 import {RTCView} from 'react-native-webrtc';
 import {CallState, callService, CallQuality} from '../services/callService';
 import {clampPreview, previewBounds, PreviewPoint} from './callPreviewLayout';
@@ -52,10 +53,13 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
   const window = useWindowDimensions();
   const [viewport, setViewport] = useState({width: window.width, height: window.height});
   const [controlsHeight, setControlsHeight] = useState(120);
-  const topInset = Platform.OS === 'android' ? (StatusBar.currentHeight || 24) : 20;
+  const insets = useModalInsets();
+  const topInset = insets.top;
+  const compact = viewport.height < 480;
+  const avatarSize = compact ? 64 : 140;
   const pipHeight = Math.min(158, Math.max(64, viewport.height - topInset - controlsHeight - 130));
   const pipWidth = Math.min(112, Math.round(pipHeight * 0.72));
-  const bounds = previewBounds(viewport.width, viewport.height, pipWidth, pipHeight, topInset, controlsHeight);
+  const bounds = previewBounds(viewport.width, viewport.height, pipWidth, pipHeight, topInset, controlsHeight + insets.bottom);
   const boundsRef = useRef(bounds);
   boundsRef.current = bounds;
   const position = useRef(new Animated.ValueXY()).current;
@@ -105,7 +109,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
     void callService.setQuality(next[callState.quality]);
   };
 
-  return <Modal visible animationType="slide" transparent statusBarTranslucent
+  return <Modal visible animationType="slide" transparent statusBarTranslucent navigationBarTranslucent
     onRequestClose={() => { if (!ended) callService.endCall(); }}>
     <StatusBar barStyle="light-content"/>
     <View style={styles.root} onLayout={event => setViewport(event.nativeEvent.layout)}>
@@ -116,7 +120,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
         objectFit={callState.isPeerScreenSharing ? 'contain' : 'cover'} zOrder={0}/> : null}
       {remoteVideo ? <View pointerEvents="none" style={styles.videoShade}/> : null}
 
-      <SafeAreaView style={[styles.content, {paddingTop: topInset + 12}]} pointerEvents="box-none">
+      <View style={[styles.content, {paddingTop: topInset + 8, paddingBottom:insets.bottom, paddingLeft:insets.left, paddingRight:insets.right}]} pointerEvents="box-none">
         <View style={styles.header}>
           <View style={styles.brandMark}><Text style={styles.brandLetter}>N</Text></View>
           <View style={styles.headerText}>
@@ -133,16 +137,16 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
           <Text style={styles.sharingText}>{callState.isScreenSharing ? 'You are sharing your screen' : 'Viewing shared screen'}</Text>
         </View> : null}
 
-        <View pointerEvents="none" style={styles.center}>
+        <View pointerEvents="none" style={[styles.center,compact&&{paddingBottom:0}]}>
           {!remoteVideo ? <>
-            <View style={[styles.avatar, isIncoming && styles.ringingAvatar]}>
-              <Avatar uid={callState.remoteUser?.uid} name={callState.remoteUser?.name||'Contact'} size={140}/>
+            <View style={[styles.avatar,{width:avatarSize+6,height:avatarSize+6,borderRadius:(avatarSize+6)/2}, isIncoming && styles.ringingAvatar]}>
+              <Avatar uid={callState.remoteUser?.uid} name={callState.remoteUser?.name||'Contact'} size={avatarSize}/>
             </View>
-            <Text style={styles.callType}>{callState.callType === 'video' ? 'Video call' : 'Audio call'}</Text>
+            <Text style={[styles.callType,compact&&{marginTop:4}]}>{callState.callType === 'video' ? 'Video call' : 'Audio call'}</Text>
           </> : null}
         </View>
 
-        <View style={styles.bottom} onLayout={event => setControlsHeight(event.nativeEvent.layout.height)}>
+        <View style={[styles.bottom,compact&&{paddingVertical:6}]} onLayout={event => setControlsHeight(event.nativeEvent.layout.height)}>
           {isIncoming ? <View style={styles.incoming}>
             <Control icon="end" label="Decline" danger onPress={() => callService.rejectCall()}/>
             <Pressable accessibilityRole="button" accessibilityLabel="Accept call"
@@ -164,7 +168,7 @@ export function CallModal({callState, myDisplayName}: CallModalProps) {
             <Control icon="end" label="End" danger disabled={ended} onPress={() => callService.endCall()}/>
           </View>}
         </View>
-      </SafeAreaView>
+      </View>
 
       {isConnected && localUrl && cameraActive && !callState.isScreenSharing ? <Animated.View
         testID="call-self-preview" accessibilityLabel="Your camera preview. Drag to move"
@@ -192,7 +196,7 @@ const styles = StyleSheet.create({
   header: {flexDirection: 'row', alignItems: 'flex-start', paddingHorizontal: 20, minHeight: 70, zIndex: 10},
   brandMark: {width: 36, height: 36, borderRadius: 18, backgroundColor: 'rgba(222,203,255,0.15)', alignItems: 'center', justifyContent: 'center'},
   brandLetter: {fontSize: 16, fontWeight: '700', color: '#eadcff'},
-  headerText: {flex: 1, alignItems: 'center', paddingHorizontal: 10},
+  headerText: {flex: 1,minWidth:0, alignItems: 'center', paddingHorizontal: 10},
   name: {fontSize: 19, fontWeight: '600', color: '#fff', textShadowColor: '#1c0e2a', textShadowRadius: 5, textShadowOffset: {width: 0, height: 1}},
   status: {fontSize: 13, color: '#eee3fb', marginTop: 5, textAlign: 'center'},
   quality: {minWidth: 44, height: 34, borderRadius: 18, backgroundColor: 'rgba(207,185,244,0.22)', alignItems: 'center', justifyContent: 'center'},
@@ -203,10 +207,10 @@ const styles = StyleSheet.create({
   ringingAvatar: {borderWidth: 3, borderColor: '#bc93f4'},
   initials: {fontSize: 46, fontWeight: '500', color: '#f1e7ff'},
   callType: {color: '#c3aed7', fontSize: 12, marginTop: 18, letterSpacing: 0.5},
-  bottom: {paddingHorizontal: 12, paddingBottom: Platform.OS === 'ios' ? 12 : 28, paddingTop: 12},
-  dock: {flexDirection: 'row', alignItems: 'center', justifyContent: 'space-evenly', backgroundColor: 'rgba(38,24,54,0.64)', borderRadius: 30, paddingHorizontal: 6, paddingVertical: 16, borderWidth: 1, borderColor: 'rgba(232,211,255,0.07)'},
+  bottom: {paddingHorizontal: 12, paddingBottom:12, paddingTop:12},
+  dock: {flexDirection: 'row', flexWrap:'wrap', rowGap:14, alignItems: 'center', justifyContent: 'space-evenly', backgroundColor: 'rgba(38,24,54,0.64)', borderRadius: 30, paddingHorizontal: 6, paddingVertical: 16, borderWidth: 1, borderColor: 'rgba(232,211,255,0.07)'},
   incoming: {flexDirection: 'row', justifyContent: 'space-evenly', paddingVertical: 16},
-  control: {alignItems: 'center', flexShrink: 1, minWidth: 52},
+  control: {alignItems: 'center', flexShrink: 1, minWidth: 52, paddingHorizontal:2},
   controlCircle: {width: 48, height: 48, borderRadius: 24, backgroundColor: 'rgba(212,191,239,0.18)', alignItems: 'center', justifyContent: 'center'},
   controlSelected: {backgroundColor: '#8055ae', borderWidth: 1, borderColor: '#c8a2f0'},
   endCircle: {backgroundColor: '#ff263b'},

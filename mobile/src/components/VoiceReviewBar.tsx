@@ -129,6 +129,7 @@ const styles = StyleSheet.create({
   },
   infoContainer: {
     flex: 1,
+    minWidth:0,
   },
   previewLabel: {
     color: '#A4B1C7',

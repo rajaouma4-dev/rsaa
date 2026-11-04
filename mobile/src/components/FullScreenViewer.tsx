@@ -10,6 +10,7 @@ import {
   ToastAndroid,
   Platform,
 } from 'react-native';
+import {useModalInsets} from '../utils/layout';
 import {MediaImageItem} from '../types';
 import {saveBatchToPhoneGallery} from '../services/mediaBridge';
 
@@ -28,13 +29,14 @@ export function FullScreenViewer({
   isHd,
   onClose,
 }: FullScreenViewerProps) {
+  const insets=useModalInsets();
   const [currentIndex, setCurrentIndex] = useState(initialIndex || 0);
   const [isSaving, setIsSaving] = useState(false);
 
   // Sync index when initialIndex changes
   React.useEffect(() => {
-    setCurrentIndex(initialIndex || 0);
-  }, [initialIndex]);
+    setCurrentIndex(Math.max(0,Math.min(initialIndex||0,images.length-1)));
+  }, [initialIndex,visible,images.length]);
 
   if (!images || images.length === 0) return null;
 
@@ -68,11 +70,13 @@ export function FullScreenViewer({
 
   return (
     <Modal
+      statusBarTranslucent
+      navigationBarTranslucent
       visible={visible}
       transparent={false}
       animationType="fade"
       onRequestClose={onClose}>
-      <View style={styles.container}>
+      <View style={[styles.container,{paddingTop:insets.top,paddingBottom:insets.bottom,paddingLeft:insets.left,paddingRight:insets.right}]}>
         {/* Top Navigation Bar */}
         <View style={styles.topBar}>
           <Pressable onPress={onClose} hitSlop={12} style={styles.actionBtn}>
@@ -91,6 +95,7 @@ export function FullScreenViewer({
           </View>
 
           <Pressable
+            accessibilityLabel="Save image to gallery"
             onPress={handleDownload}
             disabled={isSaving}
             hitSlop={12}
@@ -106,7 +111,7 @@ export function FullScreenViewer({
         {/* Main Image Stage */}
         <View style={styles.stage}>
           <Image
-            source={{uri: currentImg.fullBase64 ? `data:image/jpeg;base64,${currentImg.fullBase64}` : currentImg.thumb}}
+            source={{uri: currentImg.fullBase64 ? (currentImg.fullBase64.startsWith('data:')?currentImg.fullBase64:`data:image/jpeg;base64,${currentImg.fullBase64}`) : currentImg.thumb}}
             style={styles.fullImage}
             resizeMode="contain"
           />
@@ -146,7 +151,11 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   actionBtn: {
-    padding: 6,
+    padding: 8,
+    minWidth:44,
+    minHeight:44,
+    alignItems:'center',
+    justifyContent:'center',
   },
   closeIcon: {
     color: '#FFFFFF',

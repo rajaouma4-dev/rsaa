@@ -43,6 +43,20 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;27.0.12077973"
       - name: Generate native Android shell
         run: bash scripts/bootstrap-native.sh
+      - name: Restore Firebase Android configuration
+        env:
+          FIREBASE_ANDROID_CONFIG: ${{ secrets.FIREBASE_ANDROID_CONFIG || vars.FIREBASE_ANDROID_CONFIG }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          raw = os.environ.get('FIREBASE_ANDROID_CONFIG', '')
+          if raw:
+              config = json.loads(raw)
+              assert any(c.get('client_info', {}).get('android_client_info', {}).get('package_name') == 'com.securemessenger' for c in config.get('client', [])), 'Firebase package mismatch'
+              pathlib.Path('mobile/android/app/google-services.json').write_text(raw)
+          else:
+              print('::warning::FIREBASE_ANDROID_CONFIG is missing; this APK will not have background push configured')
+          PY
       - name: Install mobile dependencies
         working-directory: mobile
         run: npm ci --no-audit --no-fund
@@ -67,6 +81,7 @@ jobs:
           node test-call-preview.cjs
           node test-chat-appearance.cjs
           node test-avatars.cjs
+          node test-notifications.cjs
       - name: Build release APK
         working-directory: mobile/android
         run: |

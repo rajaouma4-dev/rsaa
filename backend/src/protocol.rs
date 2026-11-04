@@ -7,6 +7,9 @@ pub enum ClientFrame {
     Login { username: String, password: String },
     Resume { token: String },
     Logout,
+    RegisterPush { installation_id: String, token: String, enabled: bool, foreground: bool },
+    PushState { installation_id: String, foreground: bool },
+    UnregisterPush { installation_id: String },
     SearchUsers { query: String },
     CreateConversation { other_uid: String },
     ListConversations,
@@ -30,6 +33,8 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     AuthOk { uid: String, username: String, display_name: String, about: String, token: String },
     LoggedOut,
+    PushRegistered,
+    PushUnregistered,
     Users { users: Vec<UserSummary> },
     Conversation { conversation_id: String, user: UserSummary },
     Conversations { conversations: Vec<ConversationSummary> },
