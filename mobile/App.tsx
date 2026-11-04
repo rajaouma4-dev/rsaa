@@ -79,6 +79,7 @@ export default function App() {
   const [callState, setCallState] = useState<CallState>(callService.getState());
   const signalRef = useRef<TlsSignalingClient | null>(null);
   const rtcRef = useRef<ServerDataChannel | null>(null);
+  const incomingAccountReadyRef = useRef<string | null>(null);
 
   useEffect(()=>{
     const subscription=BackHandler.addEventListener('hardwareBackPress',()=>{
@@ -382,6 +383,7 @@ export default function App() {
           return updated;
         });
       } else if (envelope.type === 'session_repair') {
+        if (!incomingAccountReadyRef.current || incomingAccountReadyRef.current !== notificationUidRef.current) return;
         const peerUid = envelope.from_uid || envelope.peer_uid;
         if (peerUid) {
           void e2eeService.clearSessionWithPeer(peerUid);
@@ -394,15 +396,20 @@ export default function App() {
         };
         setChats(current => current.some(item => item.id === newChat.id) ? current : [newChat, ...current]);
       } else if (envelope.type === 'new_message' && envelope.message) {
+        // TLS can receive immediately after auth, before account crypto/history
+        // restoration finishes. Withhold ACK; the durable server outbox retries.
+        if (!incomingAccountReadyRef.current || incomingAccountReadyRef.current !== notificationUidRef.current) return;
         const incoming = envelope.message;
         const notificationUid = notificationUidRef.current;
         const handleIncoming = async () => {
+          if (incomingAccountReadyRef.current !== notificationUid) return;
           const notificationChat = chatsRef.current.find(chat => chat.id === incoming.conversation_id);
           const notificationSender = {name: notificationChat?.user.name || 'Nexa Chat',
             avatar: avatarUri(incoming.sender_uid), unread: (notificationChat?.unread || 0) + 1};
           const isCurrentChat = selectedRef.current?.id === incoming.conversation_id && AppState.currentState === 'active' && callService.getState().status === 'idle';
           // A retry after a lost ACK must not decrypt the same ratchet message twice.
           const known = (await getLocalMessages(incoming.conversation_id)).find(m => m.id === incoming.message_id);
+          if (incomingAccountReadyRef.current !== notificationUid) return;
           if (known) {
             if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id,
               {...notificationSender, unread: notificationChat?.unread || 0});
@@ -415,9 +422,11 @@ export default function App() {
           try {
             decryptedText = await e2eeService.decrypt(incoming.sender_uid, (incoming as any).msg_type || 0, incoming.ciphertext_b64);
           } catch (err) {
+            if (incomingAccountReadyRef.current !== notificationUid) return;
             console.warn('Decryption failed; leaving message pending:', err);
             return;
           }
+          if (incomingAccountReadyRef.current !== notificationUid) return;
           let msgMediaType: 'text' | 'image' | 'voice' = 'text';
           let msgImages: MediaImageItem[] | undefined = undefined;
           let msgIsHd: boolean | undefined = undefined;
@@ -580,7 +589,9 @@ export default function App() {
         bootRtc = createRealtime(bootSignal);
         rtcRef.current = bootRtc;
         setSession({uid: result.uid, username: result.username, displayName: result.display_name, about: result.about, token: result.token, live: true});
-        setChats(await mapInbox(inbox.conversations || [], onlineUsersRef.current));
+        const restoredChats=await mapInbox(inbox.conversations || [], onlineUsersRef.current);
+        chatsRef.current=restoredChats;setChats(restoredChats);
+        incomingAccountReadyRef.current=result.uid;
         try {
           await bootRtc.connectAuthenticated();
         } catch {
@@ -596,6 +607,7 @@ export default function App() {
           signalRef.current = null;
           rtcRef.current = null;
           await e2eeService.setAccount(saved.uid, true);
+          incomingAccountReadyRef.current=saved.uid;
           setSession({...saved, live: true});
           setRtcStatus('disconnected');
         } else {
@@ -693,7 +705,7 @@ export default function App() {
       return true;
     } catch (err) {
       console.warn('Auto-reconnect error:', err);
-      if (savedSessionIsInvalid(err)) { await clearLiveSession(); setSession(null); }
+      if (savedSessionIsInvalid(err)) { incomingAccountReadyRef.current=null; await clearLiveSession(); setSession(null); }
       try { signalRef.current?.close(); } catch {}
       setRtcStatus('connecting');
       return false;
@@ -1195,6 +1207,7 @@ export default function App() {
 
   const submitAuth = async (name: string, username: string, password: string) => {
     if (authBusy) return;
+    incomingAccountReadyRef.current=null;
     setAuthBusy(true);
     let pendingSignal: TlsSignalingClient | null = null;
     try {
@@ -1248,7 +1261,9 @@ export default function App() {
         token: result.token,
         live: true,
       });
-      setChats(await mapInbox(inbox.conversations || [], onlineUsersRef.current));
+      const restoredChats=await mapInbox(inbox.conversations || [], onlineUsersRef.current);
+      chatsRef.current=restoredChats;setChats(restoredChats);
+      incomingAccountReadyRef.current=result.uid;
 
       try {
         await rtc.connectAuthenticated();
@@ -1257,6 +1272,7 @@ export default function App() {
       }
       pendingSignal = null;
     } catch (error) {
+      incomingAccountReadyRef.current=null;
       pendingSignal?.close();
       if (signalRef.current === pendingSignal) signalRef.current = null;
       await clearLiveSession();
@@ -1305,6 +1321,7 @@ export default function App() {
   };
 
   const logout = async () => {
+    incomingAccountReadyRef.current=null;
     notificationUidRef.current = null;
     await clearNotificationAccount();
     setNotificationConversation(null);
