@@ -13,6 +13,8 @@ function load(file,mock=()=>({})){const c={exports:{},Buffer,require:mock};vm.ru
  rtc.isOpen=true;await sendQueuedEnvelope(item,offline,rtc);assert.equal(mediaWrites,1,'ready RTC remains a fallback');
  const huge={...item,ciphertextB64:'a'.repeat(100000)};
  await sendQueuedEnvelope(huge,signal,rtc);assert.equal(mediaWrites,2,'media cannot overflow TLS frame limit');
+ await sendQueuedEnvelope({...item,ciphertextB64:'a'.repeat(62000)},signal,rtc);
+ assert.equal(mediaWrites,3,'a frame fitting the client limit but exceeding the recipient relay limit must stay on chunk transport');
  rtc.isOpen=false;assert.equal(sendQueuedEnvelope(huge,signal,rtc),null);
  const {RequestScheduler}=load('src/services/requestScheduler.ts');const scheduler=new RequestScheduler(),order=[];
  let release;const blocker=scheduler.schedule(()=>new Promise(r=>release=r),2);

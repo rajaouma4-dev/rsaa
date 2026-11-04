@@ -18,7 +18,9 @@ export function sendQueuedEnvelope(item: OutgoingEnvelope, signal: Signal | null
   const payload = {type:'send_message', message_id:item.messageId, conversation_id:item.conversationId,
     recipient_uid:item.recipientUid, ciphertext_b64:item.ciphertextB64, msg_type:item.msgType};
   const frame = {type:'data_frame', payload};
-  if (signal?.authenticated && Buffer.byteLength(JSON.stringify(frame) + '\n', 'utf8') <= APP_CONFIG.MAX_SIGNAL_FRAME_BYTES) {
+  // Leave room for the server's recipient envelope and its 60 KiB relay cap.
+  const tlsLimit=Math.min(APP_CONFIG.MAX_SIGNAL_FRAME_BYTES,60*1024-1024);
+  if (signal?.authenticated && Buffer.byteLength(JSON.stringify(frame) + '\n', 'utf8') <= tlsLimit) {
     signal.send(frame);
     return Promise.resolve();
   }
