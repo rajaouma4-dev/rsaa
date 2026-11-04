@@ -328,11 +328,14 @@ where
                     },
                 }
             }
-            ClientFrame::RegisterPush { installation_id, token, enabled, foreground, receipt_key } => {
+            ClientFrame::RegisterPush { installation_id, token, enabled, foreground, receipt_key, channel_id } => {
                 let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
                     send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
                 };
-                match store.register_renderer_push(&user.uid, session, &installation_id, &token, enabled, foreground, receipt_key.as_deref()).await {
+                match async {
+                    store.register_renderer_push(&user.uid, session, &installation_id, &token, enabled, foreground, receipt_key.as_deref()).await?;
+                    store.set_push_channel(&user.uid, session, &installation_id, channel_id.as_deref()).await
+                }.await {
                     Ok(()) => signal_tx.send(ServerFrame::PushRegistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
                     Err(_) => send_error(&signal_tx, "PUSH_REGISTER_FAILED", "could not register notifications").await?,
                 }
@@ -864,11 +867,14 @@ async fn handle_ws_client(
                     },
                 }
             }
-            ClientFrame::RegisterPush { installation_id, token, enabled, foreground, receipt_key } => {
+            ClientFrame::RegisterPush { installation_id, token, enabled, foreground, receipt_key, channel_id } => {
                 let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
                     send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
                 };
-                match store.register_renderer_push(&user.uid, session, &installation_id, &token, enabled, foreground, receipt_key.as_deref()).await {
+                match async {
+                    store.register_renderer_push(&user.uid, session, &installation_id, &token, enabled, foreground, receipt_key.as_deref()).await?;
+                    store.set_push_channel(&user.uid, session, &installation_id, channel_id.as_deref()).await
+                }.await {
                     Ok(()) => signal_tx.send(ServerFrame::PushRegistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
                     Err(_) => send_error(&signal_tx, "PUSH_REGISTER_FAILED", "could not register notifications").await?,
                 }

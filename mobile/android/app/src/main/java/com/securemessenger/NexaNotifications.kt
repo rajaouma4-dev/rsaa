@@ -19,6 +19,8 @@ import android.widget.RemoteViews
 import android.util.Base64
 import android.os.Build
 import android.os.Bundle
+import android.media.AudioAttributes
+import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import org.json.JSONArray
@@ -31,7 +33,9 @@ import com.google.firebase.messaging.FirebaseMessaging
 
 /** Native so an FCM wakeup can display without a running React Native engine. */
 object NexaNotifications {
-    const val CHANNEL = "nexa_messages_v1"
+    const val CHANNEL = "nexa_messages_bubble_v2"
+    const val QUIET_CHANNEL = "nexa_messages_quiet_v2"
+    private const val LEGACY_CHANNEL = "nexa_messages_v1"
     private const val GROUP = "nexa-messages"
     @Volatile var foreground = false
         private set
@@ -62,21 +66,44 @@ object NexaNotifications {
         })
     }
 
+    fun soundEnabled(context: Context): Boolean = prefs(context).getBoolean("sound_enabled",true)
+    fun channel(context: Context): String = if(soundEnabled(context)) CHANNEL else QUIET_CHANNEL
+    fun soundUri(context: Context): Uri = Uri.parse("android.resource://${context.packageName}/raw/moonlit_bubble")
+    fun setSoundEnabled(context: Context, enabled: Boolean) {
+        createChannel(context)
+        prefs(context).edit().putBoolean("sound_enabled",enabled).commit()
+        onTokenChanged?.invoke() // Re-register this installation's selected channel immediately.
+    }
     fun createChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= 26) {
-            val channel = NotificationChannel(CHANNEL, "Messages", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "New private messages when Nexa Chat is in the background"
-                enableVibration(true)
-                lockscreenVisibility = android.app.Notification.VISIBILITY_PRIVATE
+            val manager=context.getSystemService(NotificationManager::class.java)
+            val legacy=manager.getNotificationChannel(LEGACY_CHANNEL)
+            if(!prefs(context).contains("sound_enabled")) {
+                prefs(context).edit().putBoolean("sound_enabled",legacy==null || legacy.sound!=null).commit()
             }
-            context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+            // Preserve an existing channel block/importance during migration.
+            // Sound/quiet are separate immutable Android channels; toggling never
+            // deletes channels or changes a user's system sound preferences.
+            val importance=legacy?.importance ?: NotificationManager.IMPORTANCE_HIGH
+            for((id,name) in listOf(CHANNEL to "Messages · Moonlit Bubble",QUIET_CHANNEL to "Messages · Sound off")) {
+                val item=NotificationChannel(id,name,importance).apply {
+                    description="Private message alerts"
+                    enableVibration(legacy?.shouldVibrate() ?: true)
+                    lockscreenVisibility=android.app.Notification.VISIBILITY_PRIVATE
+                    setSound(if(id==CHANNEL) soundUri(context) else null,
+                        AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build())
+                }
+                manager.createNotificationChannel(item)
+            }
         }
     }
 
     fun allowed(context: Context): Boolean {
+        createChannel(context)
         if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) return false
         return Build.VERSION.SDK_INT < 26 || context.getSystemService(NotificationManager::class.java)
-            .getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
+            .getNotificationChannel(channel(context))?.importance != NotificationManager.IMPORTANCE_NONE
     }
 
     @Synchronized fun installation(context: Context): String {
@@ -112,9 +139,12 @@ object NexaNotifications {
         if (seen && (foreground || avatar==null || context.getSystemService(NotificationManager::class.java).activeNotifications.none { it.tag=="nexa:$conversation" })) return true
         // Remember foreground deliveries too, so a delayed push cannot alert later.
         if (!seen) ids.add(message)
-        if (foreground || !allowed(context)) {
+        if (foreground) {
             p.edit().putString("recent", JSONArray(ids.takeLast(512)).toString()).commit();return true
         }
+        // A blocked alert was not rendered. Do not acknowledge it or deduplicate
+        // it away if permission is enabled before the server retries.
+        if (!allowed(context)) return false
         val name = senderName.filterNot { it.isISOControl() }.take(80).ifBlank { "Nexa Chat" }
         val count = maxOf(p.getInt("count:$conversation",0), unread.coerceIn(1,9999))
         val text = if (count == 1) "1 new message" else "$count new messages"
@@ -134,7 +164,7 @@ object NexaNotifications {
             setContentDescription(R.id.sender_name,name)
             setTextViewText(R.id.sender_count,text)
         }
-        val notification = NotificationCompat.Builder(context, CHANNEL)
+        val notification = NotificationCompat.Builder(context, channel(context))
             .setSmallIcon(R.drawable.ic_message_notification)
             .setColor(Color.rgb(182,158,255))
             .setContentTitle(name)
@@ -146,7 +176,8 @@ object NexaNotifications {
             .setNumber(count)
             .setOnlyAlertOnce(seen)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setDefaults(NotificationCompat.DEFAULT_VIBRATE or NotificationCompat.DEFAULT_LIGHTS)
+            .setSound(if(soundEnabled(context)) soundUri(context) else null)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setGroup(GROUP)
@@ -202,9 +233,14 @@ object NexaNotifications {
         val id=data["message_id"] ?: return
         val p=prefs(context)
         if (p.getString("uid",null)!=uid) return
+        // Render before any network I/O. FCM gives this callback a short window;
+        // slow avatar downloads must never delay the actual message alert.
+        val sender=data["sender_name"] ?: "Nexa Chat"
+        val unread=data["unread_count"]?.toIntOrNull() ?: 1
+        val handled=message(context,uid,conversation,id,sender,null,unread)
         val base=p.getString("server","") ?: ""
         val version=data["avatar_version"] ?: ""
-        val avatar=if (!foreground && base.startsWith("https://") && version.matches(Regex("[a-f0-9]{64}"))) {
+        val avatar=if (handled && !foreground && base.startsWith("https://") && version.matches(Regex("[a-f0-9]{64}"))) {
             runCatching {
                 val connection=URL("$base/notification-avatar/$version.jpg").openConnection() as HttpsURLConnection
                 try {
@@ -219,7 +255,7 @@ object NexaNotifications {
                 } finally {connection.disconnect()}
             }.getOrNull()
         } else null
-        val handled=message(context,uid,conversation,id,data["sender_name"] ?: "Nexa Chat",avatar,data["unread_count"]?.toIntOrNull() ?: 1)
+        if (avatar!=null) message(context,uid,conversation,id,sender,avatar,unread)
         if (handled && data["native_renderer"]=="1" && base.startsWith("https://")) {
             runCatching {
                 val bytes=JSONObject().put("uid",uid).put("installation_id",installation(context))
@@ -244,7 +280,7 @@ object NexaNotifications {
         children.take(7).forEach { item -> style.addLine("${item.notification.extras.getCharSequence("android.title")} · ${item.notification.number.coerceAtLeast(1)} messages") }
         val intent=Intent(context,MainActivity::class.java).apply { flags=Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP }
         val open=PendingIntent.getActivity(context,1,intent,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val summary=NotificationCompat.Builder(context,CHANNEL).setSmallIcon(R.drawable.ic_message_notification)
+        val summary=NotificationCompat.Builder(context,channel(context)).setSmallIcon(R.drawable.ic_message_notification)
             .setContentTitle("${children.size} people").setContentText("$total new messages").setStyle(style)
             .setGroup(GROUP).setGroupSummary(true).setSilent(true).setNumber(total)
             .setContentIntent(open).setAutoCancel(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).build()

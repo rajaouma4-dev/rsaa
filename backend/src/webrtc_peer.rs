@@ -249,10 +249,8 @@ pub async fn handle_client_frame(
     live_signaling: &LiveSignaling,
     uid: &str,
 ) {
-    if channel.is_none() && matches!(&frame, DataChannelClientFrame::SendMessage { .. }) {
-        reply_error(channel, signal_tx, "DATACHANNEL_REQUIRED", "chat messages require WebRTC DataChannel").await;
-        return;
-    }
+    // Both authenticated transports use the SAME Signal-envelope validation,
+    // membership checks and durable insert below. TLS avoids waiting for ICE.
     match frame {
         DataChannelClientFrame::CallSignal { to_uid, payload } => {
             route_call_signal(uid, &to_uid, payload, channels, live_signaling).await;
@@ -468,7 +466,9 @@ pub async fn deliver_all_pending_via_signal(_db: &Store, _signal_tx: &mpsc::Send
 pub async fn run_delivery_worker(db: Store, channels: LiveChannels, live_signaling: LiveSignaling) {
     loop {
         let mut recipients: Vec<String> = channels.read().await.keys().cloned().collect();
+        recipients.extend(live_signaling.read().await.keys().cloned());
         recipients.sort();
+        recipients.dedup();
         // At most four queries and sixteen claims/forwards run concurrently.
         stream::iter(recipients.chunks(100).map(|batch| batch.to_vec()))
             .for_each_concurrent(4, |batch| {
@@ -481,7 +481,8 @@ pub async fn run_delivery_worker(db: Store, channels: LiveChannels, live_signali
                     stream::iter(pending).for_each_concurrent(4, |item| {
                         let db = db.clone(); let channels = channels.clone(); let live_signaling = live_signaling.clone();
                         async move {
-                            if !channels.read().await.contains_key(&item.recipient_uid) { return; }
+                            if !channels.read().await.contains_key(&item.recipient_uid)
+                                && !live_signaling.read().await.contains_key(&item.recipient_uid) { return; }
                             match db.claim_delivery_attempt(&item.message.message_id, &item.recipient_uid).await {
                                 Ok(true) => {
                                     let frame = DataChannelServerFrame::NewMessage { message: item.message };
@@ -539,6 +540,15 @@ pub async fn send_to_user(
     uid: &str,
     frame: &DataChannelServerFrame,
 ) {
+    // Text and receipts use the already-established authenticated TLS socket.
+    // Keep large media on the bounded/chunked DataChannel transport.
+    if let Ok(payload) = serde_json::to_value(frame) {
+        let outgoing=ServerFrame::DataFrame {payload};
+        if serde_json::to_vec(&outgoing).is_ok_and(|bytes|bytes.len()<=60*1024) {
+            let target=live_signaling.read().await.get(uid).cloned();
+            if let Some(tx)=target {if tx.try_send(outgoing).is_ok() {return;}}
+        }
+    }
     // 1. Prefer active WebRTC DataChannel
     let dc = { channels.read().await.get(uid).cloned() };
     if let Some(channel) = dc {
@@ -659,5 +669,48 @@ pub async fn build_answerer(
     peer.set_local_description(answer).await.context("apply local SDP")?;
     let local = peer.local_description().await.context("local SDP unavailable")?;
     Ok((Arc::new(peer), local.sdp))
+}
+
+#[cfg(test)]
+mod tls_message_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn encrypted_text_and_receipts_work_without_ice_and_preserve_security_checks() {
+        let db=Store::load_test_store(&format!("target/tls-message-{}.db",uuid::Uuid::new_v4()),&["alice".into(),"bob".into(),"other".into()]).await.unwrap();
+        db.create_or_get_conversation("alice","bob").await.unwrap();
+        let cv=db.get_conversation_id("alice","bob").await.unwrap();
+        let channels:LiveChannels=Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let signaling:LiveSignaling=Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let (a_tx,mut a_rx)=mpsc::channel(16);let (b_tx,mut b_rx)=mpsc::channel(16);
+        signaling.write().await.insert("alice".into(),a_tx.clone());
+        signaling.write().await.insert("bob".into(),b_tx.clone());
+        let frame=|id:&str,cipher:&str|DataChannelClientFrame::SendMessage {message_id:id.into(),conversation_id:cv.clone(),recipient_uid:Some("other".into()),ciphertext_b64:cipher.into(),msg_type:Some(1),created_at:None};
+        handle_client_frame(frame("tls-message-001","MwEC"),None,Some(&a_tx),&db,&channels,&signaling,"alice").await;
+        let ack=a_rx.recv().await.unwrap();assert!(matches!(ack,ServerFrame::DataFrame{payload} if payload["type"]=="saved_ack"));
+        let message=b_rx.recv().await.unwrap();assert!(matches!(message,ServerFrame::DataFrame{payload} if payload["type"]=="new_message" && payload["message"]["ciphertext_b64"]=="MwEC" && payload["message"]["sender_uid"]=="alice"));
+        assert!(channels.read().await.is_empty(),"no WebRTC peer was needed");
+        handle_client_frame(frame("tls-message-001","MwEC"),None,Some(&a_tx),&db,&channels,&signaling,"alice").await;
+        a_rx.recv().await.unwrap();b_rx.recv().await.unwrap();
+        assert_eq!(db.pending_deliveries("bob",10).await.unwrap().len(),1,"same ciphertext/id stays idempotent");
+        assert!(db.pending_deliveries("other",10).await.unwrap().is_empty(),"recipient hint cannot redirect a message");
+        handle_client_frame(DataChannelClientFrame::DeliveredAck{message_id:"tls-message-001".into()},None,Some(&b_tx),&db,&channels,&signaling,"bob").await;
+        assert!(matches!(a_rx.recv().await.unwrap(),ServerFrame::DataFrame{payload} if payload["type"]=="delivered_ack"));
+        handle_client_frame(frame("tls-message-002","SGVsbG8="),None,Some(&a_tx),&db,&channels,&signaling,"alice").await;
+        assert!(matches!(a_rx.recv().await.unwrap(),ServerFrame::DataFrame{payload} if payload["code"]=="E2EE_NOT_CONFIGURED"));
+        handle_client_frame(frame("tls-message-003","MwEC"),None,Some(&a_tx),&db,&channels,&signaling,"other").await;
+        assert!(matches!(a_rx.recv().await.unwrap(),ServerFrame::DataFrame{payload} if payload["code"]=="SAVE_FAILED"));
+        assert!(b_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn media_cannot_overflow_the_tls_notification_or_message_reader() {
+        let channels:LiveChannels=Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let signaling:LiveSignaling=Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let(tx,mut rx)=mpsc::channel(2);signaling.write().await.insert("bob".into(),tx);
+        let frame=DataChannelServerFrame::NewMessage{message:crate::protocol::MessageEnvelope{message_id:"large-message".into(),conversation_id:"cv".into(),sender_uid:"alice".into(),ciphertext_b64:"a".repeat(100000),msg_type:Some(1),created_at:"0".into(),status:"SAVED".into()}};
+        send_to_user(&channels,&signaling,"bob",&frame).await;
+        assert!(rx.try_recv().is_err(),"large media waits for bounded chunk transport instead of breaking TLS framing");
+    }
 }
 

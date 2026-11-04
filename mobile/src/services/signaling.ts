@@ -2,6 +2,7 @@ import TcpSocket from 'react-native-tcp-socket';
 import {Buffer} from 'buffer';
 import {APP_CONFIG} from '../config';
 import {JsonLineFrameDecoder, SignalFrame} from './framing';
+import {RequestScheduler} from './requestScheduler';
 
 type Frame = SignalFrame;
 type FrameListener = (frame: Frame) => void;
@@ -20,7 +21,7 @@ export class TlsSignalingClient {
   private awaitingPong = false;
   private missedPongs = 0;
   private connectPromise?: Promise<void>;
-  private requestTail: Promise<void> = Promise.resolve();
+  private requests = new RequestScheduler();
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private callStateProvider?: () => string | null;
 
@@ -243,7 +244,9 @@ export class TlsSignalingClient {
     return promise;
   }
 
-  get connected(): boolean { return this.isConnected && Boolean(this.socket || this.ws); }
+  get connected(): boolean {
+    return this.isConnected && (this.ws ? this.ws.readyState === 1 : Boolean(this.socket) && !this.socket.destroyed);
+  }
   get authenticated(): boolean { return this.isAuth && this.connected; }
   setAuthenticated(val: boolean): void {
     this.isAuth = val;
@@ -302,9 +305,9 @@ export class TlsSignalingClient {
   request<T extends Frame = Frame>(frame: Frame, expectedType: string, timeoutMs = 12000): Promise<T> {
     // The wire protocol currently has no request_id field. Serialize request/response
     // pairs so concurrent searches cannot consume each other's response frames.
-    const operation = this.requestTail.then(() => this.performRequest<T>(frame, expectedType, timeoutMs));
-    this.requestTail = operation.then(() => undefined, () => undefined);
-    return operation;
+    const background = ['get_avatar', 'chat_themes'].includes(String(frame.type));
+    return this.requests.schedule(() => this.performRequest<T>(frame, expectedType, timeoutMs),
+      background ? 2 : frame.type === 'register_push' ? 1 : 0, frame.type === 'search_users' ? 'people-search' : undefined);
   }
 
   private performRequest<T extends Frame>(frame: Frame, expectedType: string, timeoutMs: number): Promise<T> {

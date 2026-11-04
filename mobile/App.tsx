@@ -11,7 +11,9 @@ import {APP_CONFIG, isLiveConfigReady, refreshTurnCredentials} from './src/confi
 import {TlsSignalingClient} from './src/services/signaling';
 import {ServerDataChannel, RtcStatus} from './src/services/rtc';
 import {DurableOutbox} from './src/services/outbox';
+import {sendQueuedEnvelope, sendMessageReceipt} from './src/services/messageTransport';
 import {advanceMessageStatus} from './src/services/messageStatus';
+import {acknowledgeVisibleMessages} from './src/services/visibleReadReceipts';
 import {e2eeService, RemotePreKeyBundle} from './src/services/e2ee';
 import {
   getLocalMessages,
@@ -69,6 +71,8 @@ export default function App() {
   const [selected, setSelected] = useState<Chat | null>(null);
   const selectedRef = useRef<Chat | null>(null);
   const notificationUidRef = useRef<string | null>(null);
+  const visibleReadAcksRef = useRef(new Set<string>());
+  const visibleReadBusyRef = useRef(false);
   const onlineUsersRef = useRef<Set<string>>(new Set<string>());
   const [authBusy, setAuthBusy] = useState(false);
   const [rtcStatus, setRtcStatus] = useState<RtcStatus>('disconnected');
@@ -101,6 +105,7 @@ export default function App() {
       }
     });
     client.onClose(() => {
+      visibleReadAcksRef.current.clear();
       setTimeout(() => {
         void ensureConnectedRef.current();
       }, 300);
@@ -111,6 +116,28 @@ export default function App() {
   useEffect(() => {
     chatsRef.current = chats;
   }, [chats]);
+
+  const reconcileVisibleReads = useCallback(async () => {
+    const chat = selectedRef.current;
+    if (!chat || visibleReadBusyRef.current || AppState.currentState !== 'active' || callService.getState().status !== 'idle') return;
+    if (!chat.messages.some(m => m.from === 'them' && m.status !== 'seen' && !visibleReadAcksRef.current.has(m.id))
+      && !chatsRef.current.some(c => c.id === chat.id && c.unread > 0)) return;
+    visibleReadBusyRef.current = true;
+    try {
+      await acknowledgeVisibleMessages({
+        conversation: () => selectedRef.current?.id || null,
+        visible: () => AppState.currentState === 'active' && callService.getState().status === 'idle',
+        load: getLocalMessages,
+        acknowledged: visibleReadAcksRef.current,
+        sendSeen: id => sendMessageReceipt('seen_ack',id,signalRef.current,rtcRef.current),
+        markRead: id => {
+          setChats(current => current.some(c => c.id===id && c.unread>0) ? current.map(c => c.id===id ? {...c,unread:0}:c) : current);
+          setSelected(current => current?.id===id && current.unread>0 ? {...current,unread:0}:current);
+        },
+      });
+    } catch { /* Retry when the active connection recovers. */ }
+    finally { visibleReadBusyRef.current = false; }
+  }, []);
 
   useEffect(() => {
     callService.setSignalSender((toUid, payload) => {
@@ -257,26 +284,29 @@ export default function App() {
 
   const outboxRef = useRef<DurableOutbox | null>(null);
   const flushingRef = useRef(false);
+  const outgoingWritesRef = useRef(new Set<string>());
   const messageConversationsRef = useRef(new Map<string, string>());
 
   const flushOutbox = useCallback(async () => {
     const queue = outboxRef.current;
     const rtc = rtcRef.current;
-    if (!queue || !rtc?.isOpen || flushingRef.current) return;
+    const signal = signalRef.current;
+    if (!queue || (!rtc?.isOpen && !signal?.authenticated) || flushingRef.current) return;
     flushingRef.current = true;
     try {
-      const pending: Promise<unknown>[] = [];
       for (const item of queue.due()) {
-        if (queue !== outboxRef.current || rtc !== rtcRef.current) break;
+        if (queue !== outboxRef.current) break;
+        if (outgoingWritesRef.current.has(item.messageId)) continue;
         messageConversationsRef.current.set(item.messageId, item.conversationId);
-        queue.attempted(item.messageId);
-        pending.push(rtc.sendEncryptedEnvelope(JSON.stringify({
-            type: 'send_message', message_id: item.messageId,
-            conversation_id: item.conversationId, recipient_uid: item.recipientUid,
-            ciphertext_b64: item.ciphertextB64, msg_type: item.msgType,
-          })).catch(() => {}));
+        try {
+          const sent = sendQueuedEnvelope(item, signal, rtc);
+          if (sent) {
+            queue.attempted(item.messageId); outgoingWritesRef.current.add(item.messageId);
+            void sent.then(() => queue.attempted(item.messageId)).catch(() => {})
+              .finally(() => outgoingWritesRef.current.delete(item.messageId));
+          }
+        } catch { /* The durable envelope remains available for reconnect. */ }
       }
-      await Promise.all(pending);
     } finally { flushingRef.current = false; }
   }, []);
 
@@ -305,8 +335,7 @@ export default function App() {
       } else if (['saved_ack', 'delivered_ack', 'seen_ack'].includes(envelope.type || '') && envelope.message_id) {
         const nextStatus = envelope.type === 'saved_ack' ? 'saved' : envelope.type === 'delivered_ack' ? 'delivered' : 'seen';
         const msgId = envelope.message_id;
-        const queued = await outboxRef.current?.acknowledge(msgId);
-        const convId = queued?.conversationId || messageConversationsRef.current.get(msgId)
+        const convId = messageConversationsRef.current.get(msgId)
           || chatsRef.current.find(c => c.messages.some(m => m.id === msgId))?.id;
         if (convId) {
           void updateLocalMessageStatus(convId, msgId, nextStatus as any).catch(err => console.warn('Receipt save failed:', err));
@@ -319,6 +348,9 @@ export default function App() {
           ...current,
           messages: current.messages.map(message => message.id === msgId ? {...message, status: advanceMessageStatus(message.status, nextStatus)} : message),
         }) : current);
+        // The server ACK already proves persistence. Do not hold the visible
+        // status behind rewriting a potentially large local outgoing queue.
+        await outboxRef.current?.acknowledge(msgId);
       } else if (envelope.type === 'presence_update' && envelope.uid && typeof envelope.online === 'boolean') {
         const targetUid = envelope.uid;
         const isOnline = envelope.online!;
@@ -372,8 +404,10 @@ export default function App() {
           // A retry after a lost ACK must not decrypt the same ratchet message twice.
           const known = (await getLocalMessages(incoming.conversation_id)).find(m => m.id === incoming.message_id);
           if (known) {
-            if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id, notificationSender);
-            try { rtcRef.current?.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id}); } catch {}
+            if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id,
+              {...notificationSender, unread: notificationChat?.unread || 0});
+            sendMessageReceipt('delivered_ack',incoming.message_id,signalRef.current,rtcRef.current);
+            if(isCurrentChat) sendMessageReceipt('seen_ack',incoming.message_id,signalRef.current,rtcRef.current);
             return;
           }
 
@@ -429,21 +463,13 @@ export default function App() {
           if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id, notificationSender);
           // Acknowledge only after the local message write succeeds.
           try {
-            if (rtcRef.current?.isOpen) {
-              rtcRef.current.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id});
-            } else if (signalRef.current?.connected) {
-              signalRef.current.send({type: 'data_frame', payload: {type: 'delivered_ack', message_id: incoming.message_id}});
-            }
+            sendMessageReceipt('delivered_ack',incoming.message_id,signalRef.current,rtcRef.current);
           } catch {}
 
 
           if (isCurrentChat) {
             try {
-              if (rtcRef.current?.isOpen) {
-                rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: incoming.message_id});
-              } else if (signalRef.current?.connected) {
-                signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: incoming.message_id}});
-              }
+              sendMessageReceipt('seen_ack',incoming.message_id,signalRef.current,rtcRef.current);
             } catch {}
           }
 
@@ -501,6 +527,7 @@ export default function App() {
         setRtcStatus('connected');
         void flushOutbox();
       } else {
+        visibleReadAcksRef.current.clear();
         setRtcStatus(status);
       }
     });
@@ -685,6 +712,7 @@ export default function App() {
     const interval = setInterval(() => {
       if (AppState.currentState === 'active') {
         const sig = signalRef.current;
+        void reconcileVisibleReads();
         void flushOutbox();
         if (!sig || !sig.connected || !sig.authenticated || !rtcRef.current?.isOpen) {
           void ensureConnected();
@@ -705,24 +733,25 @@ export default function App() {
       }
     }, 4000);
     return () => clearInterval(interval);
-  }, [session, ensureConnected]);
+  }, [session, ensureConnected, reconcileVisibleReads]);
 
   // AppState listener for instant foreground reconnect
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState: AppStateStatus) => {
       if (nextState === 'active') {
+        visibleReadAcksRef.current.clear();
         if (session?.live) {
           const sig = signalRef.current;
           if (!sig || !sig.connected || !sig.authenticated) {
-            void ensureConnected();
-          }
+            void ensureConnected().then(() => reconcileVisibleReads());
+          } else { void reconcileVisibleReads(); }
         }
       }
     });
     return () => {
       sub.remove();
     };
-  }, [session, ensureConnected]);
+  }, [session, ensureConnected, reconcileVisibleReads]);
 
   useEffect(() => {
     if (isInitializing) return;
@@ -736,22 +765,29 @@ export default function App() {
     if (chat) { setNotificationConversation(null); void openChat(chat); }
   }, [notificationConversation, chats, session?.uid]);
 
+  const peopleCacheRef = useRef(new Map<string, {at:number; users:User[]}>());
   const searchPeople = useCallback(async (query: string): Promise<User[]> => {
     if (APP_CONFIG.DEMO_MODE) {
       return demoUsers.filter(user => `${user.name} ${user.username}`.toLowerCase().includes(query.toLowerCase()));
     }
     const signal = signalRef.current;
     if (!signal?.connected) throw new Error('Server signaling connection is not available');
+    const cacheKey = `${session?.uid || ''}:${query.trim().toLowerCase()}`;
+    const cached = peopleCacheRef.current.get(cacheKey);
+    if(cached && Date.now()-cached.at<15000) return cached.users;
     const response = await signal.request<{users?: Array<{uid: string; username: string; display_name: string; about: string; online: boolean}>}>(
       {type: 'search_users', query}, 'users');
-    return (response.users || []).map(user => ({
+    const users = (response.users || []).map(user => ({
       id: user.uid,
       username: user.username,
       name: user.display_name,
       about: user.about,
       online: onlineUsersRef.current.has(user.uid) || user.online,
     }));
-  }, []);
+    peopleCacheRef.current.set(cacheKey,{at:Date.now(),users});
+    while(peopleCacheRef.current.size>32) peopleCacheRef.current.delete(peopleCacheRef.current.keys().next().value!);
+    return users;
+  }, [session?.uid]);
 
   const openChat = async (chat: Chat) => {
     // 1. Immediately display locally persisted decrypted messages
@@ -788,9 +824,7 @@ export default function App() {
     for (const m of initialMsgs) {
       if (m.from === 'them' && m.status !== 'seen') {
         try {
-          if (rtcRef.current?.isOpen) {
-            rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: m.id});
-          }
+          sendMessageReceipt('seen_ack',m.id,signalRef.current,rtcRef.current);
         } catch {}
       }
     }
@@ -968,11 +1002,7 @@ export default function App() {
       for (const m of merged) {
         if (m.from === 'them' && m.status !== 'seen') {
           try {
-            if (rtcRef.current?.isOpen) {
-              rtcRef.current.sendControlFrame({type: 'seen_ack', message_id: m.id});
-            } else if (signalRef.current?.connected) {
-              signalRef.current.send({type: 'data_frame', payload: {type: 'seen_ack', message_id: m.id}});
-            }
+            sendMessageReceipt('seen_ack',m.id,signalRef.current,rtcRef.current);
           } catch {}
         }
       }
@@ -1155,7 +1185,7 @@ export default function App() {
       await queue.enqueue(queueItem);
       messageConversationsRef.current.set(tempMsgId, conversationId);
       await flushOutbox();
-      if (!rtcRef.current?.isOpen) void ensureConnected();
+      if (!signalRef.current?.authenticated) void ensureConnected();
 
     } catch (err) {
       console.warn('Send issue:', err);

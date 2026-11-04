@@ -176,7 +176,7 @@ impl Store {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_push_jobs_device_pending ON push_jobs(installation_id,recipient_uid,finished)", ()).await?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_notification_counts ON messages(recipient_uid,conversation_id,status)", ()).await?;
         conn.execute("CREATE TABLE IF NOT EXISTS push_dispatch_leases (installation_id TEXT NOT NULL REFERENCES push_devices(installation_id) ON DELETE CASCADE, conversation_id TEXT NOT NULL, owner TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(installation_id,conversation_id))", ()).await?;
-        for (table,column,definition) in [("push_devices","receipt_key_hash","TEXT"),("push_jobs","native_sent_at","INTEGER NOT NULL DEFAULT 0")] {
+        for (table,column,definition) in [("push_devices","receipt_key_hash","TEXT"),("push_jobs","native_sent_at","INTEGER NOT NULL DEFAULT 0"),("push_devices","notification_channel","TEXT NOT NULL DEFAULT 'nexa_messages_v1'")] {
             let mut columns=conn.query(&format!("PRAGMA table_info({table})"),()).await?;
             let mut found=false;
             while let Some(row)=columns.next().await? { found |= row.get::<String>(1)?==column; }

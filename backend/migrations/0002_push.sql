@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS push_devices (
     session_hash TEXT NOT NULL,
     token TEXT NOT NULL UNIQUE,
     enabled INTEGER NOT NULL DEFAULT 1,
-    foreground_until INTEGER NOT NULL DEFAULT 0
+    foreground_until INTEGER NOT NULL DEFAULT 0,
+    notification_channel TEXT NOT NULL DEFAULT 'nexa_messages_v1'
 );
 CREATE INDEX IF NOT EXISTS idx_push_devices_uid ON push_devices(uid,enabled);
 CREATE TABLE IF NOT EXISTS push_jobs (

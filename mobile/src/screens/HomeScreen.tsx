@@ -41,22 +41,24 @@ export function HomeScreen({username, uid, displayName, about = '', liveMode, rt
   const [query, setQuery] = useState('');
   const [remotePeople, setRemotePeople] = useState<User[]>([]);
   const [searchError, setSearchError] = useState('');
+  const [searching, setSearching] = useState(false);
   const [profileName, setProfileName] = useState(displayName);
   const [profileAbout, setProfileAbout] = useState(about);
   const [profileBusy, setProfileBusy] = useState(false);
   const filtered = useMemo(() => people.filter(p => `${p.name} ${p.username}`.toLowerCase().includes(query.toLowerCase())), [people, query]);
   useEffect(() => {
-    if (!liveMode || tab !== 'people') { setRemotePeople([]); setSearchError(''); return; }
+    if (!liveMode || tab !== 'people') { setRemotePeople([]); setSearchError(''); setSearching(false); return; }
     const value = query.trim();
-    if (value.length < 2) { setRemotePeople([]); setSearchError(''); return; }
+    if (value.length < 2) { setRemotePeople([]); setSearchError(''); setSearching(false); return; }
+    setRemotePeople([]); setSearchError(''); setSearching(true);
     let cancelled = false;
     const timer = setTimeout(() => {
       onSearchPeople(value).then(results => {
-        if (!cancelled) { setRemotePeople(results); setSearchError(''); }
+        if (!cancelled) { setRemotePeople(results); setSearchError(''); setSearching(false); }
       }).catch(error => {
-        if (!cancelled) { setRemotePeople([]); setSearchError(error instanceof Error ? error.message : 'Search failed'); }
+        if (!cancelled) { setRemotePeople([]); setSearchError(error instanceof Error ? error.message : 'Search failed'); setSearching(false); }
       });
-    }, 350);
+    }, 150);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [liveMode, tab, query, onSearchPeople]);
   const peopleToShow = useMemo(() => {
@@ -82,6 +84,7 @@ export function HomeScreen({username, uid, displayName, about = '', liveMode, rt
       <View style={styles.search}><Text style={styles.searchIcon}>⌕</Text><TextInput value={query} onChangeText={setQuery} placeholder="Search name or @username" placeholderTextColor={C.muted} style={styles.searchInput}/></View>
       {liveMode && query.trim().length < 2 ? <Text style={styles.empty}>Type at least 2 characters to search server users.</Text> : null}
       {searchError ? <Text style={styles.searchError}>{searchError}</Text> : null}
+      {searching ? <Text style={{color:C.muted,paddingHorizontal:22,paddingTop:10,fontSize:12}}>Searching…</Text> : null}
       <FlatList style={{flex:1}} data={peopleToShow} keyExtractor={x => x.id} contentContainerStyle={styles.list} renderItem={({item}) => <View style={styles.personRow}><Avatar uid={item.id} name={item.name} online={item.online}/><View style={styles.personBody}><Text numberOfLines={1} style={styles.name}>{item.name}</Text><Text numberOfLines={2} style={styles.preview}>@{item.username} · {formatPresence(item.online, item.lastActive)}</Text></View><Pressable onPress={() => onAddChat(item)} style={styles.messageBtn}><Text style={styles.messageBtnText}>Message</Text></Pressable></View>}/>
     </> : null}
     {tab === 'profile' ? <ScrollView style={{flex:1}} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.profile}><Avatar uid={uid} name={displayName || username} size={82}/><View style={{flexDirection:'row',flexWrap:'wrap',justifyContent:'center',gap:12}}><Pressable accessibilityLabel="Change profile photo" disabled={profileBusy||!liveMode} style={[S.secondaryButton,{paddingHorizontal:18}]} onPress={async()=>{setProfileBusy(true);try{const uri=await pickProfilePhoto();if(uri)await onSetAvatar(uri);}catch(e){Alert.alert('Photo update failed',e instanceof Error?e.message:'Try again');}finally{setProfileBusy(false);}}}><Text style={S.secondaryText}>{profileBusy?'Saving…':'Change photo'}</Text></Pressable><Pressable accessibilityLabel="Remove profile photo" disabled={profileBusy||!liveMode} style={[S.secondaryButton,{paddingHorizontal:18}]} onPress={()=>Alert.alert('Remove profile photo?','Your initials will appear instead.',[{text:'Cancel',style:'cancel'},{text:'Remove',style:'destructive',onPress:async()=>{setProfileBusy(true);try{await onSetAvatar(null);}catch{Alert.alert('Could not remove photo','Please try again.');}finally{setProfileBusy(false);}}}])}><Text style={S.secondaryText}>Remove</Text></Pressable></View><Text style={styles.profileName}>{displayName || username}</Text><Text style={styles.profileUser}>@{username}</Text><View style={styles.profileCard}><Text style={styles.kicker}>ACCOUNT</Text><View style={styles.setting}><Text style={styles.settingLabel}>User ID</Text><Text style={styles.settingValue}>{uid || `DEMO-${username.toUpperCase()}`}</Text></View><View style={styles.setting}><Text style={styles.settingLabel}>Connection</Text><Text style={styles.settingValue}>{liveMode ? `WebRTC: ${rtcStatus}` : 'Local demo only'}</Text></View><Text style={styles.settingLabel}>Display name</Text><TextInput value={profileName} onChangeText={setProfileName} maxLength={60} placeholder="Your display name" placeholderTextColor={C.muted} style={styles.profileInput}/><Text style={styles.settingLabel}>About</Text><TextInput value={profileAbout} onChangeText={setProfileAbout} maxLength={160} placeholder="A little about you" placeholderTextColor={C.muted} style={[styles.profileInput, {minHeight: 72, textAlignVertical: 'top'}]} multiline/></View><Pressable disabled={!liveMode || profileBusy} style={[S.primaryButton,{alignSelf:'stretch'}, (!liveMode || profileBusy) && {opacity: 0.45}]} onPress={async () => {setProfileBusy(true); try {await onUpdateProfile(profileName, profileAbout); Alert.alert('Profile updated', 'Your profile has been saved.');} catch (e) {Alert.alert('Profile update failed', e instanceof Error ? e.message : 'Please try again.');} finally {setProfileBusy(false);}}}><Text style={S.primaryText}>{profileBusy ? 'Saving…' : 'Save profile'}</Text></Pressable><Pressable style={[S.secondaryButton,{alignSelf:'stretch'}]} onPress={onLogout}><Text style={[S.secondaryText, {color: C.red}]}>Sign out</Text></Pressable><NotificationSettings/><Text style={styles.profileNote}>{liveMode ? 'Signal Protocol E2EE · All messages are end-to-end encrypted.' : 'Local preview only. No real account or server messages are created.'}</Text></ScrollView> : null}

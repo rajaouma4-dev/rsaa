@@ -1,0 +1,30 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),ts=require('typescript');
+function load(file,mock=()=>({})){const c={exports:{},Buffer,require:mock};vm.runInNewContext(ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,c);return c.exports;}
+(async()=>{
+ const {sendQueuedEnvelope,sendMessageReceipt}=load('src/services/messageTransport.ts',n=>n==='buffer'?{Buffer}:{APP_CONFIG:{MAX_SIGNAL_FRAME_BYTES:65536}});
+ const sent=[],signal={authenticated:true,send:f=>sent.push(f)};
+ let mediaWrites=0;const rtc={isOpen:false,sendEncryptedEnvelope(){mediaWrites++;return Promise.resolve();},sendControlFrame(){throw Error('not open');}};
+ const item={messageId:'message-one',conversationId:'cv-one',recipientUid:'recipient',ciphertextB64:'MwEC',msgType:1};
+ await sendQueuedEnvelope(item,signal,rtc);assert.equal(sent[0].payload.ciphertext_b64,'MwEC');assert.equal(sent[0].type,'data_frame');assert.equal(mediaWrites,0,'text cannot wait for ICE');
+ assert(!JSON.stringify(sent[0]).includes('plaintext'));
+ assert.equal(sendMessageReceipt('delivered_ack',item.messageId,signal,rtc),true,'receipt works without a DataChannel');
+ const offline={authenticated:false,send(){throw Error('offline');}};
+ assert.equal(sendQueuedEnvelope(item,offline,rtc),null,'disconnected transports retain the durable queue');
+ rtc.isOpen=true;await sendQueuedEnvelope(item,offline,rtc);assert.equal(mediaWrites,1,'ready RTC remains a fallback');
+ const huge={...item,ciphertextB64:'a'.repeat(100000)};
+ await sendQueuedEnvelope(huge,signal,rtc);assert.equal(mediaWrites,2,'media cannot overflow TLS frame limit');
+ rtc.isOpen=false;assert.equal(sendQueuedEnvelope(huge,signal,rtc),null);
+ const {RequestScheduler}=load('src/services/requestScheduler.ts');const scheduler=new RequestScheduler(),order=[];
+ let release;const blocker=scheduler.schedule(()=>new Promise(r=>release=r),2);
+ const avatar=scheduler.schedule(async()=>order.push('avatar'),2);
+ const old=scheduler.schedule(async()=>order.push('old query'),0,'people-search').catch(e=>e.message);
+ const fresh=scheduler.schedule(async()=>order.push('fresh query'),0,'people-search');
+ const key=scheduler.schedule(async()=>order.push('encryption keys'),0);
+ const push=scheduler.schedule(async()=>order.push('push registration'),1);
+ release();await Promise.all([blocker,avatar,fresh,key,push]);assert.equal(await old,'Request superseded');
+ assert.deepEqual(order,['fresh query','encryption keys','push registration','avatar']);
+ let active=0,max=0;
+ await Promise.all(Array.from({length:10},(_,i)=>scheduler.schedule(async()=>{max=Math.max(max,++active);await Promise.resolve();active--;},i%2)));
+ assert.equal(max,1,'uncorrelated errors/responses must remain serial');
+ console.log('PASS: text and receipts send with no ICE; offline/media stay bounded; search bypasses queued avatars; obsolete searches coalesce; responses stay serial.');
+})().catch(e=>{console.error(e);process.exitCode=1;});

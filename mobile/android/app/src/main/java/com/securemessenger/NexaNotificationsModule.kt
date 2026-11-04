@@ -56,7 +56,15 @@ class NexaNotificationsModule(private val context: ReactApplicationContext) : Re
             putString("token", NexaNotifications.token(context))
             putString("receiptKey", NexaNotifications.receiptKey(context))
             putBoolean("configured", configured); putBoolean("googleServices", services); putBoolean("enabled",allowed)
+            putBoolean("soundEnabled",NexaNotifications.soundEnabled(context))
+            putString("channelId",NexaNotifications.channel(context))
+            putBoolean("headsUp", allowed && (android.os.Build.VERSION.SDK_INT < 26 ||
+                context.getSystemService(android.app.NotificationManager::class.java)
+                    .getNotificationChannel(NexaNotifications.channel(context)).importance >= android.app.NotificationManager.IMPORTANCE_HIGH))
         })
+    }
+    @ReactMethod fun setSoundEnabled(enabled: Boolean, promise: Promise) {
+        NexaNotifications.setSoundEnabled(context,enabled);promise.resolve(null)
     }
     @ReactMethod fun showMessage(uid: String, conversation: String, message: String, sender: String, avatar: String?, count: Double) {
         NexaNotifications.message(context,uid,conversation,message,sender,avatar,count.toInt())
@@ -67,8 +75,10 @@ class NexaNotificationsModule(private val context: ReactApplicationContext) : Re
             context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:"+context.packageName)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             return
         }
-        context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
-            putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName); addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val appBlocked = !androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled()
+        context.startActivity(Intent(if (appBlocked) Settings.ACTION_APP_NOTIFICATION_SETTINGS else Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE,context.packageName)
+            putExtra(Settings.EXTRA_CHANNEL_ID,NexaNotifications.channel(context)); addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         })
     }
 }

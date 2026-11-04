@@ -38,7 +38,7 @@ pub struct PushSender {
 #[derive(Clone)]
 struct Job { message_id: String, installation_id: String, uid: String, conversation_id: String, token: String,
     sender_name: String, unread_count: i64, unread_senders: i64, avatar_version: Option<String>,
-    native_renderer: bool, native_sent_at: i64, sequence: i64, claim_id: String }
+    native_renderer: bool, native_sent_at: i64, sequence: i64, claim_id: String, channel_id: String }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,17 +101,23 @@ fn payload(job: &Job) -> serde_json::Value {
     let mut body=if count==1 {"1 new message".to_owned()} else {format!("{count} new messages")};
     let people=job.unread_senders.clamp(1,9999);
     if people>1 {body.push_str(&format!(" · {people} people messaging you"));}
-    let result=json!({"message":{"token":job.token,"data":{"type":"new_message","message_id":job.message_id,
+    let mut result=json!({"message":{"token":job.token,"data":{"type":"new_message","message_id":job.message_id,
         "recipient_uid":job.uid,"conversation_id":job.conversation_id,
         "sender_name":title,"unread_count":count.to_string(),"unread_senders":people.to_string(),
         "notification_uid":job.uid,"notification_conversation":job.conversation_id},
         "notification":{"title":title,"body":body},
         "android":{"priority":"high","ttl":"604800s","collapse_key":job.conversation_id,
-            "notification":{"channel_id":"nexa_messages_v1","icon":"ic_message_notification",
+            "notification":{"channel_id":job.channel_id,"icon":"ic_message_notification",
                 "color":"#B69EFF","tag":format!("nexa:{}",job.conversation_id),
                 "notification_count":count,"notification_priority":"PRIORITY_HIGH",
                 "default_sound":true,"default_vibrate_timings":true,"visibility":"PRIVATE",
                 "proxy":"ALLOW"}}}});
+    if job.channel_id=="nexa_messages_bubble_v2" {
+        result["message"]["android"]["notification"]["default_sound"]=json!(false);
+        result["message"]["android"]["notification"]["sound"]=json!("moonlit_bubble");
+    } else if job.channel_id=="nexa_messages_quiet_v2" {
+        result["message"]["android"]["notification"]["default_sound"]=json!(false);
+    }
     // Always displayable on the FIRST request, including rich clients. A
     // data-only probe cannot wake every cold process and used to delay the
     // actual alert by eight seconds. Never gate delivery on an avatar/receipt.
@@ -123,6 +129,12 @@ pub fn valid_avatar_version(value: &str) -> bool {
 }
 
 impl Store {
+    pub async fn set_push_channel(&self, uid:&str, session:&str, installation:&str, channel:Option<&str>) -> Result<()> {
+        let channel=channel.unwrap_or("nexa_messages_v1");
+        anyhow::ensure!(["nexa_messages_v1","nexa_messages_bubble_v2","nexa_messages_quiet_v2"].contains(&channel),"invalid message notification channel");
+        self.connection().await?.execute("UPDATE push_devices SET notification_channel=?4 WHERE installation_id=?1 AND uid=?2 AND session_hash=?3",libsql::params![installation,uid,hash(session),channel]).await?;
+        Ok(())
+    }
     pub async fn register_renderer_push(&self, uid: &str, session: &str, installation: &str, token: &str, enabled: bool, foreground: bool, receipt_key: Option<&str>) -> Result<()> {
         if let Some(key)=receipt_key {anyhow::ensure!(valid_avatar_version(key),"invalid notification receipt key");}
         self.register_push(uid,session,installation,token,enabled,foreground).await?;
@@ -199,7 +211,7 @@ impl Store {
                 (SELECT COUNT(*) FROM messages unread WHERE unread.recipient_uid=r.recipient_uid AND unread.conversation_id=m.conversation_id AND unread.status<>'SEEN'),
                 CASE WHEN a.data_uri<>'' THEN a.version ELSE NULL END,
                 (SELECT COUNT(DISTINCT sender_uid) FROM messages unread WHERE unread.recipient_uid=r.recipient_uid AND unread.status<>'SEEN'),
-                d.receipt_key_hash IS NOT NULL,j.native_sent_at,m.rowid
+                d.receipt_key_hash IS NOT NULL,j.native_sent_at,m.rowid,d.notification_channel
             FROM ready r JOIN messages m ON m.rowid=r.sequence
             JOIN push_jobs j ON j.message_id=m.message_id AND j.installation_id=r.installation_id
             JOIN push_devices d ON d.installation_id=r.installation_id
@@ -207,7 +219,7 @@ impl Store {
             ORDER BY r.due_at,r.sequence
         "#,[now()]).await?;
         let mut jobs=Vec::new();
-        while let Some(r)=rows.next().await? { jobs.push(Job {message_id:r.get(0)?,installation_id:r.get(1)?,uid:r.get(2)?,conversation_id:r.get(3)?,token:r.get(4)?,sender_name:r.get(5)?,unread_count:r.get(6)?,avatar_version:r.get(7)?,unread_senders:r.get(8)?,native_renderer:r.get::<i64>(9)?!=0,native_sent_at:r.get(10)?,sequence:r.get(11)?,claim_id:uuid::Uuid::new_v4().to_string()}); }
+        while let Some(r)=rows.next().await? { jobs.push(Job {message_id:r.get(0)?,installation_id:r.get(1)?,uid:r.get(2)?,conversation_id:r.get(3)?,token:r.get(4)?,sender_name:r.get(5)?,unread_count:r.get(6)?,avatar_version:r.get(7)?,unread_senders:r.get(8)?,native_renderer:r.get::<i64>(9)?!=0,native_sent_at:r.get(10)?,sequence:r.get(11)?,channel_id:r.get(12)?,claim_id:uuid::Uuid::new_v4().to_string()}); }
         Ok(jobs)
     }
     async fn claim_push(&self, job: &Job) -> Result<bool> {
@@ -319,7 +331,7 @@ mod tests {
     use super::*;
     #[test]
     fn push_displays_without_app_process_and_keeps_content_private() {
-        let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into(),sender_name:"Alice".into(),unread_count:2,unread_senders:1,avatar_version:None,native_renderer:false,native_sent_at:0,sequence:0,claim_id:uuid::Uuid::new_v4().to_string()};
+        let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into(),sender_name:"Alice".into(),unread_count:2,unread_senders:1,avatar_version:None,native_renderer:false,native_sent_at:0,sequence:0,channel_id:"nexa_messages_v1".into(),claim_id:uuid::Uuid::new_v4().to_string()};
         let data=payload(&job);
         assert_eq!(data["message"]["notification"]["title"],"Alice");
         assert_eq!(data["message"]["notification"]["body"],"2 new messages");
@@ -417,7 +429,7 @@ mod tests {
             sender_name:env::var("NEXA_FCM_SMOKE_SENDER").unwrap_or_else(|_|"Notification test".into()),
             unread_count:env::var("NEXA_FCM_SMOKE_COUNT").ok().and_then(|v|v.parse().ok()).unwrap_or(1),
             unread_senders:env::var("NEXA_FCM_SMOKE_PEOPLE").ok().and_then(|v|v.parse().ok()).unwrap_or(1),
-            avatar_version:env::var("NEXA_FCM_SMOKE_AVATAR").ok(),native_renderer:env::var("NEXA_FCM_SMOKE_NATIVE").ok().as_deref()==Some("1"),native_sent_at:0,sequence:0,claim_id:uuid::Uuid::new_v4().to_string()};
+            avatar_version:env::var("NEXA_FCM_SMOKE_AVATAR").ok(),native_renderer:env::var("NEXA_FCM_SMOKE_NATIVE").ok().as_deref()==Some("1"),native_sent_at:0,sequence:0,channel_id:"nexa_messages_v1".into(),claim_id:uuid::Uuid::new_v4().to_string()};
         let sender=PushSender::from_env().unwrap().expect("Firebase credentials required");
         assert!(matches!(sender.send(&job).await.unwrap(),Outcome::Sent),"FCM did not accept the test push");
     }
@@ -449,6 +461,27 @@ mod tests {
         assert_eq!(store.due_push().await.unwrap()[0].unread_count,1);
         store.mark_delivered("message-single","b").await.unwrap();assert_eq!(store.due_push().await.unwrap().len(),1,"delivery is not a display receipt");
         store.mark_seen("message-single","b").await.unwrap();assert!(store.due_push().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sound_choice_is_installation_bound_and_quiet_still_displays_an_alert() {
+        let store=queue_fixture().await;save(&store,"sound-message").await;
+        let session="b-session-abcdefghijklmnopqrstuvwxyz123456";
+        store.set_push_channel("b",session,"test-installation-0001",Some("nexa_messages_bubble_v2")).await.unwrap();
+        let sound=payload(&store.due_push().await.unwrap()[0]);
+        assert_eq!(sound["message"]["android"]["notification"]["sound"],"moonlit_bubble");
+        assert_eq!(sound["message"]["android"]["notification"]["default_sound"],false);
+        store.set_push_channel("b",session,"test-installation-0001",Some("nexa_messages_quiet_v2")).await.unwrap();
+        let quiet=payload(&store.due_push().await.unwrap()[0]);
+        assert!(quiet["message"]["notification"].is_object());
+        assert_eq!(quiet["message"]["android"]["notification"]["channel_id"],"nexa_messages_quiet_v2");
+        assert_eq!(quiet["message"]["android"]["notification"]["default_sound"],false);
+        assert!(quiet["message"]["android"]["notification"].get("sound").is_none());
+        store.set_push_channel("c","c-session-abcdefghijklmnopqrstuvwxyz123456","test-installation-0001",Some("nexa_messages_bubble_v2")).await.unwrap();
+        assert_eq!(store.due_push().await.unwrap()[0].channel_id,"nexa_messages_quiet_v2");
+        assert!(store.set_push_channel("b",session,"test-installation-0001",Some("unknown-channel")).await.is_err());
+        store.set_push_channel("b",session,"test-installation-0001",None).await.unwrap();
+        assert_eq!(store.due_push().await.unwrap()[0].channel_id,"nexa_messages_v1","old APKs keep their original notification channel");
     }
 
     #[tokio::test]
