@@ -2,7 +2,7 @@ const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:a
 const ts = require('typescript');
 const events = new Map(), intervals = new Map(), stored = new Map(), frames = [], opened = [], local = [];
 let nextTimer = 0, account, permissions = 0, pendingOpen = 'cv_notification';
-let registration = {installationId:'test-installation-001',token:'valid-token-with-20-characters',enabled:true,configured:true,googleServices:true};
+let registration = {installationId:'test-installation-001',token:'valid-token-with-20-characters',enabled:true,configured:true,googleServices:true,receiptKey:'a'.repeat(64)};
 const native = {
   async setAccount(uid) { account = uid; },
   async getRegistration() { return registration; },
@@ -16,6 +16,7 @@ const context = {exports:{},setInterval(fn) {const id=++nextTimer;intervals.set(
       PermissionsAndroid:{PERMISSIONS:{POST_NOTIFICATIONS:'notifications'},async check(){return false;},async request(){permissions++;return 'denied';}},
       NativeEventEmitter:class {addListener(name,callback){events.set(name,callback);return{remove(){events.delete(name);}};}}};
     if (name.includes('async-storage')) return {default:{async getItem(k){return stored.get(k)||null;},async setItem(k,v){stored.set(k,v);}}};
+    if (name.endsWith('/config')) return {APP_CONFIG:{SIGNALING_HOST:'notifications.test'}};
     return {};
   }};
 vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname,'src/services/notifications.ts'),'utf8'),{
@@ -33,6 +34,7 @@ const state = next => {app.currentState=next;events.get('state')?.(next);};
   assert.equal(account,'account-a'); assert.equal(permissions,1);
   assert.equal(opened[0],'cv_notification');
   assert.equal(frames[0].type,'register_push'); assert.equal(frames[0].foreground,true);
+  assert.equal(frames[0].receipt_key,registration.receiptKey,'native rendering is enabled only with the installation receipt key');
   pendingOpen='cv_tapped_while_registering';
   state('active'); await flush();
   assert(opened.includes('cv_tapped_while_registering'),'notification tap must not wait for push registration or a network timeout');

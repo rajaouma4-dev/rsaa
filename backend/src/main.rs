@@ -328,11 +328,11 @@ where
                     },
                 }
             }
-            ClientFrame::RegisterPush { installation_id, token, enabled, foreground } => {
+            ClientFrame::RegisterPush { installation_id, token, enabled, foreground, receipt_key } => {
                 let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
                     send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
                 };
-                match store.register_push(&user.uid, session, &installation_id, &token, enabled, foreground).await {
+                match store.register_renderer_push(&user.uid, session, &installation_id, &token, enabled, foreground, receipt_key.as_deref()).await {
                     Ok(()) => signal_tx.send(ServerFrame::PushRegistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
                     Err(_) => send_error(&signal_tx, "PUSH_REGISTER_FAILED", "could not register notifications").await?,
                 }
@@ -677,6 +677,26 @@ async fn handle_ws_client(
 
     // If Render port scanner, health check probe, or web browser sends a plain HTTP request
     if !is_ws_upgrade {
+        if req_str.starts_with("POST /notification-receipt HTTP/1.") {
+            let lengths:Vec<_>=req_str.lines().filter_map(|line|line.split_once(':')).filter(|(name,_)|name.eq_ignore_ascii_case("content-length")).collect();
+            let length=if lengths.len()==1 {lengths[0].1.trim().parse::<usize>().ok().filter(|n|*n>0 && *n<=1024)} else {None};
+            let mut status="400 Bad Request";
+            if let (Some(length),Some(end))=(length,initial_buf.windows(4).position(|w|w==b"\r\n\r\n").map(|i|i+4)) {
+                let mut body=initial_buf[end..].to_vec();body.truncate(length);
+                if body.len()<length {
+                    let mut rest=vec![0;length-body.len()];
+                    if matches!(timeout(Duration::from_secs(5),stream.read_exact(&mut rest)).await,Ok(Ok(_))) {body.extend(rest);}
+                }
+                if body.len()==length {
+                    if let Ok(receipt)=serde_json::from_slice::<push::NotificationReceipt>(&body) {
+                        // No response body or token logging; duplicate receipts are idempotent.
+                        status=if store.notification_receipt(receipt).await.is_ok() {"204 No Content"} else {"503 Service Unavailable"};
+                    }
+                }
+            }
+            stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            stream.flush().await?;return Ok(());
+        }
         let path=req_str.lines().next().and_then(|line|line.strip_prefix("GET ")).and_then(|line|line.split_whitespace().next()).unwrap_or("");
         if let Some(version)=path.strip_prefix("/notification-avatar/").and_then(|v|v.strip_suffix(".jpg")) {
             let image=store.notification_avatar(version).await.ok().flatten();
@@ -843,11 +863,11 @@ async fn handle_ws_client(
                     },
                 }
             }
-            ClientFrame::RegisterPush { installation_id, token, enabled, foreground } => {
+            ClientFrame::RegisterPush { installation_id, token, enabled, foreground, receipt_key } => {
                 let (Some(user), Some(session)) = (current_user.as_ref(), current_session_token.as_ref()) else {
                     send_error(&signal_tx, "AUTH_REQUIRED", "login required").await?; continue;
                 };
-                match store.register_push(&user.uid, session, &installation_id, &token, enabled, foreground).await {
+                match store.register_renderer_push(&user.uid, session, &installation_id, &token, enabled, foreground, receipt_key.as_deref()).await {
                     Ok(()) => signal_tx.send(ServerFrame::PushRegistered).await.map_err(|_| anyhow!("signaling writer closed"))?,
                     Err(_) => send_error(&signal_tx, "PUSH_REGISTER_FAILED", "could not register notifications").await?,
                 }

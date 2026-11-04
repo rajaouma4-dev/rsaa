@@ -1,8 +1,9 @@
 import {AppState, NativeEventEmitter, NativeModules, PermissionsAndroid, Platform} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {TlsSignalingClient} from './signaling';
+import {APP_CONFIG} from '../config';
 
-type Registration = {installationId: string; token: string; configured: boolean; googleServices: boolean; enabled: boolean};
+type Registration = {installationId: string; token: string; configured: boolean; googleServices: boolean; enabled: boolean; receiptKey?: string};
 const native = NativeModules.NexaNotifications;
 const ASKED = 'nexa.notifications.permission.asked.v1';
 
@@ -67,10 +68,10 @@ export function startNotifications(uid: string, getSignal: () => TlsSignalingCli
       const signal = getSignal();
       if (!signal?.authenticated || !info.token) return;
       const enabled = info.enabled && info.configured && info.googleServices;
-      const key = `${info.installationId}:${info.token}:${enabled}`;
+      const key = `${info.installationId}:${info.token}:${enabled}:${info.receiptKey || ''}`;
       const foreground = AppState.currentState === 'active';
       if (registeredSignal !== signal || registrationKey !== key) {
-        await signal.request({type:'register_push', installation_id:info.installationId, token:info.token, enabled, foreground}, 'push_registered', 7000);
+        await signal.request({type:'register_push', installation_id:info.installationId, token:info.token, enabled, foreground,receipt_key:info.receiptKey||null}, 'push_registered', 7000);
         if (disposed) return;
         registeredSignal = signal; registrationKey = key;
       }
@@ -81,6 +82,7 @@ export function startNotifications(uid: string, getSignal: () => TlsSignalingCli
   };
   void (async () => {
     await native.setAccount(uid);
+    await native.configureServer?.(APP_CONFIG.SIGNALING_HOST);
     if (disposed) return;
     void drainOpen();
     await requestPermissionOnce();

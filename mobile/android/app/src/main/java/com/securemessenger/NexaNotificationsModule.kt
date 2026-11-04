@@ -34,6 +34,12 @@ class NexaNotificationsModule(private val context: ReactApplicationContext) : Re
     @ReactMethod fun addListener(event: String) {}
     @ReactMethod fun removeListeners(count: Int) {}
     @ReactMethod fun setAccount(uid: String?, promise: Promise) { NexaNotifications.setAccount(context,uid); promise.resolve(null) }
+    @ReactMethod fun configureServer(value: String, promise: Promise) {
+        val uri=android.net.Uri.parse(if(value.contains("://")) value else "https://$value")
+        if (uri.host.isNullOrBlank() || uri.userInfo!=null || uri.query!=null || uri.fragment!=null) {promise.reject("BAD_SERVER","Invalid notification server");return}
+        context.getSharedPreferences("nexa_notifications",0).edit().putString("server","https://${uri.authority}").apply()
+        promise.resolve(null)
+    }
     @ReactMethod fun getRegistration(promise: Promise) {
         val configured = FirebaseApp.getApps(context).isNotEmpty()
         val services = GoogleApiAvailabilityLight.getInstance().isGooglePlayServicesAvailable(context) == ConnectionResult.SUCCESS
@@ -48,6 +54,7 @@ class NexaNotificationsModule(private val context: ReactApplicationContext) : Re
         promise.resolve(Arguments.createMap().apply {
             putString("installationId", NexaNotifications.installation(context))
             putString("token", NexaNotifications.token(context))
+            putString("receiptKey", NexaNotifications.receiptKey(context))
             putBoolean("configured", configured); putBoolean("googleServices", services); putBoolean("enabled",allowed)
         })
     }

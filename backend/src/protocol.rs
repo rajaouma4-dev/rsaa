@@ -7,7 +7,7 @@ pub enum ClientFrame {
     Login { username: String, password: String },
     Resume { token: String },
     Logout,
-    RegisterPush { installation_id: String, token: String, enabled: bool, foreground: bool },
+    RegisterPush { installation_id: String, token: String, enabled: bool, foreground: bool, #[serde(default)] receipt_key: Option<String> },
     PushState { installation_id: String, foreground: bool },
     UnregisterPush { installation_id: String },
     SearchUsers { query: String },

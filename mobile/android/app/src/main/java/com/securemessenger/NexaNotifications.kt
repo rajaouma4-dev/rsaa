@@ -12,12 +12,19 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
+import android.graphics.BitmapShader
+import android.graphics.Shader
+import android.graphics.Matrix
+import android.widget.RemoteViews
 import android.util.Base64
 import android.os.Build
 import android.os.Bundle
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import org.json.JSONArray
+import org.json.JSONObject
+import java.net.URL
+import javax.net.ssl.HttpsURLConnection
 import java.util.UUID
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
@@ -87,20 +94,29 @@ object NexaNotifications {
     fun token(context: Context): String = prefs(context).getString("token", "") ?: ""
     fun setToken(context: Context, token: String) { prefs(context).edit().putString("token", token).apply(); onTokenChanged?.invoke() }
 
+    @Synchronized fun receiptKey(context: Context): String {
+        val p=prefs(context)
+        if (p.getString("server","").isNullOrEmpty()) return ""
+        return p.getString("receipt_key",null) ?: (UUID.randomUUID().toString()+UUID.randomUUID().toString()).replace("-","").also {
+            p.edit().putString("receipt_key",it).commit()
+        }
+    }
+
     @Synchronized fun message(context: Context, uid: String, conversation: String, message: String,
-        senderName: String = "Nexa Chat", avatar: String? = null, unread: Int = 1) {
+        senderName: String = "Nexa Chat", avatar: String? = null, unread: Int = 1): Boolean {
         val p = prefs(context)
-        if (uid.isEmpty() || p.getString("uid", null) != uid || conversation.isEmpty() || message.isEmpty()) return
+        if (uid.isEmpty() || p.getString("uid", null) != uid || conversation.isEmpty() || message.isEmpty()) return false
         val existing = runCatching { JSONArray(p.getString("recent", "[]")) }.getOrDefault(JSONArray())
         val ids = (0 until existing.length()).map { existing.getString(it) }.toMutableList()
-        if (ids.contains(message)) return
+        val seen=ids.contains(message)
+        if (seen && (foreground || avatar==null || context.getSystemService(NotificationManager::class.java).activeNotifications.none { it.tag=="nexa:$conversation" })) return true
         // Remember foreground deliveries too, so a delayed push cannot alert later.
-        ids.add(message)
-        p.edit().putString("recent", JSONArray(ids.takeLast(512)).toString()).commit()
-        if (foreground || !allowed(context)) return
+        if (!seen) ids.add(message)
+        if (foreground || !allowed(context)) {
+            p.edit().putString("recent", JSONArray(ids.takeLast(512)).toString()).commit();return true
+        }
         val name = senderName.filterNot { it.isISOControl() }.take(80).ifBlank { "Nexa Chat" }
-        val count = maxOf((p.getInt("count:$conversation",0) + 1).coerceAtMost(9999), unread.coerceIn(1,9999))
-        p.edit().putInt("count:$conversation",count).apply()
+        val count = maxOf(p.getInt("count:$conversation",0), unread.coerceIn(1,9999))
         val text = if (count == 1) "1 new message" else "$count new messages"
         createChannel(context)
         val intent = Intent(context, MainActivity::class.java).apply {
@@ -111,14 +127,24 @@ object NexaNotifications {
             putExtra("notification_conversation", conversation)
         }
         val open = PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val icon=senderIcon(name,avatar)
+        fun layout(resource: Int)=RemoteViews(context.packageName,resource).apply {
+            setImageViewBitmap(R.id.sender_avatar,icon)
+            setTextViewText(R.id.sender_name,name)
+            setContentDescription(R.id.sender_name,name)
+            setTextViewText(R.id.sender_count,text)
+        }
         val notification = NotificationCompat.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_message_notification)
             .setColor(Color.rgb(182,158,255))
             .setContentTitle(name)
             .setContentText(text)
-            .setLargeIcon(senderIcon(name,avatar))
+            .setStyle(NotificationCompat.DecoratedCustomViewStyle())
+            .setCustomContentView(layout(R.layout.notification_sender_small))
+            .setCustomBigContentView(layout(R.layout.notification_sender_expanded))
+            .setCustomHeadsUpContentView(layout(R.layout.notification_sender_expanded))
             .setNumber(count)
-            .setSubText("Nexa Chat")
+            .setOnlyAlertOnce(seen)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setDefaults(NotificationCompat.DEFAULT_ALL)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
@@ -129,9 +155,11 @@ object NexaNotifications {
             .build()
         try {
             NotificationManagerCompat.from(context).notify("nexa:$conversation", 0, notification)
-            updateSummary(context)
+            p.edit().putInt("count:$conversation",count).putString("recent",JSONArray(ids.takeLast(512)).toString()).commit()
+            runCatching { updateSummary(context) }
+            return true
         }
-        catch (_: SecurityException) { /* Permission may be revoked between check and post. */ }
+        catch (_: Exception) { return false /* Server fallback remains pending. */ }
     }
 
     fun clearVisible(context: Context) {
@@ -148,7 +176,14 @@ object NexaNotifications {
                 val options=BitmapFactory.Options().apply { inJustDecodeBounds=true }
                 BitmapFactory.decodeByteArray(bytes,0,bytes.size,options)
                 if (options.outWidth in 1..512 && options.outHeight in 1..512) {
-                    BitmapFactory.decodeByteArray(bytes,0,bytes.size)?.let { return Bitmap.createScaledBitmap(it,96,96,true) }
+                    BitmapFactory.decodeByteArray(bytes,0,bytes.size)?.let { source ->
+                        val result=Bitmap.createBitmap(96,96,Bitmap.Config.ARGB_8888)
+                        val scale=maxOf(96f/source.width,96f/source.height)
+                        val matrix=Matrix().apply {setScale(scale,scale);postTranslate((96-source.width*scale)/2,(96-source.height*scale)/2)}
+                        val shader=BitmapShader(source,Shader.TileMode.CLAMP,Shader.TileMode.CLAMP).apply {setLocalMatrix(matrix)}
+                        Canvas(result).drawCircle(48f,48f,48f,Paint(Paint.ANTI_ALIAS_FLAG).apply {this.shader=shader})
+                        return result
+                    }
                 }
             }
         }
@@ -158,6 +193,46 @@ object NexaNotifications {
         paint.color=Color.WHITE;paint.textSize=44f;paint.textAlign=Paint.Align.CENTER
         canvas.drawText(name.take(1).uppercase(),48f,48f-(paint.ascent()+paint.descent())/2,paint)
         return bitmap
+    }
+
+    /** Runs on Firebase's background worker; bounded I/O, no React engine needed. */
+    fun receive(context: Context, data: Map<String,String>) {
+        val uid=data["recipient_uid"] ?: return
+        val conversation=data["conversation_id"] ?: return
+        val id=data["message_id"] ?: return
+        val p=prefs(context)
+        if (p.getString("uid",null)!=uid) return
+        val base=p.getString("server","") ?: ""
+        val version=data["avatar_version"] ?: ""
+        val avatar=if (!foreground && base.startsWith("https://") && version.matches(Regex("[a-f0-9]{64}"))) {
+            runCatching {
+                val connection=URL("$base/notification-avatar/$version.jpg").openConnection() as HttpsURLConnection
+                try {
+                    connection.connectTimeout=1500;connection.readTimeout=1500;connection.instanceFollowRedirects=false
+                    check(connection.responseCode==200)
+                    val output=java.io.ByteArrayOutputStream()
+                    connection.inputStream.use { input ->
+                        val buffer=ByteArray(4096)
+                        while (true) {val n=input.read(buffer);if(n<0)break;check(output.size()+n<=16000);output.write(buffer,0,n)}
+                    }
+                    "data:image/jpeg;base64,"+Base64.encodeToString(output.toByteArray(),Base64.NO_WRAP)
+                } finally {connection.disconnect()}
+            }.getOrNull()
+        } else null
+        val handled=message(context,uid,conversation,id,data["sender_name"] ?: "Nexa Chat",avatar,data["unread_count"]?.toIntOrNull() ?: 1)
+        if (handled && data["native_renderer"]=="1" && base.startsWith("https://")) {
+            runCatching {
+                val bytes=JSONObject().put("uid",uid).put("installation_id",installation(context))
+                    .put("message_id",id).put("receipt_key",receiptKey(context)).toString().toByteArray(Charsets.UTF_8)
+                val connection=URL("$base/notification-receipt").openConnection() as HttpsURLConnection
+                try {
+                    connection.requestMethod="POST";connection.connectTimeout=1500;connection.readTimeout=1500
+                    connection.instanceFollowRedirects=false;connection.doOutput=true
+                    connection.setRequestProperty("Content-Type","application/json");connection.setFixedLengthStreamingMode(bytes.size)
+                    connection.outputStream.use {it.write(bytes)};connection.responseCode
+                } finally {connection.disconnect()}
+            }
+        }
     }
 
     private fun updateSummary(context: Context) {

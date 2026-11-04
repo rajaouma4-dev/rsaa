@@ -173,6 +173,13 @@ impl Store {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_push_devices_uid ON push_devices(uid,enabled)", ()).await?;
         conn.execute("CREATE TABLE IF NOT EXISTS push_jobs (message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE, installation_id TEXT NOT NULL REFERENCES push_devices(installation_id) ON DELETE CASCADE, recipient_uid TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(message_id,installation_id))", ()).await?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_push_jobs_due ON push_jobs(finished,next_attempt_at)", ()).await?;
+        for (table,column,definition) in [("push_devices","receipt_key_hash","TEXT"),("push_jobs","native_sent_at","INTEGER NOT NULL DEFAULT 0")] {
+            let mut columns=conn.query(&format!("PRAGMA table_info({table})"),()).await?;
+            let mut found=false;
+            while let Some(row)=columns.next().await? { found |= row.get::<String>(1)?==column; }
+            drop(columns);
+            if !found {conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),()).await?;}
+        }
         conn.execute("CREATE TRIGGER IF NOT EXISTS messages_enqueue_push AFTER INSERT ON messages BEGIN INSERT OR IGNORE INTO push_jobs(message_id,installation_id,recipient_uid,next_attempt_at) SELECT NEW.message_id,installation_id,NEW.recipient_uid,CAST(strftime('%s','now') AS INTEGER) FROM push_devices WHERE uid=NEW.recipient_uid AND enabled=1; END", ()).await?;
         // Create this index only after upgrading older outbox tables.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(recipient_uid, delivered_at, next_attempt_at)", ()).await?;

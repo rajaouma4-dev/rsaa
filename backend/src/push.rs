@@ -27,7 +27,12 @@ pub struct PushSender {
 }
 #[derive(Clone)]
 struct Job { message_id: String, installation_id: String, uid: String, conversation_id: String, token: String,
-    sender_name: String, unread_count: i64, unread_senders: i64, avatar_version: Option<String> }
+    sender_name: String, unread_count: i64, unread_senders: i64, avatar_version: Option<String>,
+    native_renderer: bool, native_sent_at: i64, sequence: i64 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationReceipt { installation_id: String, uid: String, message_id: String, receipt_key: String }
 enum Outcome { Sent, InvalidToken, Retry(i64) }
 
 impl PushSender {
@@ -97,12 +102,13 @@ fn payload(job: &Job) -> serde_json::Value {
                 "notification_count":count,"notification_priority":"PRIORITY_HIGH",
                 "default_sound":true,"default_vibrate_timings":true,"visibility":"PRIVATE",
                 "proxy":"ALLOW"}}}});
-    let base=env::var("PUBLIC_BASE_URL").or_else(|_|env::var("RENDER_EXTERNAL_URL")).unwrap_or_default();
-    if let Some(version)=job.avatar_version.as_deref().filter(|v|valid_avatar_version(v)) {
-        if base.starts_with("https://") && !base.contains(['?', '#']) {
-            let url=format!("{}/notification-avatar/{version}.jpg",base.trim_end_matches('/'));
-            result["message"]["android"]["notification"]["image"]=json!(url);
-        }
+    // System image payloads always create a BigPicture banner. Rich clients
+    // instead render a small circular avatar themselves, then acknowledge it.
+    if job.native_renderer && job.native_sent_at==0 {
+        result["message"].as_object_mut().unwrap().remove("notification");
+        result["message"]["android"].as_object_mut().unwrap().remove("notification");
+        result["message"]["data"]["native_renderer"]=json!("1");
+        result["message"]["data"]["avatar_version"]=json!(job.avatar_version.as_deref().filter(|v|valid_avatar_version(v)).unwrap_or(""));
     }
     result
 }
@@ -112,6 +118,22 @@ pub fn valid_avatar_version(value: &str) -> bool {
 }
 
 impl Store {
+    pub async fn register_renderer_push(&self, uid: &str, session: &str, installation: &str, token: &str, enabled: bool, foreground: bool, receipt_key: Option<&str>) -> Result<()> {
+        if let Some(key)=receipt_key {anyhow::ensure!(valid_avatar_version(key),"invalid notification receipt key");}
+        self.register_push(uid,session,installation,token,enabled,foreground).await?;
+        self.connection().await?.execute("UPDATE push_devices SET receipt_key_hash=?4 WHERE installation_id=?1 AND uid=?2 AND session_hash=?3",libsql::params![installation,uid,hash(session),receipt_key.map(hash)]).await?;
+        Ok(())
+    }
+
+    pub async fn notification_receipt(&self, receipt: NotificationReceipt) -> Result<bool> {
+        if !valid_avatar_version(&receipt.receipt_key) || receipt.installation_id.len()>80 || receipt.uid.len()>80 || receipt.message_id.len()>128 {return Ok(false);}
+        let changed=self.connection().await?.execute("UPDATE push_jobs SET finished=1 WHERE installation_id=?1 AND recipient_uid=?2 AND EXISTS(SELECT 1 FROM push_devices d JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid WHERE d.installation_id=?1 AND d.uid=?2 AND d.receipt_key_hash=?3 AND s.expires_at>?5) AND message_id IN (SELECT m.message_id FROM messages m JOIN messages target ON target.message_id=?4 AND target.recipient_uid=?2 WHERE m.recipient_uid=?2 AND m.conversation_id=target.conversation_id AND m.rowid<=target.rowid)",libsql::params![receipt.installation_id,receipt.uid,hash(&receipt.receipt_key),receipt.message_id,now()]).await?;
+        Ok(changed>0)
+    }
+
+    async fn native_push_sent(&self, job: &Job) -> Result<()> {
+        self.connection().await?.execute("UPDATE push_jobs SET native_sent_at=?4,next_attempt_at=?4+8 WHERE message_id=?1 AND installation_id=?2 AND recipient_uid=?3 AND finished=0 AND EXISTS(SELECT 1 FROM push_devices WHERE installation_id=?2 AND uid=?3 AND token=?5)",libsql::params![job.message_id.clone(),job.installation_id.clone(),job.uid.clone(),now(),job.token.clone()]).await?;Ok(())
+    }
     pub async fn register_push(&self, uid: &str, session: &str, installation: &str, token: &str, enabled: bool, foreground: bool) -> Result<()> {
         anyhow::ensure!((16..=80).contains(&installation.len()) && installation.chars().all(|c|c.is_ascii_alphanumeric() || c=='-'), "invalid installation ID");
         anyhow::ensure!((20..=4096).contains(&token.len()) && !token.chars().any(char::is_whitespace), "invalid push token");
@@ -119,7 +141,7 @@ impl Store {
         let tx = conn.transaction().await?;
         // Accepted FCM messages on an obsolete token may never reach the phone.
         // Requeue recent unread IDs on rotation; native ID dedup handles overlaps.
-        tx.execute("UPDATE push_jobs SET finished=0,next_attempt_at=?4 WHERE installation_id=?1 AND recipient_uid=?2 AND EXISTS(SELECT 1 FROM push_devices WHERE installation_id=?1 AND uid=?2 AND token<>?3)", libsql::params![installation,uid,token,now()]).await?;
+        tx.execute("UPDATE push_jobs SET finished=0,native_sent_at=0,next_attempt_at=?4 WHERE installation_id=?1 AND recipient_uid=?2 AND EXISTS(SELECT 1 FROM push_devices WHERE installation_id=?1 AND uid=?2 AND token<>?3)", libsql::params![installation,uid,token,now()]).await?;
         // A token belongs to one installation/account at a time. Remove old queued jobs
         // on account changes so an old notification cannot be sent to a new account.
         tx.execute("DELETE FROM push_jobs WHERE installation_id IN (SELECT installation_id FROM push_devices WHERE token=?1 OR installation_id=?2) AND recipient_uid<>?3", libsql::params![token,installation,uid]).await?;
@@ -148,9 +170,9 @@ impl Store {
     }
 
     async fn due_push(&self) -> Result<Vec<Job>> {
-        let mut rows = self.connection().await?.query("SELECT j.message_id,j.installation_id,j.recipient_uid,m.conversation_id,d.token,u.display_name,(SELECT COUNT(*) FROM messages unread WHERE unread.recipient_uid=j.recipient_uid AND unread.conversation_id=m.conversation_id AND unread.status<>'SEEN'),CASE WHEN a.data_uri<>'' THEN a.version ELSE NULL END,(SELECT COUNT(DISTINCT sender_uid) FROM messages unread WHERE unread.recipient_uid=j.recipient_uid AND unread.status<>'SEEN') FROM push_jobs j JOIN messages m ON m.message_id=j.message_id JOIN users u ON u.uid=m.sender_uid LEFT JOIN profile_avatars a ON a.uid=u.uid JOIN push_devices d ON d.installation_id=j.installation_id AND d.uid=j.recipient_uid JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid LEFT JOIN user_settings settings ON settings.uid=d.uid WHERE j.finished=0 AND j.next_attempt_at<=?1 AND d.foreground_until<=?1 AND d.enabled=1 AND s.expires_at>?1 AND m.status<>'SEEN' AND m.saved_at>=datetime('now','-7 days') AND COALESCE(settings.notifications_enabled,1)=1 ORDER BY j.next_attempt_at,j.message_id LIMIT 32",[now()]).await?;
+        let mut rows = self.connection().await?.query("SELECT j.message_id,j.installation_id,j.recipient_uid,m.conversation_id,d.token,u.display_name,(SELECT COUNT(*) FROM messages unread WHERE unread.recipient_uid=j.recipient_uid AND unread.conversation_id=m.conversation_id AND unread.status<>'SEEN'),CASE WHEN a.data_uri<>'' THEN a.version ELSE NULL END,(SELECT COUNT(DISTINCT sender_uid) FROM messages unread WHERE unread.recipient_uid=j.recipient_uid AND unread.status<>'SEEN'),d.receipt_key_hash IS NOT NULL,j.native_sent_at,m.rowid FROM push_jobs j JOIN messages m ON m.message_id=j.message_id JOIN users u ON u.uid=m.sender_uid LEFT JOIN profile_avatars a ON a.uid=u.uid JOIN push_devices d ON d.installation_id=j.installation_id AND d.uid=j.recipient_uid JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid LEFT JOIN user_settings settings ON settings.uid=d.uid WHERE j.finished=0 AND j.next_attempt_at<=?1 AND d.foreground_until<=?1 AND d.enabled=1 AND s.expires_at>?1 AND m.status<>'SEEN' AND m.saved_at>=datetime('now','-7 days') AND COALESCE(settings.notifications_enabled,1)=1 ORDER BY j.next_attempt_at,j.message_id LIMIT 32",[now()]).await?;
         let mut jobs=Vec::new();
-        while let Some(r)=rows.next().await? { jobs.push(Job {message_id:r.get(0)?,installation_id:r.get(1)?,uid:r.get(2)?,conversation_id:r.get(3)?,token:r.get(4)?,sender_name:r.get(5)?,unread_count:r.get(6)?,avatar_version:r.get(7)?,unread_senders:r.get(8)?}); }
+        while let Some(r)=rows.next().await? { jobs.push(Job {message_id:r.get(0)?,installation_id:r.get(1)?,uid:r.get(2)?,conversation_id:r.get(3)?,token:r.get(4)?,sender_name:r.get(5)?,unread_count:r.get(6)?,avatar_version:r.get(7)?,unread_senders:r.get(8)?,native_renderer:r.get::<i64>(9)?!=0,native_sent_at:r.get(10)?,sequence:r.get(11)?}); }
         Ok(jobs)
     }
     async fn claim_push(&self, job: &Job) -> Result<bool> {
@@ -193,9 +215,14 @@ pub async fn run_worker(store: Store, sender: Arc<PushSender>) {
             async move {
                 let mut claimed=Vec::new();
                 for job in jobs { if matches!(store.claim_push(&job).await,Ok(true)) {claimed.push(job);} }
-                let Some(job)=claimed.last() else {return};
-                match sender.send(job).await {
-                    Ok(Outcome::Sent)=>{for job in &claimed {let _=store.finish_push(job,false).await;}},
+                let Some(latest)=claimed.iter().max_by_key(|job|job.sequence) else {return};
+                let mut job=latest.clone();
+                if claimed.iter().any(|j|j.native_sent_at>0) {job.native_sent_at=1;}
+                match sender.send(&job).await {
+                    Ok(Outcome::Sent)=>{for candidate in &claimed {
+                        if job.native_renderer && job.native_sent_at==0 {let _=store.native_push_sent(candidate).await;}
+                        else {let _=store.finish_push(candidate,false).await;}
+                    }},
                     Ok(Outcome::InvalidToken)=>{for job in &claimed {let _=store.finish_push(job,true).await;}},
                     Ok(Outcome::Retry(delay))=>{for job in &claimed {let _=store.defer_push(job,delay).await;}},
                     _=>tracing::warn!("FCM send failed; durable notification will retry"),
@@ -210,7 +237,7 @@ mod tests {
     use super::*;
     #[test]
     fn push_displays_without_app_process_and_keeps_content_private() {
-        let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into(),sender_name:"Alice".into(),unread_count:2,unread_senders:1,avatar_version:None};
+        let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into(),sender_name:"Alice".into(),unread_count:2,unread_senders:1,avatar_version:None,native_renderer:false,native_sent_at:0,sequence:0};
         let data=payload(&job);
         assert_eq!(data["message"]["notification"]["title"],"Alice");
         assert_eq!(data["message"]["notification"]["body"],"2 new messages");
@@ -230,6 +257,45 @@ mod tests {
         assert_eq!(data["message"]["android"]["ttl"],"604800s");
         assert_eq!(data["message"]["data"]["recipient_uid"],"b");
         assert!(!data.to_string().contains("ciphertext"));
+        assert!(data["message"]["android"]["notification"].get("image").is_none(),"fallback must never create a picture banner");
+        other.native_renderer=true;other.avatar_version=Some("a".repeat(64));
+        let native=payload(&other);
+        assert!(native["message"].get("notification").is_none());
+        assert!(native["message"]["android"].get("notification").is_none());
+        assert_eq!(native["message"]["data"]["avatar_version"],"a".repeat(64));
+        assert!(native["message"]["data"].get("receipt_key").is_none(),"receipt secrets never enter FCM");
+        other.native_sent_at=1;
+        assert!(payload(&other)["message"].get("notification").is_some(),"missing receipt falls back to a system alert");
+    }
+
+    #[tokio::test]
+    async fn native_receipt_is_device_bound_and_preserves_newer_jobs() {
+        let path=format!("target/notification_receipt_{}.db",uuid::Uuid::new_v4());
+        let store=Store::load_test_store(&path,&["a".into(),"b".into(),"c".into()]).await.unwrap();
+        let conn=store.connection().await.unwrap();
+        conn.execute_batch("INSERT INTO conversations(conversation_id,pair_key,created_by) VALUES('ab','a:b','a'),('cb','b:c','c'); INSERT INTO conversation_members(conversation_id,uid) VALUES('ab','a'),('ab','b'),('cb','c'),('cb','b');").await.unwrap();
+        let session="b-session-abcdefghijklmnopqrstuvwxyz123456";
+        conn.execute("INSERT INTO device_sessions(token_hash,uid,expires_at) VALUES(?1,'b',?2)",libsql::params![hash(session),now()+3600]).await.unwrap();
+        let installation="receipt-installation-001";let key="a".repeat(64);
+        store.register_renderer_push("b",session,installation,"receipt-token-at-least-20-characters",true,false,Some(&key)).await.unwrap();
+        for (id,conv,sender) in [("receipt_a1","ab","a"),("receipt_a2","ab","a"),("receipt_c1","cb","c")] {store.save_ciphertext(id,conv,sender,&[0x33,1,2],Some(1)).await.unwrap();}
+        let jobs=store.due_push().await.unwrap();assert!(jobs.iter().all(|j|j.native_renderer && j.native_sent_at==0));
+        for job in &jobs {assert!(store.claim_push(job).await.unwrap());store.native_push_sent(job).await.unwrap();}
+        assert!(store.due_push().await.unwrap().is_empty(),"fallback waits for the native receipt");
+        let receipt=|message:&str,secret:&str|NotificationReceipt{installation_id:installation.into(),uid:"b".into(),message_id:message.into(),receipt_key:secret.into()};
+        assert!(!store.notification_receipt(receipt("receipt_a2",&"b".repeat(64))).await.unwrap());
+        store.save_ciphertext("receipt_a3","ab","a",&[0x33,1,2],Some(1)).await.unwrap();
+        assert!(store.notification_receipt(receipt("receipt_a2",&key)).await.unwrap());
+        // An ACK racing the provider response must not reopen a completed job.
+        for job in jobs.iter().filter(|j|j.conversation_id=="ab") {store.native_push_sent(job).await.unwrap();}
+        conn.execute("UPDATE push_jobs SET next_attempt_at=0",()).await.unwrap();
+        let pending=store.due_push().await.unwrap();assert_eq!(pending.len(),2);
+        assert!(pending.iter().any(|j|j.message_id=="receipt_a3" && j.native_sent_at==0));
+        assert!(pending.iter().any(|j|j.message_id=="receipt_c1" && j.native_sent_at>0));
+        let mut rows=conn.query("SELECT status FROM messages WHERE message_id='receipt_a2'",()).await.unwrap();assert_eq!(rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(),"SAVED","notification receipt is not a chat read receipt");drop(rows);
+        conn.execute("UPDATE device_sessions SET expires_at=0",()).await.unwrap();
+        assert!(!store.notification_receipt(receipt("receipt_c1",&key)).await.unwrap());
+        drop(conn);drop(store);let _=std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -269,7 +335,7 @@ mod tests {
             sender_name:env::var("NEXA_FCM_SMOKE_SENDER").unwrap_or_else(|_|"Notification test".into()),
             unread_count:env::var("NEXA_FCM_SMOKE_COUNT").ok().and_then(|v|v.parse().ok()).unwrap_or(1),
             unread_senders:env::var("NEXA_FCM_SMOKE_PEOPLE").ok().and_then(|v|v.parse().ok()).unwrap_or(1),
-            avatar_version:env::var("NEXA_FCM_SMOKE_AVATAR").ok()};
+            avatar_version:env::var("NEXA_FCM_SMOKE_AVATAR").ok(),native_renderer:env::var("NEXA_FCM_SMOKE_NATIVE").ok().as_deref()==Some("1"),native_sent_at:0,sequence:0};
         let sender=PushSender::from_env().unwrap().expect("Firebase credentials required");
         assert!(matches!(sender.send(&job).await.unwrap(),Outcome::Sent),"FCM did not accept the test push");
     }
