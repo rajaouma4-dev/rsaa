@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::protocol::{ConversationSummary, MessageEnvelope, UserSummary};
 
 #[derive(Clone)]
-pub struct Store { db: Arc<Database> }
+pub struct Store { db: Arc<Database>, pub(crate) push_wakeup: Arc<tokio::sync::Notify> }
 
 #[derive(Debug, Clone)]
 pub struct PendingDelivery {
@@ -32,7 +32,7 @@ impl Store {
     #[cfg(test)]
     pub async fn load_test_store(path: &str, users: &[String]) -> Result<Self> {
         let db = Builder::new_local(path).build().await?;
-        let store = Self { db: Arc::new(db) };
+        let store = Self { db: Arc::new(db), push_wakeup: Arc::new(tokio::sync::Notify::new()) };
         store.migrate().await?;
         let conn = store.connection().await?;
         for uid in users {
@@ -46,7 +46,7 @@ impl Store {
         anyhow::ensure!(!token.trim().is_empty() && !token.starts_with("PASTE_"), "Set TURSO_AUTH_TOKEN in backend/.env");
         let db = Builder::new_remote(url.to_owned(), token.to_owned())
             .build().await.context("connect to Turso/libSQL remote database")?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(db), push_wakeup: Arc::new(tokio::sync::Notify::new()) })
     }
 
     pub(crate) async fn connection(&self) -> Result<libsql::Connection> {
@@ -173,6 +173,9 @@ impl Store {
         conn.execute("CREATE INDEX IF NOT EXISTS idx_push_devices_uid ON push_devices(uid,enabled)", ()).await?;
         conn.execute("CREATE TABLE IF NOT EXISTS push_jobs (message_id TEXT NOT NULL REFERENCES messages(message_id) ON DELETE CASCADE, installation_id TEXT NOT NULL REFERENCES push_devices(installation_id) ON DELETE CASCADE, recipient_uid TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(message_id,installation_id))", ()).await?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_push_jobs_due ON push_jobs(finished,next_attempt_at)", ()).await?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_push_jobs_device_pending ON push_jobs(installation_id,recipient_uid,finished)", ()).await?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_notification_counts ON messages(recipient_uid,conversation_id,status)", ()).await?;
+        conn.execute("CREATE TABLE IF NOT EXISTS push_dispatch_leases (installation_id TEXT NOT NULL REFERENCES push_devices(installation_id) ON DELETE CASCADE, conversation_id TEXT NOT NULL, owner TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(installation_id,conversation_id))", ()).await?;
         for (table,column,definition) in [("push_devices","receipt_key_hash","TEXT"),("push_jobs","native_sent_at","INTEGER NOT NULL DEFAULT 0")] {
             let mut columns=conn.query(&format!("PRAGMA table_info({table})"),()).await?;
             let mut found=false;
@@ -408,6 +411,8 @@ impl Store {
         if let Some(row) = rows.next().await? {
             let recipient: String = row.get(0)?;
             anyhow::ensure!(rows.next().await?.is_none(), "ambiguous recipient");
+            drop(rows);
+            self.push_wakeup.notify_one();
             return Ok((recipient, true));
         }
         drop(rows);
@@ -464,6 +469,7 @@ impl Store {
             libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), recipient_uid.to_owned(), ciphertext.to_vec(), created_at, msg_type.unwrap_or(0) as i64],
         ).await?;
         if inserted == 1 {
+            self.push_wakeup.notify_one();
             let event_id = format!("deliver:{message_id}");
             let next_attempt = now_seconds();
             let _ = conn.execute(
@@ -686,7 +692,7 @@ mod tests {
     async fn test_password_verification_and_login_security() {
         let temp_db_path = format!("target/test_auth_{}.db", Uuid::new_v4().simple());
         let db = Builder::new_local(&temp_db_path).build().await.unwrap();
-        let store = Store { db: Arc::new(db) };
+        let store = Store { db: Arc::new(db), push_wakeup: Arc::new(tokio::sync::Notify::new()) };
         store.migrate().await.unwrap();
 
         let username = "secure_alice";
@@ -763,7 +769,7 @@ mod tests {
         {
             let dead_db = Builder::new_local("target/non_existent_dir_12345/unreachable.db").build().await;
             if let Ok(db) = dead_db {
-                let dead_store = Store { db: Arc::new(db) };
+                let dead_store = Store { db: Arc::new(db), push_wakeup: Arc::new(tokio::sync::Notify::new()) };
                 let res_g = dead_store.login("alice", "anyPassword123!").await;
                 assert!(res_g.is_err(), "Test G failed: Database failure must reject login");
             }
@@ -776,7 +782,7 @@ mod tests {
     async fn duplicate_message_prevention_test() {
         let temp_db_path = format!("target/test_dup_{}.db", Uuid::new_v4().simple());
         let db = Builder::new_local(&temp_db_path).build().await.unwrap();
-        let store = Store { db: Arc::new(db) };
+        let store = Store { db: Arc::new(db), push_wakeup: Arc::new(tokio::sync::Notify::new()) };
         store.migrate().await.unwrap();
 
         let (u1, _) = store.register("alice_dup", "Alice", "password123").await.unwrap();
@@ -813,7 +819,7 @@ mod tests {
     async fn atomic_message_pipeline_and_receipts() {
         let path = format!("target/test_pipeline_{}.db", Uuid::new_v4().simple());
         let db = Builder::new_local(&path).build().await.unwrap();
-        let store = Store { db: Arc::new(db) };
+        let store = Store { db: Arc::new(db), push_wakeup: Arc::new(tokio::sync::Notify::new()) };
         store.migrate().await.unwrap();
         let conn = store.connection().await.unwrap();
         conn.execute_batch("INSERT INTO users(uid,username,display_name,password_hash) VALUES ('a','alice','Alice','test'),('b','bob','Bob','test'),('c','carol','Carol','test'); INSERT INTO conversations(conversation_id,pair_key,created_by) VALUES ('cv_atomic','a:b','a'); INSERT INTO conversation_members(conversation_id,uid) VALUES ('cv_atomic','a'),('cv_atomic','b');").await.unwrap();

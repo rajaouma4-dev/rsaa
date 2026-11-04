@@ -715,6 +715,7 @@ async fn handle_ws_client(
             "build_revision": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "local".to_owned()),
             "push_configured": (["FIREBASE_SERVICE_ACCOUNT_JSON", "FIREBASE_SERVICE_ACCOUNT_FILE"].iter()
                 .any(|key| env::var(key).is_ok_and(|value| !value.trim().is_empty()))),
+            "push": push::health(),
         }).to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

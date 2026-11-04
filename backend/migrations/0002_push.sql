@@ -18,6 +18,14 @@ CREATE TABLE IF NOT EXISTS push_jobs (
     PRIMARY KEY(message_id,installation_id)
 );
 CREATE INDEX IF NOT EXISTS idx_push_jobs_due ON push_jobs(finished,next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_push_jobs_device_pending ON push_jobs(installation_id,recipient_uid,finished);
+CREATE TABLE IF NOT EXISTS push_dispatch_leases (
+    installation_id TEXT NOT NULL REFERENCES push_devices(installation_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY(installation_id,conversation_id)
+);
 CREATE TRIGGER IF NOT EXISTS messages_enqueue_push AFTER INSERT ON messages BEGIN
     INSERT OR IGNORE INTO push_jobs(message_id,installation_id,recipient_uid,next_attempt_at)
         SELECT NEW.message_id,installation_id,NEW.recipient_uid,CAST(strftime('%s','now') AS INTEGER)
