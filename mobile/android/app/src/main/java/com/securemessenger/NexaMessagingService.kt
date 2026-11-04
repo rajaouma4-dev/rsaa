@@ -9,6 +9,7 @@ class NexaMessagingService : FirebaseMessagingService() {
         val data = message.data
         if (data["type"] != "new_message") return
         NexaNotifications.message(this, data["recipient_uid"] ?: return,
-            data["conversation_id"] ?: return, data["message_id"] ?: return)
+            data["conversation_id"] ?: return, data["message_id"] ?: return,
+            data["sender_name"] ?: "Nexa Chat", null, data["unread_count"]?.toIntOrNull() ?: 1)
     }
 }

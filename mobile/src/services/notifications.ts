@@ -11,9 +11,10 @@ export async function notificationStatus(): Promise<Registration | null> {
 }
 export function notificationSettings() { native?.openSettings(); }
 export async function clearNotificationAccount() { await native?.setAccount(null); }
-export function recordIncomingNotification(uid: string, conversation: string, message: string) {
+export function recordIncomingNotification(uid: string, conversation: string, message: string,
+  sender?: {name: string; avatar?: string | null; unread: number}) {
   // This also records foreground deliveries to suppress a delayed push duplicate.
-  native?.showMessage(uid, conversation, message);
+  native?.showMessage(uid, conversation, message, sender?.name || 'Nexa Chat', sender?.avatar || null, sender?.unread || 1);
 }
 
 async function requestPermissionOnce() {

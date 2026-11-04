@@ -26,7 +26,8 @@ pub struct PushSender {
     access: Mutex<(String, i64)>,
 }
 #[derive(Clone)]
-struct Job { message_id: String, installation_id: String, uid: String, conversation_id: String, token: String }
+struct Job { message_id: String, installation_id: String, uid: String, conversation_id: String, token: String,
+    sender_name: String, unread_count: i64, unread_senders: i64, avatar_version: Option<String> }
 enum Outcome { Sent, InvalidToken, Retry(i64) }
 
 impl PushSender {
@@ -77,16 +78,37 @@ impl PushSender {
 fn payload(job: &Job) -> serde_json::Value {
     // Notification + data lets Android/Play services display while the process
     // is absent. Foreground delivery still goes through our native service.
-    // Keep the alert generic; plaintext and sender details stay encrypted.
-    json!({"message":{"token":job.token,"data":{"type":"new_message","message_id":job.message_id,
+    // Only identity metadata and unread counts leave the server. Never include
+    // message plaintext, media, ciphertext or encryption keys in notifications.
+    let count=job.unread_count.clamp(1,9999);
+    let title=job.sender_name.chars().filter(|c| !c.is_control()).take(80).collect::<String>();
+    let title=if title.trim().is_empty() { "Nexa Chat".to_owned() } else {title};
+    let mut body=if count==1 {"1 new message".to_owned()} else {format!("{count} new messages")};
+    let people=job.unread_senders.clamp(1,9999);
+    if people>1 {body.push_str(&format!(" · {people} people messaging you"));}
+    let mut result=json!({"message":{"token":job.token,"data":{"type":"new_message","message_id":job.message_id,
         "recipient_uid":job.uid,"conversation_id":job.conversation_id,
+        "sender_name":title,"unread_count":count.to_string(),"unread_senders":people.to_string(),
         "notification_uid":job.uid,"notification_conversation":job.conversation_id},
-        "notification":{"title":"Nexa Chat","body":"You have a new private message"},
-        "android":{"priority":"high","ttl":"604800s","collapse_key":"nexa-unread",
+        "notification":{"title":title,"body":body},
+        "android":{"priority":"high","ttl":"604800s","collapse_key":job.conversation_id,
             "notification":{"channel_id":"nexa_messages_v1","icon":"ic_message_notification",
                 "color":"#B69EFF","tag":format!("nexa:{}",job.conversation_id),
+                "notification_count":count,"notification_priority":"PRIORITY_HIGH",
                 "default_sound":true,"default_vibrate_timings":true,"visibility":"PRIVATE",
-                "proxy":"ALLOW"}}}})
+                "proxy":"ALLOW"}}}});
+    let base=env::var("PUBLIC_BASE_URL").or_else(|_|env::var("RENDER_EXTERNAL_URL")).unwrap_or_default();
+    if let Some(version)=job.avatar_version.as_deref().filter(|v|valid_avatar_version(v)) {
+        if base.starts_with("https://") && !base.contains(['?', '#']) {
+            let url=format!("{}/notification-avatar/{version}.jpg",base.trim_end_matches('/'));
+            result["message"]["android"]["notification"]["image"]=json!(url);
+        }
+    }
+    result
+}
+
+pub fn valid_avatar_version(value: &str) -> bool {
+    value.len()==64 && value.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 impl Store {
@@ -126,9 +148,9 @@ impl Store {
     }
 
     async fn due_push(&self) -> Result<Vec<Job>> {
-        let mut rows = self.connection().await?.query("SELECT j.message_id,j.installation_id,j.recipient_uid,m.conversation_id,d.token FROM push_jobs j JOIN messages m ON m.message_id=j.message_id JOIN push_devices d ON d.installation_id=j.installation_id AND d.uid=j.recipient_uid JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid LEFT JOIN user_settings settings ON settings.uid=d.uid WHERE j.finished=0 AND j.next_attempt_at<=?1 AND d.foreground_until<=?1 AND d.enabled=1 AND s.expires_at>?1 AND m.status<>'SEEN' AND m.saved_at>=datetime('now','-7 days') AND COALESCE(settings.notifications_enabled,1)=1 ORDER BY j.next_attempt_at LIMIT 32",[now()]).await?;
+        let mut rows = self.connection().await?.query("SELECT j.message_id,j.installation_id,j.recipient_uid,m.conversation_id,d.token,u.display_name,(SELECT COUNT(*) FROM messages unread WHERE unread.recipient_uid=j.recipient_uid AND unread.conversation_id=m.conversation_id AND unread.status<>'SEEN'),CASE WHEN a.data_uri<>'' THEN a.version ELSE NULL END,(SELECT COUNT(DISTINCT sender_uid) FROM messages unread WHERE unread.recipient_uid=j.recipient_uid AND unread.status<>'SEEN') FROM push_jobs j JOIN messages m ON m.message_id=j.message_id JOIN users u ON u.uid=m.sender_uid LEFT JOIN profile_avatars a ON a.uid=u.uid JOIN push_devices d ON d.installation_id=j.installation_id AND d.uid=j.recipient_uid JOIN device_sessions s ON s.token_hash=d.session_hash AND s.uid=d.uid LEFT JOIN user_settings settings ON settings.uid=d.uid WHERE j.finished=0 AND j.next_attempt_at<=?1 AND d.foreground_until<=?1 AND d.enabled=1 AND s.expires_at>?1 AND m.status<>'SEEN' AND m.saved_at>=datetime('now','-7 days') AND COALESCE(settings.notifications_enabled,1)=1 ORDER BY j.next_attempt_at,j.message_id LIMIT 32",[now()]).await?;
         let mut jobs=Vec::new();
-        while let Some(r)=rows.next().await? { jobs.push(Job {message_id:r.get(0)?,installation_id:r.get(1)?,uid:r.get(2)?,conversation_id:r.get(3)?,token:r.get(4)?}); }
+        while let Some(r)=rows.next().await? { jobs.push(Job {message_id:r.get(0)?,installation_id:r.get(1)?,uid:r.get(2)?,conversation_id:r.get(3)?,token:r.get(4)?,sender_name:r.get(5)?,unread_count:r.get(6)?,avatar_version:r.get(7)?,unread_senders:r.get(8)?}); }
         Ok(jobs)
     }
     async fn claim_push(&self, job: &Job) -> Result<bool> {
@@ -162,14 +184,20 @@ pub async fn run_worker(store: Store, sender: Arc<PushSender>) {
         passes += 1;
         if passes >= 1200 { let _ = store.clean_push().await; passes = 0; }
         let jobs=match store.due_push().await {Ok(j)=>j,Err(_)=>{tracing::warn!("push queue query failed; will retry");continue}};
-        stream::iter(jobs).for_each_concurrent(8, |job| {
+        // One send per installation/conversation in each pass: two messages
+        // cannot race their counts or overwrite another sender's notification.
+        let mut groups=std::collections::BTreeMap::<_,Vec<Job>>::new();
+        for job in jobs { groups.entry((job.installation_id.clone(),job.uid.clone(),job.conversation_id.clone(),job.token.clone())).or_default().push(job); }
+        stream::iter(groups.into_values()).for_each_concurrent(8, |jobs| {
             let store=store.clone(); let sender=sender.clone();
             async move {
-                if !matches!(store.claim_push(&job).await,Ok(true)){return}
-                match sender.send(&job).await {
-                    Ok(Outcome::Sent)=>{let _=store.finish_push(&job,false).await;},
-                    Ok(Outcome::InvalidToken)=>{let _=store.finish_push(&job,true).await;},
-                    Ok(Outcome::Retry(delay))=>{let _=store.defer_push(&job,delay).await;},
+                let mut claimed=Vec::new();
+                for job in jobs { if matches!(store.claim_push(&job).await,Ok(true)) {claimed.push(job);} }
+                let Some(job)=claimed.last() else {return};
+                match sender.send(job).await {
+                    Ok(Outcome::Sent)=>{for job in &claimed {let _=store.finish_push(job,false).await;}},
+                    Ok(Outcome::InvalidToken)=>{for job in &claimed {let _=store.finish_push(job,true).await;}},
+                    Ok(Outcome::Retry(delay))=>{for job in &claimed {let _=store.defer_push(job,delay).await;}},
                     _=>tracing::warn!("FCM send failed; durable notification will retry"),
                 }
             }
@@ -182,9 +210,17 @@ mod tests {
     use super::*;
     #[test]
     fn push_displays_without_app_process_and_keeps_content_private() {
-        let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into()};
+        let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into(),sender_name:"Alice".into(),unread_count:2,unread_senders:1,avatar_version:None};
         let data=payload(&job);
-        assert_eq!(data["message"]["notification"]["body"],"You have a new private message");
+        assert_eq!(data["message"]["notification"]["title"],"Alice");
+        assert_eq!(data["message"]["notification"]["body"],"2 new messages");
+        assert_eq!(data["message"]["android"]["collapse_key"],"cv");
+        assert_eq!(data["message"]["android"]["notification"]["notification_count"],2);
+        let mut other=job.clone();other.conversation_id="other".into();other.sender_name="Bob".into();other.unread_count=1;
+        assert_eq!(payload(&other)["message"]["notification"]["body"],"1 new message");
+        assert_ne!(payload(&other)["message"]["android"]["notification"]["tag"],data["message"]["android"]["notification"]["tag"]);
+        other.unread_senders=2;
+        assert_eq!(payload(&other)["message"]["notification"]["body"],"1 new message · 2 people messaging you");
         assert_eq!(data["message"]["android"]["notification"]["channel_id"],"nexa_messages_v1");
         assert_eq!(data["message"]["android"]["notification"]["tag"],"nexa:cv");
         assert_eq!(data["message"]["android"]["notification"]["visibility"],"PRIVATE");
@@ -197,6 +233,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sender_counts_are_separate_and_seen_messages_are_excluded() {
+        let path=format!("target/sender_counts_{}.db",uuid::Uuid::new_v4());
+        let store=Store::load_test_store(&path,&["alice".into(),"bob".into(),"carol".into()]).await.unwrap();
+        let conn=store.connection().await.unwrap();
+        conn.execute_batch("INSERT INTO conversations(conversation_id,pair_key,created_by) VALUES('ab','alice:bob','alice'),('cb','bob:carol','carol'); INSERT INTO conversation_members(conversation_id,uid) VALUES('ab','alice'),('ab','bob'),('cb','carol'),('cb','bob');").await.unwrap();
+        let session="bob-session-abcdefghijklmnopqrstuvwxyz123456";
+        conn.execute("INSERT INTO device_sessions(token_hash,uid,expires_at) VALUES(?1,'bob',?2)",libsql::params![hash(session),now()+3600]).await.unwrap();
+        store.register_push("bob",session,"counts-installation-001","counts-token-at-least-20-characters",true,false).await.unwrap();
+        for (id,conversation,sender) in [("count_a1","ab","alice"),("count_a2","ab","alice"),("count_c1","cb","carol")] {
+            store.save_ciphertext(id,conversation,sender,&[0x33,1,2],Some(1)).await.unwrap();
+        }
+        // Lost-ACK retries must not inflate unread counts.
+        store.save_ciphertext("count_a1","ab","alice",&[0x33,1,2],Some(1)).await.unwrap();
+        let jobs=store.due_push().await.unwrap();assert_eq!(jobs.len(),3);
+        assert!(jobs.iter().all(|j|j.unread_senders==2));
+        assert!(jobs.iter().filter(|j|j.conversation_id=="ab").all(|j|j.sender_name=="alice" && j.unread_count==2));
+        assert!(jobs.iter().filter(|j|j.conversation_id=="cb").all(|j|j.sender_name=="carol" && j.unread_count==1));
+        store.mark_seen("count_a1","bob").await.unwrap();
+        let jobs=store.due_push().await.unwrap();assert_eq!(jobs.len(),2);
+        assert_eq!(jobs.iter().find(|j|j.conversation_id=="ab").unwrap().unread_count,1);
+        drop(conn);drop(store);let _=std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     #[ignore = "Requires an explicit Firebase credential and a private test-device registration fixture; sends one real push"]
     async fn firebase_real_device_transport() {
         let path=env::var("NEXA_FCM_SMOKE_FIXTURE").expect("explicit test-device fixture path required");
@@ -205,7 +265,11 @@ mod tests {
         let uid=fixture["uid"].as_str().filter(|v|!v.is_empty()).expect("test device has no signed-in account");
         let job=Job {message_id:env::var("NEXA_FCM_SMOKE_ID").expect("explicit smoke message ID required"),
             installation_id:fixture["installation_id"].as_str().unwrap().into(), uid:uid.into(), token:token.into(),
-            conversation_id:env::var("NEXA_FCM_SMOKE_CONVERSATION").unwrap_or_else(|_|"notification-transport-test".into())};
+            conversation_id:env::var("NEXA_FCM_SMOKE_CONVERSATION").unwrap_or_else(|_|"notification-transport-test".into()),
+            sender_name:env::var("NEXA_FCM_SMOKE_SENDER").unwrap_or_else(|_|"Notification test".into()),
+            unread_count:env::var("NEXA_FCM_SMOKE_COUNT").ok().and_then(|v|v.parse().ok()).unwrap_or(1),
+            unread_senders:env::var("NEXA_FCM_SMOKE_PEOPLE").ok().and_then(|v|v.parse().ok()).unwrap_or(1),
+            avatar_version:env::var("NEXA_FCM_SMOKE_AVATAR").ok()};
         let sender=PushSender::from_env().unwrap().expect("Firebase credentials required");
         assert!(matches!(sender.send(&job).await.unwrap(),Outcome::Sent),"FCM did not accept the test push");
     }

@@ -80,6 +80,17 @@ impl Store {
         } else { Ok((String::new(), None)) }
     }
 
+    /// Unlisted content-addressed JPEG for system notification image fetches.
+    /// A 256-bit content hash reveals no user ID and cannot enumerate profiles.
+    pub async fn notification_avatar(&self, version: &str) -> Result<Option<Vec<u8>>> {
+        if !crate::push::valid_avatar_version(version) { return Ok(None); }
+        let mut rows=self.connection().await?.query("SELECT data_uri FROM profile_avatars WHERE version=?1 AND data_uri<>'' LIMIT 1",[version]).await?;
+        let Some(row)=rows.next().await? else {return Ok(None)};
+        let uri:String=row.get(0)?;
+        let Some(encoded)=uri.strip_prefix("data:image/jpeg;base64,") else {return Ok(None)};
+        let bytes=STANDARD.decode(encoded)?;validate_avatar(&bytes)?;Ok(Some(bytes))
+    }
+
     pub async fn chat_themes(&self, id: Option<&str>) -> Result<serde_json::Value> {
         let conn = self.connection().await?;
         if let Some(id) = id {
@@ -169,6 +180,8 @@ impl Store {
         conn.execute("CREATE TRIGGER IF NOT EXISTS messages_enqueue_delivery AFTER INSERT ON messages BEGIN INSERT INTO outbox (event_id, message_id, recipient_uid, next_attempt_at) VALUES ('deliver:' || NEW.message_id, NEW.message_id, NEW.recipient_uid, CAST(strftime('%s', 'now') AS INTEGER)); END", ()).await?;
         conn.execute("CREATE TRIGGER IF NOT EXISTS messages_finish_delivery AFTER UPDATE OF status ON messages WHEN NEW.status IN ('DELIVERED', 'SEEN') BEGIN UPDATE outbox SET delivered_at = COALESCE(delivered_at, CURRENT_TIMESTAMP) WHERE message_id = NEW.message_id AND recipient_uid = NEW.recipient_uid; END", ()).await?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender_saved ON messages(sender_uid, saved_at)", ()).await?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_notification_unread ON messages(recipient_uid, conversation_id, status)", ()).await?;
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_avatar_version ON profile_avatars(version)", ()).await?;
         Ok(())
     }
 
@@ -596,6 +609,9 @@ mod tests {
         let bytes=include_bytes!("../testdata/avatar.jpg");
         let uri=format!("data:image/jpeg;base64,{}",base64::Engine::encode(&base64::engine::general_purpose::STANDARD,bytes));
         let version=store.set_avatar("avatar-a",Some(&uri)).await.unwrap();
+        assert_eq!(store.notification_avatar(&version).await.unwrap(),Some(bytes.to_vec()));
+        assert!(store.notification_avatar("avatar-a").await.unwrap().is_none());
+        assert!(store.notification_avatar(&"0".repeat(64)).await.unwrap().is_none());
         assert_eq!(store.get_avatar("avatar-a",None).await.unwrap(),(version.clone(),Some(uri.clone())));
         assert_eq!(store.get_avatar("avatar-a",Some(&version)).await.unwrap(),(version.clone(),None));
         assert_eq!(store.set_avatar("avatar-a",Some(&uri)).await.unwrap(),version);
@@ -606,6 +622,7 @@ mod tests {
         for p in 0..large.len()-8 {if large[p]==255 && large[p+1]==192 {large[p+5]=2;large[p+6]=0;break;}}
         assert!(super::validate_avatar(&large).is_err());
         store.set_avatar("avatar-a",None).await.unwrap();
+        assert!(store.notification_avatar(&version).await.unwrap().is_none());
         assert!(store.get_avatar("avatar-a",Some(&version)).await.unwrap().1.is_none());
         drop(store);let _=std::fs::remove_file(path);
     }

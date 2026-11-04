@@ -51,7 +51,9 @@ class NexaNotificationsModule(private val context: ReactApplicationContext) : Re
             putBoolean("configured", configured); putBoolean("googleServices", services); putBoolean("enabled",allowed)
         })
     }
-    @ReactMethod fun showMessage(uid: String, conversation: String, message: String) { NexaNotifications.message(context,uid,conversation,message) }
+    @ReactMethod fun showMessage(uid: String, conversation: String, message: String, sender: String, avatar: String?, count: Double) {
+        NexaNotifications.message(context,uid,conversation,message,sender,avatar,count.toInt())
+    }
     @ReactMethod fun consumeOpen(uid: String, promise: Promise) { promise.resolve(NexaNotifications.consumeOpen(context,uid)) }
     @ReactMethod fun openSettings() {
         if (android.os.Build.VERSION.SDK_INT < 26) {

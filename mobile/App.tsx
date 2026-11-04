@@ -25,7 +25,7 @@ import {
 import {C, S} from './src/theme';
 import {getMessageTimestamp} from './src/utils/time';
 import {CallModal} from './src/components/CallModal';
-import {configureAvatars,refreshVisibleAvatars,avatarChanged,installAvatar} from './src/services/avatars';
+import {configureAvatars,refreshVisibleAvatars,avatarChanged,installAvatar,avatarUri} from './src/services/avatars';
 import {callService, CallState} from './src/services/callService';
 
 async function publishPrekeys(signal: TlsSignalingClient) {
@@ -365,11 +365,14 @@ export default function App() {
         const incoming = envelope.message;
         const notificationUid = notificationUidRef.current;
         const handleIncoming = async () => {
+          const notificationChat = chatsRef.current.find(chat => chat.id === incoming.conversation_id);
+          const notificationSender = {name: notificationChat?.user.name || 'Nexa Chat',
+            avatar: avatarUri(incoming.sender_uid), unread: (notificationChat?.unread || 0) + 1};
           const isCurrentChat = selectedRef.current?.id === incoming.conversation_id && AppState.currentState === 'active' && callService.getState().status === 'idle';
           // A retry after a lost ACK must not decrypt the same ratchet message twice.
           const known = (await getLocalMessages(incoming.conversation_id)).find(m => m.id === incoming.message_id);
           if (known) {
-            if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id);
+            if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id, notificationSender);
             try { rtcRef.current?.sendControlFrame({type: 'delivered_ack', message_id: incoming.message_id}); } catch {}
             return;
           }
@@ -423,7 +426,7 @@ export default function App() {
           };
 
           await appendLocalMessage(incoming.conversation_id, incomingMsg);
-          if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id);
+          if (notificationUid) recordIncomingNotification(notificationUid, incoming.conversation_id, incoming.message_id, notificationSender);
           // Acknowledge only after the local message write succeeds.
           try {
             if (rtcRef.current?.isOpen) {

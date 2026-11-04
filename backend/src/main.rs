@@ -677,6 +677,14 @@ async fn handle_ws_client(
 
     // If Render port scanner, health check probe, or web browser sends a plain HTTP request
     if !is_ws_upgrade {
+        let path=req_str.lines().next().and_then(|line|line.strip_prefix("GET ")).and_then(|line|line.split_whitespace().next()).unwrap_or("");
+        if let Some(version)=path.strip_prefix("/notification-avatar/").and_then(|v|v.strip_suffix(".jpg")) {
+            let image=store.notification_avatar(version).await.ok().flatten();
+            let status=if image.is_some() {"200 OK"} else {"404 Not Found"};
+            let image=image.unwrap_or_default();
+            let headers=format!("HTTP/1.1 {status}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nCache-Control: private, max-age=300\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",image.len());
+            stream.write_all(headers.as_bytes()).await?;stream.write_all(&image).await?;stream.flush().await?;return Ok(());
+        }
         let body = serde_json::json!({
             "status": "ok", "service": "nexa-messenger-server",
             "ice_urls": {
