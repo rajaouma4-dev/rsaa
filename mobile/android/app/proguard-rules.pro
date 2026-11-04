@@ -13,3 +13,13 @@
 -keep class com.facebook.react.** { *; }
 -keep class com.facebook.jni.** { *; }
 -keepattributes *Annotation*
+# The separately signed release instrumentation APK uses these public APIs to
+# verify/repair a test device's registration. Keep its release ABI stable.
+-keep,includedescriptorclasses class com.google.firebase.messaging.FirebaseMessaging {
+    public static com.google.firebase.messaging.FirebaseMessaging getInstance();
+    public com.google.android.gms.tasks.Task deleteToken();
+    public com.google.android.gms.tasks.Task getToken();
+}
+-keep,includedescriptorclasses class com.google.android.gms.tasks.Tasks {
+    public static *** await(...);
+}

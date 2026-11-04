@@ -14,6 +14,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import org.json.JSONArray
 import java.util.UUID
+import com.google.firebase.FirebaseApp
+import com.google.firebase.messaging.FirebaseMessaging
 
 /** Native so an FCM wakeup can display without a running React Native engine. */
 object NexaNotifications {
@@ -27,6 +29,11 @@ object NexaNotifications {
 
     fun initialize(application: Application) {
         createChannel(application)
+        // Let Play services display an alert without starting our process on
+        // Android 10+. Explicitly enable it for existing installs as well.
+        if (Build.VERSION.SDK_INT >= 29 && FirebaseApp.getApps(application).isNotEmpty()) {
+            runCatching { FirebaseMessaging.getInstance().setNotificationDelegationEnabled(true) }
+        }
         application.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
             private var started = 0
             override fun onActivityStarted(activity: Activity) {

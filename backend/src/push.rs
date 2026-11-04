@@ -75,9 +75,18 @@ impl PushSender {
 }
 
 fn payload(job: &Job) -> serde_json::Value {
+    // Notification + data lets Android/Play services display while the process
+    // is absent. Foreground delivery still goes through our native service.
+    // Keep the alert generic; plaintext and sender details stay encrypted.
     json!({"message":{"token":job.token,"data":{"type":"new_message","message_id":job.message_id,
-        "recipient_uid":job.uid,"conversation_id":job.conversation_id},
-        "android":{"priority":"high","ttl":"604800s","collapse_key":"nexa-unread"}}})
+        "recipient_uid":job.uid,"conversation_id":job.conversation_id,
+        "notification_uid":job.uid,"notification_conversation":job.conversation_id},
+        "notification":{"title":"Nexa Chat","body":"You have a new private message"},
+        "android":{"priority":"high","ttl":"604800s","collapse_key":"nexa-unread",
+            "notification":{"channel_id":"nexa_messages_v1","icon":"ic_message_notification",
+                "color":"#B69EFF","tag":format!("nexa:{}",job.conversation_id),
+                "default_sound":true,"default_vibrate_timings":true,"visibility":"PRIVATE",
+                "proxy":"ALLOW"}}}})
 }
 
 impl Store {
@@ -172,10 +181,16 @@ pub async fn run_worker(store: Store, sender: Arc<PushSender>) {
 mod tests {
     use super::*;
     #[test]
-    fn push_is_data_only_and_expires_after_a_week() {
+    fn push_displays_without_app_process_and_keeps_content_private() {
         let job=Job{message_id:"m_test".into(),installation_id:"i_test".into(),uid:"b".into(),conversation_id:"cv".into(),token:"token".into()};
         let data=payload(&job);
-        assert!(data["message"].get("notification").is_none());
+        assert_eq!(data["message"]["notification"]["body"],"You have a new private message");
+        assert_eq!(data["message"]["android"]["notification"]["channel_id"],"nexa_messages_v1");
+        assert_eq!(data["message"]["android"]["notification"]["tag"],"nexa:cv");
+        assert_eq!(data["message"]["android"]["notification"]["visibility"],"PRIVATE");
+        assert_eq!(data["message"]["android"]["notification"]["proxy"],"ALLOW");
+        assert_eq!(data["message"]["data"]["notification_uid"],"b");
+        assert_eq!(data["message"]["data"]["notification_conversation"],"cv");
         assert_eq!(data["message"]["android"]["ttl"],"604800s");
         assert_eq!(data["message"]["data"]["recipient_uid"],"b");
         assert!(!data.to_string().contains("ciphertext"));
