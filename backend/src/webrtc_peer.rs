@@ -27,12 +27,6 @@ pub type LiveSignaling = Arc<tokio::sync::RwLock<HashMap<String, mpsc::Sender<Se
 static MEDIA_IN_FLIGHT: LazyLock<tokio::sync::Mutex<HashSet<String>>> = LazyLock::new(|| tokio::sync::Mutex::new(HashSet::new()));
 static MEDIA_SEND_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
-static MESSAGE_SENDERS: LazyLock<tokio::sync::Mutex<HashMap<String, String>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::with_capacity(8192)));
-
-static CONVERSATION_RECIPIENTS: LazyLock<tokio::sync::RwLock<HashMap<(String, String), String>>> =
-    LazyLock::new(|| tokio::sync::RwLock::new(HashMap::with_capacity(8192)));
-
 #[derive(Clone)]
 pub struct ServerPeerHandler {
     pub uid: String,
@@ -292,9 +286,9 @@ pub async fn handle_client_frame(
             // the client's recipient hint or acknowledge an in-memory-only message.
             let _ = frame_recipient_uid;
             match db.save_ciphertext(&message_id, &conversation_id, uid, &ciphertext, msg_type).await {
-                Ok((recipient_uid, _)) => {
+                Ok((recipient_uid, _, created_at, server_sequence)) => {
                     reply_to_sender(channel, signal_tx, &DataChannelServerFrame::SavedAck {
-                        message_id: message_id.clone(),
+                        message_id: message_id.clone(), created_at: created_at.clone(), server_sequence,
                     }).await;
                     // The committed outbox provides retries. Forward the already
                     // available envelope immediately instead of querying it back
@@ -302,7 +296,7 @@ pub async fn handle_client_frame(
                     let frame = DataChannelServerFrame::NewMessage { message: crate::protocol::MessageEnvelope {
                         message_id: message_id.clone(), conversation_id: conversation_id.clone(),
                         sender_uid: uid.to_owned(), ciphertext_b64: ciphertext_b64.clone(),
-                        msg_type, created_at: crate::db::now_epoch_string(), status: "SAVED".to_owned(),
+                        msg_type, created_at, server_sequence: Some(server_sequence), status: "SAVED".to_owned(),
                     }};
                     send_to_user(channels, live_signaling, &recipient_uid, &frame).await;
                 }
@@ -312,58 +306,29 @@ pub async fn handle_client_frame(
                 }
             }
         }
-        DataChannelClientFrame::SessionRepair { peer_uid } => {
-            let frame = DataChannelServerFrame::SessionRepair { from_uid: uid.to_string() };
-            send_to_user(channels, live_signaling, &peer_uid, &frame).await;
+        DataChannelClientFrame::SessionRepair { .. } => {
+            // Control traffic is not authenticated by a peer's Signal identity.
+            reply_error(channel, signal_tx, "UNSUPPORTED_OPERATION", "Remote ratchet reset is disabled").await;
         }
         DataChannelClientFrame::DeliveredAck { message_id } => {
-            let cached_sender = {
-                let cache = MESSAGE_SENDERS.lock().await;
-                cache.get(&message_id).cloned()
-            };
-            if let Some(sender_uid) = cached_sender {
-                let ack = DataChannelServerFrame::DeliveredAck { message_id: message_id.clone() };
-                send_to_user(channels, live_signaling, &sender_uid, &ack).await;
-                let db_clone = db.clone();
-                let r_uid = uid.to_string();
-                let m_id = message_id.clone();
-                tokio::spawn(async move {
-                    let _ = db_clone.mark_delivered(&m_id, &r_uid).await;
-                });
-            } else {
-                match db.mark_delivered(&message_id, uid).await {
-                    Ok(Some(sender_uid)) => {
-                        let ack = DataChannelServerFrame::DeliveredAck { message_id };
-                        send_to_user(channels, live_signaling, &sender_uid, &ack).await;
-                    }
-                    Ok(None) => {}
-                    Err(err) => tracing::warn!(error = %err, "failed to record delivered receipt"),
+            // Authorize the recipient and commit BEFORE forwarding a receipt.
+            match db.mark_delivered(&message_id, uid).await {
+                Ok(Some(sender_uid)) => {
+                    let ack = DataChannelServerFrame::DeliveredAck { message_id };
+                    send_to_user(channels, live_signaling, &sender_uid, &ack).await;
                 }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(error = %err, "failed to record delivered receipt"),
             }
         }
         DataChannelClientFrame::SeenAck { message_id } => {
-            let cached_sender = {
-                let cache = MESSAGE_SENDERS.lock().await;
-                cache.get(&message_id).cloned()
-            };
-            if let Some(sender_uid) = cached_sender {
-                let ack = DataChannelServerFrame::SeenAck { message_id: message_id.clone() };
-                send_to_user(channels, live_signaling, &sender_uid, &ack).await;
-                let db_clone = db.clone();
-                let r_uid = uid.to_string();
-                let m_id = message_id.clone();
-                tokio::spawn(async move {
-                    let _ = db_clone.mark_seen(&m_id, &r_uid).await;
-                });
-            } else {
-                match db.mark_seen(&message_id, uid).await {
-                    Ok(Some(sender_uid)) => {
-                        let ack = DataChannelServerFrame::SeenAck { message_id };
-                        send_to_user(channels, live_signaling, &sender_uid, &ack).await;
-                    }
-                    Ok(None) => {}
-                    Err(err) => tracing::warn!(error = %err, "failed to record seen receipt"),
+            match db.mark_seen(&message_id, uid).await {
+                Ok(Some(sender_uid)) => {
+                    let ack = DataChannelServerFrame::SeenAck { message_id };
+                    send_to_user(channels, live_signaling, &sender_uid, &ack).await;
                 }
+                Ok(None) => {}
+                Err(err) => tracing::warn!(error = %err, "failed to record seen receipt"),
             }
         }
         DataChannelClientFrame::Ping => {
@@ -694,6 +659,12 @@ mod tls_message_tests {
         a_rx.recv().await.unwrap();b_rx.recv().await.unwrap();
         assert_eq!(db.pending_deliveries("bob",10).await.unwrap().len(),1,"same ciphertext/id stays idempotent");
         assert!(db.pending_deliveries("other",10).await.unwrap().is_empty(),"recipient hint cannot redirect a message");
+        handle_client_frame(DataChannelClientFrame::DeliveredAck{message_id:"tls-message-001".into()},None,Some(&b_tx),&db,&channels,&signaling,"other").await;
+        handle_client_frame(DataChannelClientFrame::SeenAck{message_id:"tls-message-001".into()},None,Some(&b_tx),&db,&channels,&signaling,"alice").await;
+        assert!(a_rx.try_recv().is_err(), "non-recipient cannot forge receipts");
+        handle_client_frame(DataChannelClientFrame::SessionRepair{peer_uid:"bob".into()},None,Some(&a_tx),&db,&channels,&signaling,"other").await;
+        assert!(matches!(a_rx.recv().await.unwrap(),ServerFrame::DataFrame{payload} if payload["code"]=="UNSUPPORTED_OPERATION"));
+        assert!(b_rx.try_recv().is_err(), "remote client cannot reset a peer ratchet");
         handle_client_frame(DataChannelClientFrame::DeliveredAck{message_id:"tls-message-001".into()},None,Some(&b_tx),&db,&channels,&signaling,"bob").await;
         assert!(matches!(a_rx.recv().await.unwrap(),ServerFrame::DataFrame{payload} if payload["type"]=="delivered_ack"));
         handle_client_frame(frame("tls-message-002","SGVsbG8="),None,Some(&a_tx),&db,&channels,&signaling,"alice").await;
@@ -708,7 +679,7 @@ mod tls_message_tests {
         let channels:LiveChannels=Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let signaling:LiveSignaling=Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let(tx,mut rx)=mpsc::channel(2);signaling.write().await.insert("bob".into(),tx);
-        let frame=DataChannelServerFrame::NewMessage{message:crate::protocol::MessageEnvelope{message_id:"large-message".into(),conversation_id:"cv".into(),sender_uid:"alice".into(),ciphertext_b64:"a".repeat(100000),msg_type:Some(1),created_at:"0".into(),status:"SAVED".into()}};
+        let frame=DataChannelServerFrame::NewMessage{message:crate::protocol::MessageEnvelope{server_sequence:None,message_id:"large-message".into(),conversation_id:"cv".into(),sender_uid:"alice".into(),ciphertext_b64:"a".repeat(100000),msg_type:Some(1),created_at:"0".into(),status:"SAVED".into()}};
         send_to_user(&channels,&signaling,"bob",&frame).await;
         assert!(rx.try_recv().is_err(),"large media waits for bounded chunk transport instead of breaking TLS framing");
     }

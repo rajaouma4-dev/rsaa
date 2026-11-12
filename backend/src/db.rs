@@ -381,7 +381,7 @@ impl Store {
         let cursor = before.unwrap_or("");
         if !cursor.is_empty() { validate_message_id(cursor)?; }
         let mut rows = conn.query(
-            "SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status, msg_type FROM messages WHERE conversation_id = ?1 AND (?3 = '' OR EXISTS (SELECT 1 FROM messages cursor WHERE cursor.message_id = ?3 AND cursor.conversation_id = messages.conversation_id AND (CAST(messages.created_at AS INTEGER) < CAST(cursor.created_at AS INTEGER) OR (CAST(messages.created_at AS INTEGER) = CAST(cursor.created_at AS INTEGER) AND messages.message_id < cursor.message_id)))) ORDER BY CAST(created_at AS INTEGER) DESC, message_id DESC LIMIT ?2",
+            "SELECT message_id, conversation_id, sender_uid, ciphertext, created_at, status, msg_type, rowid FROM messages WHERE conversation_id = ?1 AND (?3 = '' OR EXISTS (SELECT 1 FROM messages cursor WHERE cursor.message_id = ?3 AND cursor.conversation_id = messages.conversation_id AND (CAST(messages.created_at AS INTEGER) < CAST(cursor.created_at AS INTEGER) OR (CAST(messages.created_at AS INTEGER) = CAST(cursor.created_at AS INTEGER) AND messages.rowid < cursor.rowid)))) ORDER BY CAST(created_at AS INTEGER) DESC, rowid DESC LIMIT ?2",
             libsql::params![conversation_id.to_owned(), limit.clamp(1, 100), cursor.to_owned()],
         ).await?;
         let mut messages = Vec::new();
@@ -390,7 +390,7 @@ impl Store {
             let mt: i64 = row.get(6).unwrap_or(0);
             messages.push(MessageEnvelope {
                 message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
-                ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None }, created_at: row.get(4)?, status: row.get(5)?,
+                ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None }, created_at: row.get(4)?, server_sequence: Some(row.get(7)?), status: row.get(5)?,
             });
         }
         messages.reverse();
@@ -398,35 +398,37 @@ impl Store {
     }
 
     /// Saves only opaque ciphertext, verifies membership, and atomically adds an outbox row.
-    pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8], msg_type: Option<u8>) -> Result<(String, bool)> {
+    pub async fn save_ciphertext(&self, message_id: &str, conversation_id: &str, sender_uid: &str, ciphertext: &[u8], msg_type: Option<u8>) -> Result<(String, bool, String, i64)> {
         validate_message_id(message_id)?;
         anyhow::ensure!(!ciphertext.is_empty() && ciphertext.len() <= 10 * 1024 * 1024, "invalid ciphertext size");
         let conn = self.connection().await?;
         // Atomic conditional insert: authorization, one-to-one membership, quota
         // and outbox creation execute inside SQLite, without remote read/write gaps.
         let mut rows = conn.query(
-            "INSERT INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status, msg_type) SELECT ?1, ?2, ?3, other.uid, ?4, ?5, 'SAVED', ?6 FROM conversation_members other WHERE other.conversation_id = ?2 AND other.uid <> ?3 AND EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = ?2 AND mine.uid = ?3) AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?2) = 2 AND (SELECT COUNT(*) FROM messages WHERE sender_uid = ?3 AND saved_at >= datetime('now', '-1 minute')) < 60 ON CONFLICT(message_id) DO NOTHING RETURNING recipient_uid",
+            "INSERT INTO messages (message_id, conversation_id, sender_uid, recipient_uid, ciphertext, created_at, status, msg_type) SELECT ?1, ?2, ?3, other.uid, ?4, ?5, 'SAVED', ?6 FROM conversation_members other WHERE other.conversation_id = ?2 AND other.uid <> ?3 AND EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = ?2 AND mine.uid = ?3) AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?2) = 2 AND (SELECT COUNT(*) FROM messages WHERE sender_uid = ?3 AND saved_at >= datetime('now', '-1 minute')) < 60 ON CONFLICT(message_id) DO NOTHING RETURNING recipient_uid, created_at, rowid",
             libsql::params![message_id.to_owned(), conversation_id.to_owned(), sender_uid.to_owned(), ciphertext.to_vec(), now_epoch_string(), msg_type.unwrap_or(0) as i64],
         ).await?;
         if let Some(row) = rows.next().await? {
             let recipient: String = row.get(0)?;
+            let created_at: String = row.get(1)?;
+            let sequence: i64 = row.get(2)?;
             anyhow::ensure!(rows.next().await?.is_none(), "ambiguous recipient");
             drop(rows);
             self.push_wakeup.notify_one();
-            return Ok((recipient, true));
+            return Ok((recipient, true, created_at, sequence));
         }
         drop(rows);
         // Lost-ACK retries are idempotent, but an ID cannot replace prior content,
         // message type, sender or conversation. Revalidate current membership.
         let mut existing = conn.query(
-            "SELECT m.recipient_uid, m.ciphertext, m.msg_type FROM messages m WHERE m.message_id = ?1 AND m.sender_uid = ?2 AND m.conversation_id = ?3 AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = ?3 AND uid = ?2)",
+            "SELECT m.recipient_uid, m.ciphertext, m.msg_type, m.created_at, m.rowid FROM messages m WHERE m.message_id = ?1 AND m.sender_uid = ?2 AND m.conversation_id = ?3 AND EXISTS (SELECT 1 FROM conversation_members WHERE conversation_id = ?3 AND uid = ?2)",
             libsql::params![message_id.to_owned(), sender_uid.to_owned(), conversation_id.to_owned()],
         ).await?;
         let row = existing.next().await?.ok_or_else(|| anyhow!("message rejected: membership, quota or conflicting message id"))?;
         let prior: Vec<u8> = row.get(1)?;
         let prior_type: i64 = row.get(2)?;
         anyhow::ensure!(prior == ciphertext && prior_type == msg_type.unwrap_or(0) as i64, "message_id was already used with different content");
-        Ok((row.get(0)?, false))
+        Ok((row.get(0)?, false, row.get(3)?, row.get(4)?))
     }
 
     /// Fast path: lookup recipient UID for a 1-on-1 conversation
@@ -483,7 +485,7 @@ impl Store {
     pub async fn pending_deliveries(&self, recipient_uid: &str, limit: i64) -> Result<Vec<PendingDelivery>> {
         let conn = self.connection().await?;
         let mut rows = conn.query(
-            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status, m.msg_type FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.rowid ASC LIMIT ?3",
+            "SELECT m.message_id, m.conversation_id, m.sender_uid, m.ciphertext, m.created_at, m.status, m.msg_type, m.rowid FROM outbox o JOIN messages m ON m.message_id = o.message_id WHERE o.recipient_uid = ?1 AND o.delivered_at IS NULL AND o.next_attempt_at <= ?2 ORDER BY o.rowid ASC LIMIT ?3",
             libsql::params![recipient_uid.to_owned(), now_seconds(), limit.clamp(1, 100)],
         ).await?;
         let mut items = Vec::new();
@@ -493,7 +495,7 @@ impl Store {
             items.push(PendingDelivery {
                 message: MessageEnvelope {
                     message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
-                    ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None }, created_at: row.get(4)?, status: row.get(5)?,
+                    ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None }, created_at: row.get(4)?, server_sequence: Some(row.get(7)?), status: row.get(5)?,
                 },
                 recipient_uid: recipient_uid.to_owned(),
             });
@@ -507,7 +509,7 @@ impl Store {
         anyhow::ensure!(recipients.len() <= 100, "online delivery batch too large");
         if recipients.is_empty() { return Ok(Vec::new()); }
         let placeholders = (0..recipients.len()).map(|i| format!("?{}", i + 2)).collect::<Vec<_>>().join(",");
-        let sql = format!("WITH due AS (SELECT o.message_id,o.recipient_uid,ROW_NUMBER() OVER (PARTITION BY o.recipient_uid ORDER BY o.next_attempt_at,o.rowid) AS position FROM outbox o WHERE o.delivered_at IS NULL AND o.next_attempt_at <= ?1 AND o.recipient_uid IN ({placeholders})) SELECT m.message_id,m.conversation_id,m.sender_uid,m.ciphertext,m.created_at,m.status,m.msg_type,d.recipient_uid FROM due d JOIN messages m ON m.message_id=d.message_id WHERE d.position <= 4");
+        let sql = format!("WITH due AS (SELECT o.message_id,o.recipient_uid,ROW_NUMBER() OVER (PARTITION BY o.recipient_uid ORDER BY o.next_attempt_at,o.rowid) AS position FROM outbox o WHERE o.delivered_at IS NULL AND o.next_attempt_at <= ?1 AND o.recipient_uid IN ({placeholders})) SELECT m.message_id,m.conversation_id,m.sender_uid,m.ciphertext,m.created_at,m.status,m.msg_type,d.recipient_uid,m.rowid FROM due d JOIN messages m ON m.message_id=d.message_id WHERE d.position <= 4");
         let mut params = vec![libsql::Value::Integer(now_seconds())];
         params.extend(recipients.iter().cloned().map(libsql::Value::Text));
         let conn = self.connection().await?;
@@ -520,7 +522,7 @@ impl Store {
                 message: MessageEnvelope {
                     message_id: row.get(0)?, conversation_id: row.get(1)?, sender_uid: row.get(2)?,
                     ciphertext_b64: STANDARD.encode(bytes), msg_type: if mt != 0 { Some(mt as u8) } else { None },
-                    created_at: row.get(4)?, status: row.get(5)?,
+                    created_at: row.get(4)?, server_sequence: Some(row.get(8)?), status: row.get(5)?,
                 }, recipient_uid: row.get(7)?,
             });
         }
@@ -616,6 +618,32 @@ pub fn now_epoch_string() -> String { format!("{}", now_seconds()) }
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn canonical_history_ignores_sender_clocks_and_keeps_same_second_insertion_order() {
+        let users = vec!["timeline-a".into(), "timeline-b".into()];
+        let store = Store::load_test_store(&format!("target/timeline-{}.db", uuid::Uuid::new_v4()), &users).await.unwrap();
+        store.create_or_get_conversation(&users[0], &users[1]).await.unwrap();
+        let conv = store.get_conversation_id(&users[0], &users[1]).await.unwrap();
+        let ids = ["m_1999999999999_a", "m_1000000000001_b", "m_1999999999998_c", "m_1000000000000_d"];
+        let mut sequences = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let (_, fresh, created, sequence) = store.save_ciphertext(id, &conv, &users[i % 2], &[0x33,1,2], Some(1)).await.unwrap();
+            assert!(fresh); assert!(created.parse::<i64>().unwrap() > 1_700_000_000);
+            sequences.push(sequence);
+        }
+        let conn=store.connection().await.unwrap();
+        conn.execute("UPDATE messages SET created_at = '1794247200' WHERE conversation_id = ?1", [conv.as_str()]).await.unwrap();
+        for uid in &users {
+            let history=store.history(uid,&conv,None,100).await.unwrap();
+            assert_eq!(history.iter().map(|m|m.message_id.as_str()).collect::<Vec<_>>(),ids);
+            assert_eq!(history.iter().map(|m|m.server_sequence.unwrap()).collect::<Vec<_>>(),sequences);
+            let older=store.history(uid,&conv,Some(ids[2]),100).await.unwrap();
+            assert_eq!(older.iter().map(|m|m.message_id.as_str()).collect::<Vec<_>>(),ids[..2]);
+        }
+        let (_,fresh,created,sequence)=store.save_ciphertext(ids[0],&conv,&users[0],&[0x33,1,2],Some(1)).await.unwrap();
+        assert!(!fresh);assert_eq!(created,"1794247200");assert_eq!(sequence,sequences[0]);
+    }
+
+    #[tokio::test]
     async fn avatar_roundtrip_version_cache_removal_and_bounds() {
         let path = format!("target/avatar-{}.db", uuid::Uuid::new_v4());
         let store = super::Store::load_test_store(&path, &["avatar-a".into(),"avatar-b".into()]).await.unwrap();
@@ -663,12 +691,12 @@ mod tests {
                 let ciphertext = vec![0x33, 0x11, 0x22, 0x33];
 
                 // First delivery attempt
-                let (rec1, is_new1) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext, None).await.expect("Save 1");
+                let (rec1, is_new1, _, _) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext, None).await.expect("Save 1");
                 assert_eq!(rec1, u2.uid);
                 assert!(is_new1, "Live Turso: First delivery attempt must be marked as new");
 
                 // Duplicate delivery attempt with identical payload
-                let (rec2, is_new2) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext, None).await.expect("Save 2");
+                let (rec2, is_new2, _, _) = store.save_ciphertext(&test_msg_id, &conv_id, &u1.uid, &ciphertext, None).await.expect("Save 2");
                 assert_eq!(rec2, u2.uid);
                 assert!(!is_new2, "Live Turso: Duplicate delivery attempt must NOT be marked as new");
 
@@ -793,11 +821,11 @@ mod tests {
         let msg_id = "msg_test_dup_001";
         let ciphertext = vec![0x33, 0x01, 0x02, 0x03];
 
-        let (recipient, is_new1) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
+        let (recipient, is_new1, _, _) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
         assert_eq!(recipient, u2.uid);
         assert!(is_new1, "First delivery attempt must be marked as new");
 
-        let (recipient2, is_new2) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
+        let (recipient2, is_new2, _, _) = store.save_ciphertext(msg_id, &conv_id, &u1.uid, &ciphertext, None).await.unwrap();
         assert_eq!(recipient2, u2.uid);
         assert!(!is_new2, "Duplicate delivery attempt must NOT be marked as new");
 

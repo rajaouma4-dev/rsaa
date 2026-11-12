@@ -81,6 +81,8 @@ pub struct MessageEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub msg_type: Option<u8>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_sequence: Option<i64>,
     pub status: String,
 }
 
@@ -114,7 +116,7 @@ pub enum DataChannelClientFrame {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataChannelServerFrame {
-    SavedAck { message_id: String },
+    SavedAck { message_id: String, created_at: String, server_sequence: i64 },
     NewMessage { message: MessageEnvelope },
     SessionRepair { from_uid: String },
     Chunk {

@@ -36,6 +36,21 @@ impl PeerConnectionEventHandler for Handler {
 }
 struct Client { pc: Arc<dyn PeerConnection>, server: Arc<dyn PeerConnection>, dc: Arc<dyn DataChannel>, frames: mpsc::UnboundedReceiver<Value> }
 
+async fn send_fixture(dc: &Arc<dyn DataChannel>, frame: &Value) -> Result<()> {
+    let text = frame.to_string();
+    anyhow::ensure!(text.is_ascii(), "fixture envelope must be ASCII");
+    if text.len() <= 12 * 1024 { dc.send_text(&text).await?; }
+    else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let parts: Vec<_> = text.as_bytes().chunks(12 * 1024).collect();
+        for (index, part) in parts.iter().enumerate() {
+            dc.send_text(&json!({"type":"chunk","transfer_id":id,"index":index,"total":parts.len(),
+                "data":std::str::from_utf8(part)?}).to_string()).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn connect(uid: String, store: Store, channels: webrtc_peer::LiveChannels, signals: webrtc_peer::LiveSignaling) -> Result<Client> {
     let (ice_tx, mut ice_rx) = mpsc::unbounded_channel();
     let pc: Arc<dyn PeerConnection> = Arc::new(PeerConnectionBuilder::new()
@@ -60,11 +75,27 @@ async fn connect(uid: String, store: Store, channels: webrtc_peer::LiveChannels,
     }});
     let (tx, rx) = mpsc::unbounded_channel();
     let polling = dc.clone();
-    tokio::spawn(async move { while let Some(event) = polling.poll().await {
+    tokio::spawn(async move {
+      let mut chunks: HashMap<String, (usize, HashMap<usize, String>)> = HashMap::new();
+      while let Some(event) = polling.poll().await {
         match event {
             DataChannelEvent::OnOpen => { let _ = tx.send(json!({"type":"open"})); },
             DataChannelEvent::OnMessage(message) => {
-                if let Ok(frame) = serde_json::from_slice::<Value>(&message.data) { let _ = tx.send(frame); }
+                if let Ok(frame) = serde_json::from_slice::<Value>(&message.data) {
+                    if frame["type"] == "chunk" {
+                        let id = frame["transfer_id"].as_str().unwrap().to_owned();
+                        let total = frame["total"].as_u64().unwrap() as usize;
+                        assert!(total > 0 && total <= 1024);
+                        let entry = chunks.entry(id.clone()).or_insert_with(|| (total, HashMap::new()));
+                        entry.1.insert(frame["index"].as_u64().unwrap() as usize, frame["data"].as_str().unwrap().to_owned());
+                        if entry.1.len() == total {
+                            let body = (0..total).map(|i| entry.1[&i].as_str()).collect::<String>();
+                            let assembled = serde_json::from_str(&body).unwrap();
+                            chunks.remove(&id);
+                            let _ = tx.send(assembled);
+                        }
+                    } else { let _ = tx.send(frame); }
+                }
             },
             DataChannelEvent::OnClose => break,
             _ => {},
@@ -113,12 +144,12 @@ async fn multi_user_datachannels() -> Result<()> {
         let sender = message["sender"].as_u64().context("sender index")? as usize;
         let mut envelope = message["envelope"].clone();
         envelope["conversation_id"] = json!(conversations[&users[sender]]);
-        clients[sender].dc.send_text(&envelope.to_string()).await?;
+        send_fixture(&clients[sender].dc, &envelope).await?;
     }
     // Retry the first envelope with the same ID; it must not create another row.
     let mut duplicate = outbound[0]["envelope"].clone();
     duplicate["conversation_id"] = json!(conversations[&users[0]]);
-    clients[0].dc.send_text(&duplicate.to_string()).await?;
+    send_fixture(&clients[0].dc, &duplicate).await?;
     let mut received = Vec::new();
     let mut saved = std::collections::HashSet::new();
     let mut unique = std::collections::HashSet::new();
@@ -153,7 +184,7 @@ async fn multi_user_datachannels() -> Result<()> {
     let mut offline = fixture["offline"]["envelope"].clone();
     let offline_id = offline["message_id"].as_str().unwrap().to_owned();
     offline["conversation_id"] = json!(conversations[&users[1]]);
-    clients[1].dc.send_text(&offline.to_string()).await?;
+    send_fixture(&clients[1].dc, &offline).await?;
     tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(frame) = clients[1].frames.recv().await {
             if frame["type"] == "saved_ack" && frame["message_id"] == offline_id {
