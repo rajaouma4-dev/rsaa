@@ -1,6 +1,7 @@
 mod proxy;
 mod push;
 mod calls;
+mod profiles;
 mod db;
 mod protocol;
 mod webrtc_peer;
@@ -716,6 +717,7 @@ async fn handle_ws_client(
                 "turn": ice_urls.iter().filter(|url| url.starts_with("turn:") || url.starts_with("turns:")).count()
             },
             "build_revision": env::var("RENDER_GIT_COMMIT").unwrap_or_else(|_| "local".to_owned()),
+            "profiles": {"version":1,"public_storage_key_configured":profiles::configured()},
             "push_configured": (["FIREBASE_SERVICE_ACCOUNT_JSON", "FIREBASE_SERVICE_ACCOUNT_FILE"].iter()
                 .any(|key| env::var(key).is_ok_and(|value| !value.trim().is_empty()))),
             "push": push::health(),

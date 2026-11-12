@@ -89,6 +89,7 @@ pub struct MessageEnvelope {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataChannelClientFrame {
+    Profile { request_id: String, action: String, body: serde_json::Value },
     SendMessage {
         message_id: String,
         conversation_id: String,
@@ -116,6 +117,10 @@ pub enum DataChannelClientFrame {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DataChannelServerFrame {
+    ProfileResult { request_id: String, result: serde_json::Value },
+    ProfileUpdate { event_id: String, from_uid: String, ciphertext_b64: String, msg_type: u8 },
+    ProfileChanged { uid: String, revision: i64 },
+    ProfileRequest { from_uid: String },
     SavedAck { message_id: String, created_at: String, server_sequence: i64 },
     NewMessage { message: MessageEnvelope },
     SessionRepair { from_uid: String },

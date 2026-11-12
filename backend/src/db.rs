@@ -58,6 +58,7 @@ impl Store {
     }
 
     pub async fn set_avatar(&self, uid: &str, data_uri: Option<&str>) -> Result<String> {
+        self.require_legacy_profile(uid).await?;
         let uri = data_uri.unwrap_or("");
         if !uri.is_empty() {
             let encoded = uri.strip_prefix("data:image/jpeg;base64,").ok_or_else(|| anyhow!("JPEG avatar required"))?;
@@ -66,8 +67,13 @@ impl Store {
             validate_avatar(&bytes)?;
         }
         let version = hex_digest(uri.as_bytes());
-        self.connection().await?.execute("INSERT INTO profile_avatars(uid,version,data_uri) VALUES(?1,?2,?3) ON CONFLICT(uid) DO UPDATE SET version=excluded.version,data_uri=excluded.data_uri", libsql::params![uid, version.clone(), uri]).await?;
+        let changed=self.connection().await?.execute("INSERT INTO profile_avatars(uid,version,data_uri) SELECT ?1,?2,?3 WHERE NOT EXISTS (SELECT 1 FROM secure_profiles WHERE uid=?1) ON CONFLICT(uid) DO UPDATE SET version=excluded.version,data_uri=excluded.data_uri", libsql::params![uid, version.clone(), uri]).await?;
+        anyhow::ensure!(changed==1,"Update the app to edit a secure profile");
         Ok(version)
+    }
+    async fn require_legacy_profile(&self, uid: &str) -> Result<()> {
+        let mut rows=self.connection().await?.query("SELECT 1 FROM secure_profiles WHERE uid=?1",[uid]).await?;
+        anyhow::ensure!(rows.next().await?.is_none(),"Update the app to edit a secure profile");Ok(())
     }
     pub async fn get_avatar(&self, uid: &str, version: Option<&str>) -> Result<(String, Option<String>)> {
         anyhow::ensure!(uid.len() <= 80, "invalid user");
@@ -109,6 +115,10 @@ impl Store {
         let _ = conn.execute("PRAGMA foreign_keys = ON", ()).await;
         let _ = conn.execute("PRAGMA busy_timeout = 10000", ()).await;
         let statements = [
+            "CREATE TABLE IF NOT EXISTS secure_profile_staging (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, revision INTEGER NOT NULL, ciphertext TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS secure_profiles (uid TEXT PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE, revision INTEGER NOT NULL, owner_ciphertext TEXT NOT NULL, public_ciphertext BLOB NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS secure_profile_events (event_id TEXT PRIMARY KEY NOT NULL, owner_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, recipient_uid TEXT NOT NULL REFERENCES users(uid) ON DELETE CASCADE, ciphertext BLOB NOT NULL, msg_type INTEGER NOT NULL, created_at INTEGER NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_secure_profile_recipient ON secure_profile_events(recipient_uid, created_at)",
             "CREATE TABLE IF NOT EXISTS profile_avatars (uid TEXT PRIMARY KEY REFERENCES users(uid) ON DELETE CASCADE, version TEXT NOT NULL, data_uri TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS chat_theme_assets (id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, data_uri TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)",
             "CREATE TABLE IF NOT EXISTS users (uid TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL COLLATE NOCASE UNIQUE, display_name TEXT NOT NULL, password_hash TEXT NOT NULL, about TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
@@ -289,13 +299,14 @@ impl Store {
     }
 
     pub async fn update_profile(&self, uid: &str, display_name: &str, about: &str) -> Result<UserSummary> {
+        self.require_legacy_profile(uid).await?;
         let display_name = display_name.trim();
         let about = about.trim();
         anyhow::ensure!((2..=60).contains(&display_name.chars().count()), "display name must be 2-60 characters");
         anyhow::ensure!(about.chars().count() <= 160, "about text must be at most 160 characters");
         let conn = self.connection().await?;
         let changed = conn.execute(
-            "UPDATE users SET display_name = ?1, about = ?2 WHERE uid = ?3",
+            "UPDATE users SET display_name = ?1, about = ?2 WHERE uid = ?3 AND NOT EXISTS (SELECT 1 FROM secure_profiles WHERE uid=?3)",
             libsql::params![display_name.to_owned(), about.to_owned(), uid.to_owned()],
         ).await?;
         anyhow::ensure!(changed == 1, "user not found");
@@ -435,7 +446,7 @@ impl Store {
     pub async fn get_conversation_recipient(&self, conversation_id: &str, sender_uid: &str) -> Result<String> {
         let conn = self.connection().await?;
         let mut rows = conn.query(
-            "SELECT uid FROM conversation_members WHERE conversation_id = ?1 AND uid <> ?2 LIMIT 1",
+            "SELECT other.uid FROM conversation_members other WHERE other.conversation_id = ?1 AND other.uid <> ?2 AND EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = ?1 AND mine.uid = ?2) AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?1) = 2 LIMIT 1",
             libsql::params![conversation_id.to_owned(), sender_uid.to_owned()],
         ).await?;
         let r: String = rows.next().await?.ok_or_else(|| anyhow!("conversation member not found"))?.get(0)?;
@@ -902,6 +913,9 @@ mod tests {
 }
 
 fn validate_avatar(bytes: &[u8]) -> Result<()> {
+    validate_profile_image(bytes,256,256)
+}
+pub(crate) fn validate_profile_image(bytes: &[u8], max_width: u16, max_height: u16) -> Result<()> {
     anyhow::ensure!(bytes.len() <= 16000 && bytes.starts_with(&[255,216]) && bytes.ends_with(&[255,217]), "Invalid JPEG avatar");
     let mut p=2;
     while p+4 <= bytes.len() {
@@ -913,7 +927,7 @@ fn validate_avatar(bytes: &[u8]) -> Result<()> {
         if matches!(marker,192|193|194) {
             anyhow::ensure!(len>=8, "Invalid JPEG dimensions");
             let h=u16::from_be_bytes([bytes[p+3],bytes[p+4]]);let w=u16::from_be_bytes([bytes[p+5],bytes[p+6]]);
-            anyhow::ensure!(w>0 && h>0 && w<=256 && h<=256, "Avatar dimensions must be at most 256 pixels");
+            anyhow::ensure!(w>0 && h>0 && w<=max_width && h<=max_height, "Photo dimensions are too large");
             return Ok(());
         }
         anyhow::ensure!(marker!=218 && marker!=217, "Missing JPEG dimensions");p+=len;

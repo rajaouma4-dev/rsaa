@@ -8,6 +8,8 @@ services:
     plan: free
     region: oregon
     envVars:
+      - key: PROFILE_STORAGE_KEY
+        sync: false
       - key: TURSO_DATABASE_URL
         sync: false
       - key: TURSO_AUTH_TOKEN

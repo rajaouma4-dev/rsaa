@@ -246,6 +246,13 @@ pub async fn handle_client_frame(
     // Both authenticated transports use the SAME Signal-envelope validation,
     // membership checks and durable insert below. TLS avoids waiting for ICE.
     match frame {
+        DataChannelClientFrame::Profile { request_id, action, body } => {
+            let result = crate::profiles::handle(db, uid, &action, &body, channels, live_signaling).await;
+            let result = result.unwrap_or_else(|_| serde_json::json!({"error":"PROFILE_OPERATION_FAILED"}));
+            if request_id.len() <= 128 {
+                reply_to_sender(channel, signal_tx, &DataChannelServerFrame::ProfileResult { request_id, result }).await;
+            }
+        }
         DataChannelClientFrame::CallSignal { to_uid, payload } => {
             route_call_signal(uid, &to_uid, payload, channels, live_signaling).await;
         }
